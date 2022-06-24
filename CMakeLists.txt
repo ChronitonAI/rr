@@ -1070,6 +1070,7 @@ set(BASIC_TESTS
   x86/deferred_patch_refused_restart
   desched_blocking_poll
   desched_sigkill
+  desched_sigreturn
   detach_huge_mmap
   detach_state
   detach_threads
