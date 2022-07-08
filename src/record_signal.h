@@ -18,6 +18,17 @@ void arm_desched_event(RecordTask* t);
 bool desched_event_armed(RecordTask *t);
 bool handle_syscallbuf_breakpoint(RecordTask* t);
 
+/**
+ * |t| is at the entry of an untraced syscall in the syscallbuf code (a
+ * syscall-entry or seccomp stop), set up so that the kernel skips the
+ * syscall. Abort the buffered syscall: make it return EINTR and mark its
+ * syscallbuf record aborted, so that the syscallbuf code unwinds and the
+ * syscall is performed by the traced syscall instruction in the extended
+ * jump patch instead. Then run |t| to the entry of that syscall, stashing
+ * any signals that arrive. Returns false if |t| exited.
+ */
+bool leave_syscallbuf(RecordTask* t);
+
 enum SignalBlocked { SIG_UNBLOCKED = 0, SIG_BLOCKED = 1 };
 enum SignalHandled { SIGNAL_HANDLED, SIGNAL_PTRACE_STOP, DEFER_SIGNAL };
 /**

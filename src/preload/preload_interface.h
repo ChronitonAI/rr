@@ -195,6 +195,10 @@ static inline const char* extract_file_name(const char* s) {
  */
 #define PATCH_NO_MATCH_TRAILING_4_BYTES (1 << 3)
 
+/* The space in an x86 extended jump patch for the copy of the instructions
+ * following the syscall instruction in the patched code region.
+ */
+#define STUB_PATCH_LENGTH 20
 
 /**
  * To support syscall buffering, we replace syscall instructions with a "call"
@@ -566,7 +570,10 @@ struct syscallbuf_record {
   /* Does this record require an assist during replay ? */
   uint8_t replay_assist : 1;
   uint8_t _flags_padding : 6;
-  uint8_t _padding;
+  /* Set by rr when it interrupted the syscall and aborted this record. The
+   * syscall is then performed by the traced syscall instruction in the
+   * extended jump patch. */
+  uint8_t aborted;
   /* Size of entire record in bytes: this struct plus extra
    * recorded data stored inline after the last field, not
    * including padding.

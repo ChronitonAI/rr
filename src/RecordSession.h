@@ -242,7 +242,9 @@ private:
                                      RecordSession::StepState* step_state,
                                      RecordResult* result,
                                      bool* did_enter_syscall);
-  // Returns false if the task exits during processing
+  // Returns false if the task didn't enter the syscall: it exited during
+  // processing, or it has a signal to deliver first. Then sets
+  // step_state->continue_type and last_task_switchable.
   bool process_syscall_entry(RecordTask* t, StepState* step_state,
                              RecordResult* step_result,
                              SupportedArch syscall_arch);

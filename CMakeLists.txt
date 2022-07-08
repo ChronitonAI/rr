@@ -1035,6 +1035,7 @@ set(BASIC_TESTS
   bpf_query
   brk
   brk2
+  buffered_syscalls_after_abort
   arm/brk_nonzero
   capget
   chew_cpu
@@ -1370,6 +1371,7 @@ set(BASIC_TESTS
   seccomp_madvise
   seccomp_null
   seccomp_sigsys_args
+  seccomp_sigsys_mprotect
   seccomp_sigsys_sigtrap
   seccomp_sigsys_syscallbuf
   x86/seccomp_stop_remote_syscall
@@ -1399,6 +1401,7 @@ set(BASIC_TESTS
   sigcont_then_sigstop
   sigcont_threaded
   sigframe_grow_stack
+  sigframe_ip_patched_syscall
   sighandler_bad_rsp_sigsegv
   sighandler_fork
   arm/sighandler_frame_record
@@ -1667,6 +1670,7 @@ set(TESTS_WITH_PROGRAM
   x86/rdtsc_loop
   x86/rdtsc_loop2
   x86/rdtsc_interfering
+  x86/rdtsc_patch_fallback
   read_big_struct
   remove_latest_trace
   restart_abnormal_exit
@@ -1683,6 +1687,7 @@ set(TESTS_WITH_PROGRAM
   rseq
   rseq_syscallbuf
   rseq_cpu_id_reset_longrunning
+  sched_at_bail_syscall
   sched_at_interrupted_syscall_exit
   search
   seccomp_blocks_rr

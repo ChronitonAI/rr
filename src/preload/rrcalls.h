@@ -142,6 +142,7 @@
  */
 #define SYS_rrcall_arm_kill (RR_CALL_BASE + 13)
 #define RRCALL_ARM_KILL_INHERIT 1
+#ifndef __ASSEMBLER__
 enum rrcall_kill_point {
   RRCALL_KILL_NONE,
 
@@ -257,3 +258,4 @@ enum rrcall_kill_point {
 
   RRCALL_KILL_NUM_POINTS
 };
+#endif

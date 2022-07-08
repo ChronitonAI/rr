@@ -483,8 +483,6 @@ void RecordSession::handle_seccomp_traced_syscall(RecordTask* t,
       SupportedArch syscall_arch = t->detect_syscall_arch();
       t->canonicalize_regs(syscall_arch);
       if (!process_syscall_entry(t, step_state, result, syscall_arch)) {
-        last_task_switchable = ALLOW_SWITCH;
-        step_state->continue_type = RecordSession::DONT_CONTINUE;
         return;
       }
       *did_enter_syscall = true;
@@ -551,27 +549,27 @@ void RecordSession::handle_seccomp_trap(RecordTask* t,
     }
   }
 
-  if (t->is_in_untraced_syscall()) {
-    ASSERT(t, !t->delay_syscallbuf_reset_for_seccomp_trap);
-    // Don't reset the syscallbuf immediately after delivering the trap. We have
-    // to wait until this buffered syscall aborts completely before resetting
-    // the buffer.
-    t->delay_syscallbuf_reset_for_seccomp_trap = true;
-
-    t->push_event(Event::seccomp_trap());
-
+  bool is_untraced_syscall = t->is_in_untraced_syscall();
+  if (is_untraced_syscall) {
     // desched may be armed but we're not going to execute the syscall, let
-    // alone block. If it fires, ignore it.
-    t->write_mem(
-        REMOTE_PTR_FIELD(t->syscallbuf_child, desched_signal_may_be_relevant),
-        (uint8_t)0);
+    // alone block. Disarm the event and if it fires, ignore it.
+    disarm_desched_event(t);
+    // Abort the buffered syscall and move to the entry of the traced syscall
+    // in the extended jump patch, where the SIGSYS is delivered.
+    if (!leave_syscallbuf(t)) {
+      last_task_switchable = ALLOW_SWITCH;
+      step_state->continue_type = RecordSession::DONT_CONTINUE;
+      return;
+    }
+    r = t->regs();
   }
 
+  t->canonicalize_regs(t->detect_syscall_arch());
   t->push_syscall_event(syscallno);
   t->ev().Syscall().failed_during_preparation = true;
   note_entering_syscall(t);
 
-  if (t->is_in_untraced_syscall() && !syscall_entry_already_recorded) {
+  if (is_untraced_syscall && !syscall_entry_already_recorded) {
     t->record_current_event();
   }
 
@@ -587,10 +585,20 @@ void RecordSession::handle_seccomp_trap(RecordTask* t,
   si.native_api.si_code = SYS_SECCOMP;
   si.native_api._sifields._sigsys._arch = to_audit_arch(r.arch());
   si.native_api._sifields._sigsys._syscall = syscallno;
+
   // Documentation says that si_call_addr is the address of the syscall
   // instruction, but in tests it's immediately after the syscall
   // instruction.
-  si.native_api._sifields._sigsys._call_addr = t->ip().to_data_ptr<void>();
+  // When the syscall is in an extended jump patch, the signal frame will
+  // show the corresponding address in the patched code region instead (see
+  // signal_state_changed), so report that address here too.
+  remote_code_ptr seccomp_ip = t->ip();
+  remote_code_ptr patched_code_ip =
+      t->vm()->monkeypatcher().patched_code_ip_for_stub_ip(t, seccomp_ip);
+  if (!patched_code_ip.is_null()) {
+    seccomp_ip = patched_code_ip;
+  }
+  si.native_api._sifields._sigsys._call_addr = seccomp_ip.to_data_ptr<void>();
   LOG(debug) << "Synthesizing " << si.linux_api;
   t->stash_synthetic_sig(si.linux_api, DETERMINISTIC_SIG);
 
@@ -600,17 +608,34 @@ void RecordSession::handle_seccomp_trap(RecordTask* t,
   t->set_regs(r);
   t->maybe_restore_original_syscall_registers();
 
-  if (t->is_in_untraced_syscall()) {
+  if (is_untraced_syscall) {
+    Registers r = t->regs();
+    // Cause kernel processing to skip the syscall
+    r.set_original_syscallno(SECCOMP_MAGIC_SKIP_ORIGINAL_SYSCALLNO);
+    t->set_regs(r);
+    uintptr_t orig_arg1 = r.arg1();
+
+    // The tracee is currently in the syscall-entry stop of the traced syscall
+    // in the extended jump patch. Advance it to the syscall-exit stop so that
+    // when we try to deliver the SIGSYS via PTRACE_SINGLESTEP, that doesn't
+    // trigger a SIGTRAP stop.
+    if (!t->exit_syscall(r.arch())) {
+      last_task_switchable = ALLOW_SWITCH;
+      step_state->continue_type = RecordSession::DONT_CONTINUE;
+      return;
+    }
+
+    if (t->arch() == aarch64) {
+      // The skipped syscall clobbered x0 with its result.
+      r = t->regs();
+      r.set_arg1(orig_arg1);
+      t->set_regs(r);
+    }
+
     // For buffered syscalls, go ahead and record the exit state immediately.
     t->ev().Syscall().state = EXITING_SYSCALL;
     t->record_current_event();
     t->pop_syscall();
-
-    // The tracee is currently in the seccomp ptrace-stop. Advance it to the
-    // syscall-exit stop so that when we try to deliver the SIGSYS via
-    // PTRACE_SINGLESTEP, that doesn't trigger a SIGTRAP stop.
-    // If this fails, that's fine, we're not going to deliver the SIGSYS.
-    t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS);
   }
 
   // Don't continue yet. At the next iteration of record_step, if we
@@ -844,12 +869,6 @@ void RecordSession::task_continue(const StepState& step_state) {
   // A task in an emulated ptrace-stop must really stay stopped
   ASSERT(t, !t->emulated_stop_pending);
 
-  bool may_restart = t->at_may_restart_syscall();
-
-  if (may_restart && t->seccomp_bpf_enabled) {
-    LOG(debug) << "  PTRACE_SYSCALL to possibly-restarted " << t->ev();
-  }
-
   if (!t->vm()->first_run_event()) {
     t->vm()->set_first_run_event(trace_writer().time());
   }
@@ -921,7 +940,7 @@ void RecordSession::task_continue(const StepState& step_state) {
          makes PTRACE_SYSCALL traps be delivered *before* seccomp RET_TRACE
          traps.
          Detect and handle this. */
-      if (!t->seccomp_bpf_enabled || may_restart ||
+      if (!t->seccomp_bpf_enabled ||
           syscall_seccomp_ordering_ == PTRACE_SYSCALL_BEFORE_SECCOMP_UNKNOWN) {
         resume = RESUME_SYSCALL;
       } else {
@@ -1280,6 +1299,18 @@ void RecordSession::syscall_state_changed(RecordTask* t,
           ASSERT(t, t->regs().original_syscallno() == -1);
         }
         rec_did_sigreturn(t);
+
+        // The inverse of the processing we do during signal delivery: if the
+        // IP points into a patched code region, move it to the extended jump
+        // patch instead.
+        remote_code_ptr stub_ip =
+            t->vm()->monkeypatcher().stub_ip_for_patched_code_ip(t, t->ip());
+        if (!stub_ip.is_null()) {
+          Registers r = t->regs();
+          r.set_ip(stub_ip);
+          t->set_regs(r);
+        }
+
         t->record_current_event();
         t->pop_syscall();
 
@@ -1728,6 +1759,71 @@ static bool inject_handled_signal(RecordTask* t) {
 }
 
 /**
+ * Return where the signal frame at |frame_ptr| stores the ip that sigreturn
+ * restores. |takes_siginfo| is whether the handler has SA_SIGINFO.
+ */
+template <typename Arch>
+static remote_ptr<typename Arch::unsigned_long> get_sigframe_ip_ptr(
+    remote_ptr<void> frame_ptr, bool takes_siginfo);
+
+template <>
+remote_ptr<ARM64Arch::unsigned_long> get_sigframe_ip_ptr<ARM64Arch>(
+    remote_ptr<void> frame_ptr, bool) {
+  auto frame = frame_ptr.cast<ARM64Arch::rt_sigframe>();
+  return REMOTE_PTR_FIELD(
+      REMOTE_PTR_FIELD(
+          REMOTE_PTR_FIELD(REMOTE_PTR_FIELD(frame, uc), uc_mcontext), regs),
+      pc);
+}
+
+template <>
+remote_ptr<X86Arch::unsigned_long> get_sigframe_ip_ptr<X86Arch>(
+    remote_ptr<void> frame_ptr, bool takes_siginfo) {
+  if (!takes_siginfo) {
+    auto frame = frame_ptr.cast<X86Arch::sigframe>();
+    return REMOTE_PTR_FIELD(REMOTE_PTR_FIELD(frame, sc), ip);
+  }
+  auto frame = frame_ptr.cast<X86Arch::rt_sigframe>();
+  return REMOTE_PTR_FIELD(
+      REMOTE_PTR_FIELD(REMOTE_PTR_FIELD(frame, uc), uc_mcontext), ip);
+}
+
+template <>
+remote_ptr<X64Arch::unsigned_long> get_sigframe_ip_ptr<X64Arch>(
+    remote_ptr<void> frame_ptr, bool) {
+  auto frame = frame_ptr.cast<X64Arch::rt_sigframe>();
+  return REMOTE_PTR_FIELD(
+      REMOTE_PTR_FIELD(REMOTE_PTR_FIELD(frame, uc), uc_mcontext), ip);
+}
+
+template <typename Arch>
+static remote_code_ptr get_sigframe_ip_arch(RecordTask* t,
+                                            remote_ptr<void> frame_ptr,
+                                            bool takes_siginfo) {
+  return t->read_mem(get_sigframe_ip_ptr<Arch>(frame_ptr, takes_siginfo));
+}
+
+static remote_code_ptr get_sigframe_ip(RecordTask* t,
+                                       remote_ptr<void> frame_ptr,
+                                       bool takes_siginfo) {
+  RR_ARCH_FUNCTION(get_sigframe_ip_arch, t->arch(), t, frame_ptr,
+                   takes_siginfo);
+}
+
+template <typename Arch>
+static void set_sigframe_ip_arch(RecordTask* t, remote_ptr<void> frame_ptr,
+                                 bool takes_siginfo, remote_code_ptr ip) {
+  t->write_mem(get_sigframe_ip_ptr<Arch>(frame_ptr, takes_siginfo),
+               (typename Arch::unsigned_long)ip.register_value());
+}
+
+static void set_sigframe_ip(RecordTask* t, remote_ptr<void> frame_ptr,
+                            bool takes_siginfo, remote_code_ptr ip) {
+  RR_ARCH_FUNCTION(set_sigframe_ip_arch, t->arch(), t, frame_ptr, takes_siginfo,
+                   ip);
+}
+
+/**
  * |t| has just entered a signal handler on aarch64. Returns the size of what
  * the kernel wrote to set that up, from the handler's sp: the rt_sigframe,
  * any extra context that doesn't fit in its __reserved area (e.g. large SVE
@@ -1805,6 +1901,29 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
           sigframe_size = aarch64_sigframe_size(t);
         } else {
           DEBUG_ASSERT(0 && "Add sigframe size for your architecture here");
+        }
+
+        // If we're delivering a signal while in an extended jump patch,
+        // pretend we're in the patched code region instead. That way, any
+        // unwinder that makes use of CFI for unwinding will see the unwind
+        // info of the patch site rather than none at all. The instructions at
+        // the patch site were of course altered by the patch, so a signal
+        // handler that inspects them might get confused. However, that is
+        // already a general problem with our patching strategy, in that the
+        // application is not allowed to read its own code.
+        // sigreturn performs the inverse transformation.
+        // We modify the signal frame rather than the registers before
+        // delivering the signal, because on some architectures (e.g. aarch64)
+        // the kernel adjusts the registers after the signal-delivery stop.
+        remote_ptr<void> sigframe = t->regs().sp();
+        bool takes_siginfo = t->signal_handler_takes_siginfo(sig);
+        remote_code_ptr frame_ip = get_sigframe_ip(t, sigframe, takes_siginfo);
+        remote_code_ptr patched_code_ip =
+            t->vm()->monkeypatcher().patched_code_ip_for_stub_ip(t, frame_ip);
+        if (!patched_code_ip.is_null()) {
+          set_sigframe_ip(t, sigframe, takes_siginfo, patched_code_ip);
+          LOG(debug) << "Moved signal frame ip from extended jump patch "
+                     << frame_ip << " to " << patched_code_ip;
         }
 
         t->ev().transform(EV_SIGNAL_HANDLER);
@@ -2096,32 +2215,32 @@ static bool is_ptrace_any_sysemu(SupportedArch arch, int command)
 bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
                                           RecordResult* step_result,
                                           SupportedArch syscall_arch) {
-  if (const RecordTask::StashedSignal* sig = t->stashed_sig_not_synthetic_SIGCHLD()) {
-    // The only four cases where we allow a stashed signal to be pending on
-    // syscall entry are:
-    // -- the signal is a ptrace-related signal, in which case if it's generated
-    // during a blocking syscall, it does not interrupt the syscall
-    // -- rrcall_notify_syscall_hook_exit, which is effectively a noop and
-    // lets us dispatch signals afterward
-    // -- when we're entering a blocking untraced syscall. If it really blocks,
-    // we'll get the desched-signal notification and dispatch our stashed
-    // signal.
-    // -- when we're doing a privileged syscall that's internal to the preload
-    // logic
-    // We do not generally want to have stashed signals pending when we enter
-    // a syscall, because that will execute with a hacked signal mask
-    // (see RecordTask::will_resume_execution) which could make things go wrong.
-    ASSERT(t,
-           t->desched_rec() || is_rrcall_notify_syscall_hook_exit_syscall(
-                                   t->regs().original_syscallno(), t->arch()) ||
-               t->ip() ==
-                   t->vm()
-                       ->privileged_traced_syscall_ip()
-                       .increment_by_syscall_insn_length(t->arch()))
-      << "Stashed signal pending on syscall entry when it shouldn't be: "
-      << sig->siginfo << "; regs=" << t->regs()
-      << "; last_execution_resume=" << t->last_execution_resume()
-      << "; sig ip=" << sig->ip;
+  if (!t->is_in_syscallbuf() && t->stashed_sig_not_synthetic_SIGCHLD()) {
+    // If we have a pending signal, deliver it as if it had happened just before
+    // execution of the syscall instruction. To this end, kick us out of the
+    // current syscall again and set up the registers for a restart. Regular
+    // signal injection will do the rest.
+    LOG(debug) << "Entered syscall, but signal pending - setting up "
+                  "pre-syscall signal delivery";
+    Registers entry_regs = t->regs();
+    Registers r = entry_regs;
+    // Cause kernel processing to skip the syscall
+    r.set_original_syscallno(SECCOMP_MAGIC_SKIP_ORIGINAL_SYSCALLNO);
+    t->set_regs(r);
+    if (!t->exit_syscall(syscall_arch)) {
+      last_task_switchable = ALLOW_SWITCH;
+      step_state->continue_type = DONT_CONTINUE;
+      return false;
+    }
+    entry_regs.set_ip(
+        entry_regs.ip().decrement_by_syscall_insn_length(syscall_arch));
+    entry_regs.set_syscallno(entry_regs.original_syscallno());
+    t->set_regs(entry_regs);
+    // The signal is delivered in the next step. The task has run since its
+    // last recorded event, so don't switch to another task before then.
+    last_task_switchable = PREVENT_SWITCH;
+    step_state->continue_type = DONT_CONTINUE;
+    return false;
   }
 
   // We just entered a syscall.
@@ -2146,6 +2265,7 @@ bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
       if (!t->is_stopped()) {
         // task exited while we were trying to patch it.
         // Make sure that this exit event gets processed
+        last_task_switchable = ALLOW_SWITCH;
         step_state->continue_type = DONT_CONTINUE;
         return false;
       }
