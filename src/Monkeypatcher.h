@@ -131,26 +131,78 @@ public:
   };
   std::vector<ExtendedJumpPage> extended_jump_pages;
 
-  bool is_jump_stub_instruction(remote_code_ptr p, bool include_safearea);
-  // Return the breakpoint instruction (i.e. the last branch back to caller)
-  // if we are on the exit path in the jump stub
-  remote_code_ptr get_jump_stub_exit_breakpoint(remote_code_ptr ip, RecordTask *t);
-
   void unpatch_dl_runtime_resolves(RecordTask* t);
 
+  /**
+   * A patched syscall (or trapping instruction) and its extended jump patch.
+   * The patched code region starts at |patch_addr| and ends at the address
+   * the extended jump patch returns to. The extended jump patch ends with its
+   * safe suffix, which starts with the syscall instruction (the trapping
+   * instruction for trapping-instruction patches), followed by a copy of the
+   * instructions of the patched code region that follow the syscall
+   * instruction, and a jump to the end of the patched code region.
+   */
   struct patched_syscall {
     // Pointer to hook inside the syscall_hooks array, which gets initialized
     // once and is fixed afterwards.
-    const syscall_patch_hook *hook;
+    const syscall_patch_hook* hook;
+    // Start of the patched code region.
+    remote_ptr<uint8_t> patch_addr;
+    // Start of the extended jump patch.
+    remote_ptr<uint8_t> stub_addr;
+    // Size of the extended jump patch.
     size_t size;
+    // Size of the patched code region.
+    uint16_t patch_region_size;
+    // Offset of the syscall instruction in the patched code region.
+    uint16_t syscall_offset;
+    // Instructions at the start of the extended jump patch that haven't
+    // changed any state yet.
     uint16_t safe_prefix = 0;
+    // Instructions at the end of the extended jump patch that no longer use
+    // the syscallbuf stack. Signals can be delivered there.
     uint16_t safe_suffix = 0;
   };
 
   /**
-   * Addresses/lengths of syscallbuf stubs.
+   * Return the extended jump patch containing |ip|, if any. Unless
+   * |include_safearea| is true, the safe prefix and safe suffix don't count.
    */
-  std::map<remote_ptr<uint8_t>, patched_syscall> syscallbuf_stubs;
+  patched_syscall* find_jump_stub(remote_code_ptr ip, bool include_safearea);
+  bool is_jump_stub_instruction(remote_code_ptr ip, bool include_safearea) {
+    return find_jump_stub(ip, include_safearea) != nullptr;
+  }
+
+  /**
+   * If |ip| is in the safe prefix or safe suffix of an extended jump patch,
+   * return the address in the patched code region where execution would be
+   * in the same state without the patch. The safe prefix corresponds to the
+   * syscall instruction, the rest of the safe suffix to the original
+   * instructions it copies, and the end of the safe suffix to the end of the
+   * patched code region. Otherwise return null.
+   */
+  remote_code_ptr patched_code_ip_for_stub_ip(Task* t, remote_code_ptr ip);
+
+  /**
+   * The inverse of patched_code_ip_for_stub_ip: if |ip| is in a patched code
+   * region, at or after the syscall instruction, return the corresponding
+   * address in the safe suffix of the extended jump patch. Otherwise return
+   * null.
+   */
+  remote_code_ptr stub_ip_for_patched_code_ip(Task* t, remote_code_ptr ip);
+
+  // Return the breakpoint instruction (i.e. the last branch back to caller)
+  // if we are on the exit path in the jump stub
+  remote_code_ptr get_jump_stub_exit_breakpoint(remote_code_ptr ip,
+                                                RecordTask* t);
+
+  /**
+   * All syscall patches, and indexes into this vector by the start of their
+   * extended jump patch and by the start of their patched code region.
+   */
+  std::vector<patched_syscall> syscall_stub_list;
+  std::map<remote_ptr<uint8_t>, size_t> syscallbuf_stubs_by_extended_patch;
+  std::map<remote_ptr<uint8_t>, size_t> syscallbuf_stubs_by_patch_addr;
 
 private:
   void patch_dl_runtime_resolve(RecordTask* t, ElfReader& reader,
