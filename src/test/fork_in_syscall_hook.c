@@ -2,9 +2,9 @@
 
 #include "util.h"
 
-/* Fork through syscall(). On x86, once earlier calls have let rr patch it,
-   the fork happens in rr's syscall hook, on the syscallbuf alt stack, and
-   the child returns from the hook on its copy of that stack. */
+/* Fork through syscall(). Once earlier calls have let rr patch it, the
+   fork happens at the syscall instruction of its extended jump patch, after
+   rr's syscall hook has returned. */
 
 static long do_fork(void) {
 #ifdef SYS_fork
