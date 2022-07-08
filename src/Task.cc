@@ -1057,8 +1057,9 @@ bool Task::enter_syscall(SupportedArch syscall_arch, bool allow_exit) {
 bool Task::exit_syscall(SupportedArch syscall_arch) {
   // If PTRACE_SYSCALL_BEFORE_SECCOMP and we're at a syscall-entry stop
   // rather than the seccomp trap (rr handles syscalls from the rr page's
-  // untraced instructions there), a seccomp trap can come before the
-  // syscall-exit stop. Skip it.
+  // untraced instructions there, and leave_syscallbuf() stops there at the
+  // syscall in the extended jump patch), a seccomp trap can come before
+  // the syscall-exit stop. Skip it.
   bool will_see_seccomp = seccomp_bpf_enabled &&
                           (session().syscall_seccomp_ordering() ==
                            Session::PTRACE_SYSCALL_BEFORE_SECCOMP) &&

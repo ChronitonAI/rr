@@ -1,0 +1,23 @@
+source `dirname $0`/util.sh
+skip_if_no_syscall_buf
+skip_if_test_32_bit
+skip_if_rr_32_bit
+# With a small syscall buffer, the patch sites often find it full.
+RECORD_ARGS="--syscall-buffer-size=16"
+record $TESTNAME
+replay
+# Each RDTSC that an extended jump patch executes traps. Count those traps
+# before and after the sched_yield() between the two patch sites' loops.
+# Each loop runs enough RDTSCs to fill the buffer about 150 times. If a
+# site isn't patched, each of its 100000 RDTSCs traps instead.
+traps=($(get_events |
+         awk 'BEGIN { second = 0 }
+              /event:.SYSCALL: sched_yield/ { second = 1 }
+              /event:.INSTRUCTION_TRAP/ { count[second]++ }
+              END { print count[0] + 0, count[1] + 0 }'))
+if (( traps[0] < 10 || traps[1] < 10 ||
+      traps[0] >= 10000 || traps[1] >= 10000 )); then
+  failed "trapped RDTSCs at the two patch sites: ${traps[0]}, ${traps[1]}"
+else
+  check EXIT-SUCCESS
+fi

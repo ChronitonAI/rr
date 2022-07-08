@@ -25,7 +25,7 @@ int main(void) {
   int status;
   pthread_t thread;
   int pipe_fds[2];
-  pipe(pipe_fds);
+  test_assert(0 == pipe(pipe_fds));
   handler_pipe_fd = pipe_fds[1];
 
   if ((child = fork()) == 0) {
@@ -33,14 +33,15 @@ int main(void) {
     act.sa_sigaction = fault_handler;
     act.sa_flags = SA_ONSTACK | SA_SIGINFO;
     sigemptyset(&act.sa_mask);
-    sigaction(SIGSEGV, &act, NULL);
+    test_assert(0 == sigaction(SIGSEGV, &act, NULL));
 
-    pthread_create(&thread, NULL, do_thread, NULL);
+    test_assert(0 == pthread_create(&thread, NULL, do_thread, NULL));
     test_assert(0 == sched_yield());
     sleep(1000);
     test_assert(0 && "Should not reach here");
     return 0;
   }
+  test_assert(child > 0);
 
   int handler_sig;
 
