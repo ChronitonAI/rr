@@ -958,6 +958,11 @@ public:
   // signal. Used for testing (RRCALL_KILL_AFTER_DESCHED_STOP_WAIT).
   bool in_desched_handling;
 
+  // The stack pointer at the last deterministic signal in syscallbuf code
+  // for which rr cleared desched_signal_may_be_relevant, until its handler
+  // returns there. Null otherwise. See is_safe_to_deliver_signal().
+  remote_ptr<void> desched_flag_cleared_at_sp;
+
 private:
   // See arm_kill().
   std::unique_ptr<ArmedKill> armed_kill;

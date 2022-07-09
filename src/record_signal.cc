@@ -662,7 +662,8 @@ static void handle_desched_event(RecordTask* t) {
   }
 }
 
-static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si) {
+static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si,
+                                      SignalDeterministic deterministic) {
   if (!t->is_in_syscallbuf()) {
     /* The tracee is outside the syscallbuf code,
      * so in most cases can't possibly affect
@@ -673,7 +674,29 @@ static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si) {
                << " because not in syscallbuf";
     return true;
   }
-  (void)si;
+
+  if (deterministic == DETERMINISTIC_SIG) {
+    LOG(error)
+        << "Received deterministic signal " << signal_name(si->si_signo)
+        << " while in syscallbuf code.\n Ordinarily this should never happen.\n"
+        << "Recording will proceed, but additional errors or a corrupted trace "
+           "may follow.";
+    // The handler runs with the syscallbuf locked, so its syscalls are
+    // traced and the desched event isn't relevant to them. Clear
+    // desched_signal_may_be_relevant and disarm the event, so that rr
+    // neither arms it (after remote syscalls) nor acts on a desched signal
+    // while the handler runs. If the handler returns here with
+    // rt_sigreturn, rr sets the flag and arms the event again (see
+    // RecordSession::syscall_state_changed).
+    if (desched_event_armed(t)) {
+      t->write_mem(REMOTE_PTR_FIELD(t->syscallbuf_child,
+                                    desched_signal_may_be_relevant),
+                   (uint8_t)0);
+      t->desched_flag_cleared_at_sp = t->regs().sp();
+    }
+    disarm_desched_event(t);
+    return true;
+  }
 
   LOG(debug) << "Not safe to deliver signal at " << t->ip();
   return false;
@@ -725,7 +748,7 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
       return SIGNAL_HANDLED;
     }
 
-    if (!is_safe_to_deliver_signal(t, si)) {
+    if (!is_safe_to_deliver_signal(t, si, deterministic)) {
       return DEFER_SIGNAL;
     }
 

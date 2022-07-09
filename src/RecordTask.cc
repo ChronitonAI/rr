@@ -210,7 +210,8 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       did_execveat(false),
       tick_request_override((TicksRequest)0),
       schedule_frozen(false),
-      in_desched_handling(false) {
+      in_desched_handling(false),
+      desched_flag_cleared_at_sp(nullptr) {
   push_event(Event::sentinel());
   if (session.tasks().empty()) {
     // Initial tracee.

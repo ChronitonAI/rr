@@ -1422,6 +1422,18 @@ void RecordSession::syscall_state_changed(RecordTask* t,
 
         maybe_discard_syscall_interruption(t, retval);
 
+        if (!t->desched_flag_cleared_at_sp.is_null() &&
+            t->regs().sp() == t->desched_flag_cleared_at_sp &&
+            t->is_in_syscallbuf()) {
+          // The handler of a deterministic signal returned to the
+          // syscallbuf code it interrupted (see is_safe_to_deliver_signal).
+          t->desched_flag_cleared_at_sp = nullptr;
+          t->write_mem(REMOTE_PTR_FIELD(t->syscallbuf_child,
+                                        desched_signal_may_be_relevant),
+                       (uint8_t)1);
+          arm_desched_event(t);
+        }
+
         if (EV_SECCOMP_TRAP == t->ev().type()) {
           LOG(debug) << "  exiting seccomp trap";
           save_interrupted_syscall_ret_in_syscallbuf(t, retval);

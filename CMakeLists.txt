@@ -1743,6 +1743,8 @@ set(TESTS_WITH_PROGRAM
   seccomp_signals
   seekticks_threads
   segfault
+  segv_in_syscallbuf
+  segv_in_syscallbuf_race
   setuid
   shared_map
   shared_persistent_file

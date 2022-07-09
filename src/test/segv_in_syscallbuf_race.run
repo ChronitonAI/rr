@@ -1,0 +1,13 @@
+source `dirname $0`/util.sh
+# rr logs an error for a deterministic signal in syscallbuf code, and the
+# recording can't be replayed, so only the recording is checked.
+GLOBAL_OPTIONS="${GLOBAL_OPTIONS//--fatal-errors/}"
+record $TESTNAME
+if [[ "record.out" != $(grep -l "EXIT-SUCCESS" record.out) ]]; then
+  failed "recording failed"
+  echo "--------------------------------------------------"
+  cat record.out record.err
+  echo "--------------------------------------------------"
+else
+  passed
+fi
