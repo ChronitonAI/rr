@@ -662,7 +662,8 @@ static void handle_desched_event(RecordTask* t) {
   }
 }
 
-static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si) {
+static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si,
+                                      SignalDeterministic deterministic) {
   if (!t->is_in_syscallbuf()) {
     /* The tracee is outside the syscallbuf code,
      * so in most cases can't possibly affect
@@ -673,7 +674,15 @@ static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si) {
                << " because not in syscallbuf";
     return true;
   }
-  (void)si;
+
+  if (deterministic == DETERMINISTIC_SIG) {
+    LOG(error)
+        << "Received deterministic signal " << signal_name(si->si_signo)
+        << " while in syscallbuf code.\n Ordinarily this should never happen.\n"
+        << "Recording will proceed, but additional errors or a corrupted trace "
+           "may follow.";
+    return true;
+  }
 
   LOG(debug) << "Not safe to deliver signal at " << t->ip();
   return false;
@@ -725,7 +734,7 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
       return SIGNAL_HANDLED;
     }
 
-    if (!is_safe_to_deliver_signal(t, si)) {
+    if (!is_safe_to_deliver_signal(t, si, deterministic)) {
       return DEFER_SIGNAL;
     }
 
