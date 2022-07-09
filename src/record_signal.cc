@@ -461,9 +461,11 @@ static void handle_desched_event(RecordTask* t) {
    * If we're running in a signal handler inside an interrupted syscallbuf
    * system call, never do anything here. Syscall buffering is disabled and
    * the desched_signal_may_be_relevant was set by the outermost syscallbuf
-   * invocation.
+   * invocation. That's also the case outside the syscallbuf code, in the
+   * handler of a deterministic signal that arrived in syscallbuf code.
    */
-  if (!desched_event_armed(t) || t->running_inside_desched()) {
+  if (!desched_event_armed(t) || t->running_inside_desched() ||
+      !t->is_in_syscallbuf()) {
     LOG(debug) << "  (not entering may-block syscall; resuming)";
     /* We have to disarm the event just in case the tracee
      * has cleared the relevancy flag, but not yet
@@ -662,7 +664,8 @@ static void handle_desched_event(RecordTask* t) {
   }
 }
 
-static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si) {
+static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si,
+                                      SignalDeterministic deterministic) {
   if (!t->is_in_syscallbuf()) {
     /* The tracee is outside the syscallbuf code,
      * so in most cases can't possibly affect
@@ -673,7 +676,20 @@ static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si) {
                << " because not in syscallbuf";
     return true;
   }
-  (void)si;
+
+  if (deterministic == DETERMINISTIC_SIG) {
+    LOG(error)
+        << "Received deterministic signal " << signal_name(si->si_signo)
+        << " while in syscallbuf code.\n Ordinarily this should never happen.\n"
+        << "Recording will proceed, but additional errors or a corrupted trace "
+           "may follow.";
+    // The desched event is only relevant in syscallbuf code (see
+    // handle_desched_event), so keep it disarmed while the handler runs.
+    // rr arms it again if the handler returns to a buffered syscall that
+    // may block.
+    disarm_desched_event(t);
+    return true;
+  }
 
   LOG(debug) << "Not safe to deliver signal at " << t->ip();
   return false;
@@ -725,7 +741,7 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
       return SIGNAL_HANDLED;
     }
 
-    if (!is_safe_to_deliver_signal(t, si)) {
+    if (!is_safe_to_deliver_signal(t, si, deterministic)) {
       return DEFER_SIGNAL;
     }
 

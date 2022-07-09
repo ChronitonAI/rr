@@ -1415,6 +1415,12 @@ void RecordSession::syscall_state_changed(RecordTask* t,
 
         maybe_discard_syscall_interruption(t, retval);
 
+        if (t->is_in_syscallbuf() && desched_event_armed(t)) {
+          // The handler of a deterministic signal returned to a buffered
+          // syscall that may block (see is_safe_to_deliver_signal).
+          arm_desched_event(t);
+        }
+
         if (EV_SECCOMP_TRAP == t->ev().type()) {
           LOG(debug) << "  exiting seccomp trap";
           save_interrupted_syscall_ret_in_syscallbuf(t, retval);
