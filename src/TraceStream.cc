@@ -370,6 +370,8 @@ static trace::TicksSemantics to_trace_ticks_semantics(TicksSemantics semantics) 
       return trace::TicksSemantics::RETIRED_CONDITIONAL_BRANCHES;
     case TICKS_TAKEN_BRANCHES:
       return trace::TicksSemantics::TAKEN_BRANCHES;
+    case TICKS_SOFTWARE_CONDITIONAL_BLOCKS:
+      return trace::TicksSemantics::SOFTWARE_CONDITIONAL_BLOCKS;
     default:
       FATAL() << "Unknown ticks semantics";
       return trace::TicksSemantics::RETIRED_CONDITIONAL_BRANCHES;
@@ -382,6 +384,8 @@ static TicksSemantics from_trace_ticks_semantics(trace::TicksSemantics semantics
       return TICKS_RETIRED_CONDITIONAL_BRANCHES;
     case trace::TicksSemantics::TAKEN_BRANCHES:
       return TICKS_TAKEN_BRANCHES;
+    case trace::TicksSemantics::SOFTWARE_CONDITIONAL_BLOCKS:
+      return TICKS_SOFTWARE_CONDITIONAL_BLOCKS;
     default:
       FATAL() << "Unknown ticks semantics";
       return TICKS_RETIRED_CONDITIONAL_BRANCHES;
@@ -1667,6 +1671,11 @@ TraceReader::TraceReader(const string& dir)
   bind_to_cpu = header.getBindToCpu();
   preload_thread_locals_recorded_ = header.getPreloadThreadLocalsRecorded();
   ticks_semantics_ = from_trace_ticks_semantics(header.getTicksSemantics());
+  {
+    auto software_ticks = header.getSoftwareTicks();
+    software_ticks_abi_version_ = software_ticks.getAbiVersion();
+    software_ticks_countdown_address_ = software_ticks.getCountdownAddress();
+  }
   rrcall_base_ = header.getRrcallBase();
   max_virtual_address_size_ = header.getMaxVirtualAddressSize();
   syscallbuf_fds_disabled_size_ = header.getSyscallbufFdsDisabledSize();
@@ -1795,6 +1804,8 @@ TraceReader::TraceReader(const TraceReader& other)
   quirks_ = other.quirks_;
   clear_fip_fdp_ = other.clear_fip_fdp_;
   required_forward_compatibility_version_ = other.required_forward_compatibility_version_;
+  software_ticks_abi_version_ = other.software_ticks_abi_version_;
+  software_ticks_countdown_address_ = other.software_ticks_countdown_address_;
 }
 
 TraceReader::~TraceReader() {}

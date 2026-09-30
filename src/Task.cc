@@ -1506,6 +1506,9 @@ template <typename Arch> static void setup_preload_thread_locals_arch(Task* t) {
     auto locals = reinterpret_cast<preload_thread_locals<Arch>*>(local_addr);
     static_assert(sizeof(*locals) <= PRELOAD_THREAD_LOCALS_SIZE,
                   "bad PRELOAD_THREAD_LOCALS_SIZE");
+    static_assert(PRELOAD_THREAD_LOCALS_ADDR + PRELOAD_THREAD_LOCALS_SIZE <=
+                      SOFTWARE_TICKS_COUNTDOWN_ADDR,
+                  "preload_thread_locals overlaps the software ticks countdown");
     locals->syscallbuf_stub_alt_stack = t->syscallbuf_alt_stack();
   }
 }

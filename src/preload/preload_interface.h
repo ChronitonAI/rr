@@ -156,6 +156,11 @@ static inline const char* extract_file_name(const char* s) {
 #define PRELOAD_THREAD_LOCAL_SCRATCH2_SIZE 0
 #endif
 #define PRELOAD_THREAD_LOCALS_SIZE (144 + PRELOAD_THREAD_LOCAL_SCRATCH2_SIZE)
+/* Reserved in the preload_thread_locals page: the 64-bit countdown of
+ * traces with software ticks (Header.softwareTicks in rr_trace.capnp).
+ * Instrumented code addresses it absolutely, so it must not move, and
+ * struct preload_thread_locals must stay below it. */
+#define SOFTWARE_TICKS_COUNTDOWN_ADDR (PRELOAD_THREAD_LOCALS_ADDR + 0x800)
 
 #include "rrcalls.h"
 
