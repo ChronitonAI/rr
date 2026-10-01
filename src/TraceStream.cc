@@ -39,6 +39,7 @@
 #include "util.h"
 
 #include "rr/rr.h"
+#include "SoftwareTicks.h"
 
 using namespace std;
 using namespace capnp;
@@ -1457,6 +1458,12 @@ void TraceWriter::close(CloseStatus status, const TraceUuid* uuid) {
   header.setBindToCpu(this->bind_to_cpu);
   header.setTicksSemantics(
     to_trace_ticks_semantics(PerfCounters::default_ticks_semantics()));
+  if (ticks_semantics_ == TICKS_SOFTWARE) {
+    auto software_ticks = header.initSoftwareTicks();
+    software_ticks.setAbiVersion(SOFTWARE_TICKS_ABI_VERSION);
+    software_ticks.setCountdownAddress(
+        software_ticks_countdown_address().as_int());
+  }
   header.setSyscallbufProtocolVersion(SYSCALLBUF_PROTOCOL_VERSION);
   header.setRequiredForwardCompatibilityVersion(FORWARD_COMPATIBILITY_VERSION);
   header.setPreloadThreadLocalsRecorded(true);
@@ -1487,7 +1494,9 @@ void TraceWriter::close(CloseStatus status, const TraceUuid* uuid) {
     quirks.setExplicitProcMem(false);
     quirks.setSpecialLibrrpage(false);
     quirks.setPkeyAllocRecordedExtraRegs(true);
-    quirks.setBufferedSyscallForcedTick(true);
+    // syscallbuf's force_tick() is a conditional branch; software ticks don't
+    // count it.
+    quirks.setBufferedSyscallForcedTick(ticks_semantics_ != TICKS_SOFTWARE);
     quirks.setUsesGlobalsInReplay(false);
   }
   // Add a random UUID to the trace metadata. This lets tools identify a trace

@@ -58,6 +58,7 @@
 #include "record_signal.h"
 #include "seccomp-bpf.h"
 #include "util.h"
+#include "SoftwareTicks.h"
 
 using namespace std;
 
@@ -2464,6 +2465,27 @@ bool Task::did_waitpid(WaitStatus status) {
         session().as_replay()->notify_detected_transient_error();
       }
     }
+  }
+
+  // Software ticks: a tick trap is the interrupt the PMU would have
+  // delivered. Make it the same TIME_SLICE_SIGNAL stop.
+  if (!status.reaped() && status.stop_sig() == SIGTRAP &&
+      !status.ptrace_event() && hpc.is_software() &&
+      is_software_tick_trap(this)) {
+    LOG(debug) << "  software tick trap at " << ip()
+               << "; treating as TIME_SLICE_SIGNAL";
+    if (arch() == aarch64) {
+      // The pc is at the brk; continue after it.
+      Registers r = regs();
+      r.set_ip(ip() + 4);
+      set_regs(r);
+    }
+    status = WaitStatus::for_stop_sig(PerfCounters::TIME_SLICE_SIGNAL);
+    memset(&pending_siginfo, 0, sizeof(pending_siginfo));
+    pending_siginfo.si_signo = PerfCounters::TIME_SLICE_SIGNAL;
+    pending_siginfo.si_fd = hpc.ticks_interrupt_fd();
+    pending_siginfo.si_code = POLL_IN;
+    in_injectable_signal_stop = false;
   }
 
   wait_status = status;

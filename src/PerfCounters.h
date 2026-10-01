@@ -149,6 +149,11 @@ public:
   TicksSemantics ticks_semantics() const { return ticks_semantics_; }
 
   /**
+   * Whether these counters count software ticks (SoftwareTicks.h).
+   */
+  bool is_software() const { return ticks_semantics_ == TICKS_SOFTWARE; }
+
+  /**
    * Return the fd we last used to generate the ticks-counter signal.
    */
   int ticks_interrupt_fd() const { return fd_ticks_interrupt.get(); }
@@ -214,6 +219,11 @@ private:
    */
   Ticks read_ticks(Task* t, Error* error);
 
+  // Software ticks (SoftwareTicks.h).
+  void software_start(Task* t, Ticks ticks_period);
+  Ticks software_read(Task* t);
+  Ticks software_stop(Task* t);
+
   // Only valid while 'counting' is true
   Ticks counting_period;
   pid_t tid;
@@ -247,6 +257,13 @@ private:
   Enabled enabled;
   bool opened;
   bool counting;
+
+  // Software ticks: the countdown value software_start() wrote, the ticks
+  // counted for this task when another task of its address space took the
+  // countdown over, and whether the countdown is still this task's.
+  uint32_t sw_period = 0;
+  Ticks sw_harvested = 0;
+  bool sw_owned = false;
 };
 
 } // namespace rr

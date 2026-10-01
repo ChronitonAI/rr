@@ -22,6 +22,7 @@
 #include "Task.h"
 #include "core.h"
 #include "log.h"
+#include "SoftwareTicks.h"
 
 using namespace std;
 
@@ -659,6 +660,8 @@ void AddressSpace::post_exec_syscall(Task* t) {
                                   "preload_thread_locals");
   mapping_flags_of(preload_thread_locals_start()) |=
       AddressSpace::Mapping::IS_THREAD_LOCALS;
+  // Software ticks: the page's creator parks the countdown (SoftwareTicks.h).
+  init_software_ticks_slot(t);
 }
 
 void AddressSpace::brk(Task* t, remote_ptr<void> addr, int prot) {
@@ -1935,6 +1938,8 @@ bool AddressSpace::post_vm_clone(Task* t) {
                                   "preload_thread_locals");
   mapping_flags_of(preload_thread_locals_start()) |=
       AddressSpace::Mapping::IS_THREAD_LOCALS;
+  // Software ticks: the page's creator parks the countdown (SoftwareTicks.h).
+  init_software_ticks_slot(t);
   return true;
 }
 
