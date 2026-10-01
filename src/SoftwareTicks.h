@@ -73,9 +73,24 @@ void init_software_ticks_slot(Task* t);
  * treated the same way. */
 bool is_software_tick_trap(Task* t);
 
+/* When recording, move a task stopped between a tick's decrement and the end
+ * of its sequence to the end of the sequence. What lies in between (the
+ * branch on the result, the trap) has no effect but the trap, and whether it
+ * runs depends on the countdown's value, which replay programs differently: a
+ * recorded event there could not be found again. Completing the sequence
+ * only drops a pending tick trap, i.e. a time-slice interrupt that the stop
+ * has made moot. Returns whether the pc moved. */
+bool complete_software_tick_sequence(Task* t);
+
 /* Zero the countdown's slot in a copy of a preload thread-locals page (for
  * memory checksums: recording and replay program different values there). */
 void normalize_software_ticks_slot(uint8_t* page, size_t size);
+
+/* The size of the preload_thread_locals segment: PRELOAD_THREAD_LOCALS_SIZE
+ * would end the shared file before the countdown, and the kernel does not
+ * keep what is written to a shared mapping's page beyond the end of the file,
+ * so the segment covers the countdown too. */
+size_t software_ticks_thread_locals_size();
 
 /* Read and write the slot through t's memory. */
 bool read_software_ticks_slot(Task* t, uint64_t* value);

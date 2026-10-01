@@ -2486,6 +2486,12 @@ bool Task::did_waitpid(WaitStatus status) {
     pending_siginfo.si_fd = hpc.ticks_interrupt_fd();
     pending_siginfo.si_code = POLL_IN;
     in_injectable_signal_stop = false;
+  } else if (!status.reaped() && status.stop_sig() &&
+             status.stop_sig() != SIGTRAP && !status.ptrace_event() &&
+             hpc.is_software() && session().is_recording()) {
+    // A signal stop between a tick's decrement and its trap is moved to the
+    // end of the tick sequence, where replay can find it again.
+    complete_software_tick_sequence(this);
   }
 
   wait_status = status;

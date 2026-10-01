@@ -4,6 +4,8 @@
 
 #include <string.h>
 
+#include <algorithm>
+
 #include "AddressSpace.h"
 #include "ElfReader.h"
 #include "Task.h"
@@ -135,6 +137,66 @@ bool is_software_tick_trap(Task* t) {
     return false;
   }
   return !memcmp(buf, seq, len);
+}
+
+bool complete_software_tick_sequence(Task* t) {
+  // The offsets of the instructions after the commit (the decrement): jnz and
+  // int3 (x86-64); jnz, cmpl, jnz and int3 (i386); cbnz and brk (aarch64).
+  static const size_t x64_after_commit[] = { 8, 10 };
+  static const size_t x86_after_commit[] = { 7, 9, 16, 18 };
+  static const size_t arm64_after_commit[] = { 16, 20 };
+  const uint8_t* seq;
+  size_t len;
+  size_t seq_end;
+  const size_t* offsets;
+  size_t noffsets;
+  switch (t->arch()) {
+    case x86_64:
+      seq = tick_x64;
+      len = sizeof(tick_x64);
+      seq_end = len;
+      offsets = x64_after_commit;
+      noffsets = 2;
+      break;
+    case x86:
+      seq = tick_x86;
+      len = sizeof(tick_x86);
+      seq_end = len;
+      offsets = x86_after_commit;
+      noffsets = 4;
+      break;
+    case aarch64:
+      seq = tick_arm64;
+      len = sizeof(tick_arm64);
+      seq_end = len + 4;
+      offsets = arm64_after_commit;
+      noffsets = 2;
+      break;
+    default:
+      return false;
+  }
+  uintptr_t pc = t->ip().register_value();
+  uint8_t buf[sizeof(tick_arm64)];
+  for (size_t i = 0; i < noffsets; ++i) {
+    uintptr_t start = pc - offsets[i];
+    if (t->read_bytes_fallible(remote_ptr<void>(start), len, buf) != (ssize_t)len ||
+        memcmp(buf, seq, len)) {
+      continue;
+    }
+    LOG(debug) << "  stopped inside a tick sequence at " << t->ip()
+               << "; completing it";
+    Registers r = t->regs();
+    r.set_ip(remote_code_ptr(start + seq_end));
+    t->set_regs(r);
+    return true;
+  }
+  return false;
+}
+
+size_t software_ticks_thread_locals_size() {
+  return std::max<size_t>(PRELOAD_THREAD_LOCALS_SIZE,
+                          SOFTWARE_TICKS_COUNTDOWN_ADDR -
+                              PRELOAD_THREAD_LOCALS_ADDR + sizeof(uint64_t));
 }
 
 void normalize_software_ticks_slot(uint8_t* page, size_t size) {
