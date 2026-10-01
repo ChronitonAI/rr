@@ -742,7 +742,7 @@ bool PerfCounters::supports_ticks_semantics(TicksSemantics ticks_semantics) {
     return (pmu_semantics_flags & PMU_TICKS_RCB) != 0;
   case TICKS_TAKEN_BRANCHES:
     return (pmu_semantics_flags & PMU_TICKS_TAKEN_BRANCHES) != 0;
-  case TICKS_SOFTWARE_CONDITIONAL_BLOCKS:
+  case TICKS_SOFTWARE:
     // rr does not implement a tick source for these yet.
     return false;
   default:

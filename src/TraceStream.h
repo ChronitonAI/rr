@@ -487,7 +487,7 @@ public:
   const TraceUuid& uuid() const { return *uuid_; }
 
   TicksSemantics ticks_semantics() const { return ticks_semantics_; }
-  // For TICKS_SOFTWARE_CONDITIONAL_BLOCKS: see Header.softwareTicks.
+  // For TICKS_SOFTWARE: see Header.softwareTicks.
   uint32_t software_ticks_abi_version() const { return software_ticks_abi_version_; }
   remote_ptr<uint64_t> software_ticks_countdown_address() const {
     return software_ticks_countdown_address_;

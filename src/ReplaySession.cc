@@ -247,7 +247,7 @@ ReplaySession::ReplaySession(const std::string& dir, const Flags& flags)
   trace_start_time = trace_frame.monotonic_time();
 
   if (!flags.replay_stops_at_first_execve) {
-    if (ticks_semantics_ == TICKS_SOFTWARE_CONDITIONAL_BLOCKS) {
+    if (ticks_semantics_ == TICKS_SOFTWARE) {
       CLEAN_FATAL()
           << "Trace was recorded with software ticks (counted by the recorded\n"
              "program's own instrumentation); this rr cannot replay it.";

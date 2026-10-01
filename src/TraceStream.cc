@@ -370,8 +370,8 @@ static trace::TicksSemantics to_trace_ticks_semantics(TicksSemantics semantics) 
       return trace::TicksSemantics::RETIRED_CONDITIONAL_BRANCHES;
     case TICKS_TAKEN_BRANCHES:
       return trace::TicksSemantics::TAKEN_BRANCHES;
-    case TICKS_SOFTWARE_CONDITIONAL_BLOCKS:
-      return trace::TicksSemantics::SOFTWARE_CONDITIONAL_BLOCKS;
+    case TICKS_SOFTWARE:
+      return trace::TicksSemantics::SOFTWARE;
     default:
       FATAL() << "Unknown ticks semantics";
       return trace::TicksSemantics::RETIRED_CONDITIONAL_BRANCHES;
@@ -384,8 +384,8 @@ static TicksSemantics from_trace_ticks_semantics(trace::TicksSemantics semantics
       return TICKS_RETIRED_CONDITIONAL_BRANCHES;
     case trace::TicksSemantics::TAKEN_BRANCHES:
       return TICKS_TAKEN_BRANCHES;
-    case trace::TicksSemantics::SOFTWARE_CONDITIONAL_BLOCKS:
-      return TICKS_SOFTWARE_CONDITIONAL_BLOCKS;
+    case trace::TicksSemantics::SOFTWARE:
+      return TICKS_SOFTWARE;
     default:
       FATAL() << "Unknown ticks semantics";
       return TICKS_RETIRED_CONDITIONAL_BRANCHES;

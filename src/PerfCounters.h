@@ -32,7 +32,7 @@ enum TicksSemantics {
   TICKS_TAKEN_BRANCHES,
   // Counted by the tracee's own instrumented code, not by the PMU.
   // See Header.softwareTicks in rr_trace.capnp.
-  TICKS_SOFTWARE_CONDITIONAL_BLOCKS,
+  TICKS_SOFTWARE,
 };
 
 /**
