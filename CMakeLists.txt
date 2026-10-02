@@ -1111,6 +1111,7 @@ set(BASIC_TESTS
   fork_brk
   fork_child_crash
   fork_many
+  fork_stashed_sigmask
   fsmount
   fstatat
   futex_exit_race
