@@ -320,18 +320,15 @@ bool Scheduler::is_task_runnable(RecordTask* t, WaitAggregator& wait_aggregator,
       // in the case where t->is_stopped(), because if we don't PTRACE_CONT
       // the task, we'll never see the SIGCONT.
       t->emulate_SIGCONT();
-      // We shouldn't run any user code since there is at least one signal
-      // pending.
-      if (t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
-        *by_waitpid = true;
-        must_run_task = t;
-        LOGM(debug) << "  Got " << t->tid
-                   << " out of emulated stop due to pending SIGCONT";
-        return true;
-      }
-      // Tracee exited unexpectedly. Reexamine it now in case it has a new
-      // status we can use. Note that we cleared `t->emulated_stop_type`
-      // so we won't end up here again.
+      LOGM(debug) << "  Got " << t->tid
+                  << " out of emulated stop due to pending SIGCONT";
+      // Don't resume t here. Its current stop may not have been processed
+      // yet: we may have collected it (e.g. a syscall exit) while another
+      // task was running, before the group stop. Resuming would skip it.
+      // Examine t like any other task now that it's no longer in an emulated
+      // stop (emulate_SIGCONT cleared `t->emulated_stop_type`, so we won't
+      // end up here again). The kernel reports the SIGCONT before t runs any
+      // user code.
       return is_task_runnable(t, wait_aggregator, by_waitpid);
     } else {
       LOGM(debug) << "  " << t->tid << " is stopped by ptrace or signal";

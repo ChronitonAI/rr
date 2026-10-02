@@ -1410,6 +1410,7 @@ set(BASIC_TESTS
   sigrt
   sigstop
   sigstop2
+  sigstop_blocked_thread
   sigsuspend
   sigtrap
   simple_threads_stress
