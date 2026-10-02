@@ -1380,8 +1380,13 @@ GdbServer::ContinueOrStop GdbServer::handle_exited_state(
       return s;
     }
     if (req.type == DREQ_INTERRUPT) {
-      // Ignore this. Sometimes LLDB seems to send it automatically
-      // after the task has exited, before we detach I guess.
+      // The debugger interrupted the process before it saw our exit
+      // notification, e.g. LLDB halts a process that it thinks is running
+      // before killing it. The exit notification already answered the
+      // resume request, so there is nothing left to interrupt. Don't reply:
+      // the debugger would take a stop reply as the reply to its next
+      // request.
+      dbg->ignore_interrupt_after_exit();
       continue;
     }
     FATAL() << "Received continue/interrupt request after end-of-trace: "
@@ -1423,7 +1428,10 @@ GdbServer::ContinueOrStop GdbServer::debug_one_step(
         return handle_exited_state(last_resume_request);
       }
     } else {
-      if (req.type != DREQ_DETACH) {
+      // An interrupt that the debugger sent before it saw our stop
+      // notification doesn't move the debuggee: report the SIGKILL stop
+      // again below, and still report the exit at the next forward resume.
+      if (req.type != DREQ_DETACH && req.type != DREQ_INTERRUPT) {
         in_debuggee_end_state = false;
       }
     }

@@ -1619,6 +1619,11 @@ void GdbServerConnection::notify_exit_signal(int sig) {
   consume_request();
 }
 
+void GdbServerConnection::ignore_interrupt_after_exit() {
+  DEBUG_ASSERT(req.type == DREQ_INTERRUPT);
+  consume_request();
+}
+
 /**
  * Translate linux-x86 |sig| to gdb's internal numbering.  Translation
  * made according to gdb/include/gdb/signals.def.

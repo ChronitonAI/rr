@@ -528,6 +528,12 @@ public:
    */
   void notify_exit_signal(int sig);
 
+  /**
+   * Finish a DREQ_INTERRUPT request that arrived after we notified the
+   * debugger that the process exited, without replying to it.
+   */
+  void ignore_interrupt_after_exit();
+
   struct ThreadInfo {
     ExtendedTaskId id;
     uintptr_t pc;
