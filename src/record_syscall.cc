@@ -3679,6 +3679,13 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
   RecordTask* new_task = static_cast<RecordTask*>(
       t->session().clone(t, clone_flags_to_task_flags(flags), params.stack,
                          params.tls, params.ctid, new_tid));
+  if (t->stashed_signals_blocking_more_signals) {
+    // While |t| has stashed signals, we block all signals but our own
+    // whenever it runs (see RecordTask::will_resume_execution), so the new
+    // task inherited that mask. Give it |t|'s real mask.
+    new_task->set_sigmask(t->get_sigmask());
+    new_task->invalidate_sigmask();
+  }
 
   // Restore modified registers in cloned task
   Registers new_r = new_task->regs();
