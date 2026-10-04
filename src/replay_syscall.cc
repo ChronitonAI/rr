@@ -239,12 +239,16 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
       << "Unexpected ptrace event while waiting for syscall exit; got "
       << ptrace_event_name(t->ptrace_event());
 
+  // The arguments of the recorded syscall
+  Registers trace_regs = trace_frame.regs();
+  trace_regs.set_syscall_arch(Arch::arch());
+
   r = t->regs();
   // Restore the saved flags, to hide the fact that we may have
   // masked out CLONE_UNTRACED/CLONE_CHILD_CLEARTID or changed from vfork to
   // clone.
-  r.set_arg1(trace_frame.regs().arg1());
-  r.set_arg2(trace_frame.regs().arg2());
+  r.set_arg1(trace_regs.arg1());
+  r.set_arg2(trace_regs.arg2());
   // Pretend we're still in the system call
   r.set_syscall_result(-ENOSYS);
   r.set_original_syscallno(trace_frame.regs().original_syscallno());
@@ -283,13 +287,14 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
     new_task->apply_data_record_from_trace();
   }
 
-  // Fix registers in new task
+  // Fix registers in new task, which is in the same syscall
+  Task::SyscallArchScope new_task_scope(new_task, Arch::arch());
   Registers new_r = new_task->regs();
   new_r.set_original_syscallno(trace_frame.regs().original_syscallno());
-  new_r.set_orig_arg1(trace_frame.regs().arg1());
-  new_r.set_arg2(trace_frame.regs().arg2());
+  new_r.set_orig_arg1(trace_regs.arg1());
+  new_r.set_arg2(trace_regs.arg2());
   new_task->set_regs(new_r);
-  new_task->canonicalize_regs(new_task->arch());
+  new_task->canonicalize_regs(Arch::arch());
 
   if (!syscall_shares_vm<Arch>(r)) {
     // It's hard to imagine a scenario in which it would
@@ -774,8 +779,9 @@ static void process_mremap(ReplayTask* t, const TraceFrame& trace_frame,
                            ReplayTraceStep* step) {
   step->action = TSTEP_RETIRE;
 
-  auto& trace_regs = trace_frame.regs();
-  remote_ptr<void> old_addr = trace_frame.regs().orig_arg1();
+  Registers trace_regs = trace_frame.regs();
+  trace_regs.set_syscall_arch(trace_frame.event().Syscall().arch());
+  remote_ptr<void> old_addr = trace_regs.orig_arg1();
   size_t old_size = ceil_page_size(trace_regs.arg2());
   remote_ptr<void> new_addr = trace_frame.regs().syscall_result();
   size_t new_size = ceil_page_size(trace_regs.arg3());
@@ -803,15 +809,15 @@ static void process_mremap(ReplayTask* t, const TraceFrame& trace_frame,
     if (new_addr == old_addr) {
       // Non-moving mremap. Don't pass MREMAP_FIXED or MREMAP_MAYMOVE
       // since that triggers EINVAL when the new map overlaps the old map.
-      remote.infallible_syscall_if_alive(trace_regs.original_syscallno(), new_addr,
-                                         old_size, new_size, 0);
+      remote.infallible_syscall_if_alive(syscall_number_for_mremap(t->arch()),
+                                         new_addr, old_size, new_size, 0);
     } else {
       // Force the mremap to use the destination address from recording.
       // XXX could the new mapping overlap the old, with different start
       // addresses? Hopefully the kernel doesn't do that to us!!!
-      remote.infallible_syscall_if_alive(trace_regs.original_syscallno(), old_addr,
-                                         old_size, new_size,
-                                         flags | MREMAP_MAYMOVE | MREMAP_FIXED, new_addr);
+      remote.infallible_syscall_if_alive(
+          syscall_number_for_mremap(t->arch()), old_addr, old_size, new_size,
+          flags | MREMAP_MAYMOVE | MREMAP_FIXED, new_addr);
     }
 
     remote.regs().set_syscall_result(new_addr);
@@ -1037,7 +1043,9 @@ static void rep_after_enter_syscall_arch(ReplayTask* t) {
 }
 
 void rep_after_enter_syscall(ReplayTask* t) {
-  RR_ARCH_FUNCTION(rep_after_enter_syscall_arch, t->arch(), t)
+  SupportedArch arch = t->current_trace_frame().event().Syscall().arch();
+  Task::SyscallArchScope scope(t, arch);
+  RR_ARCH_FUNCTION(rep_after_enter_syscall_arch, arch, t)
 }
 
 void rep_prepare_run_to_syscall(ReplayTask* t, ReplayTraceStep* step) {
@@ -1408,12 +1416,16 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
 void rep_process_syscall(ReplayTask* t, ReplayTraceStep* step) {
   const TraceFrame& trace_frame = t->current_trace_frame();
   step->syscall.arch = trace_frame.event().Syscall().arch();
-  const Registers& trace_regs = trace_frame.regs();
-  with_converted_registers<void>(
-      trace_regs, step->syscall.arch, [&](const Registers& trace_regs) {
-        RR_ARCH_FUNCTION(rep_process_syscall_arch, step->syscall.arch, t, step,
-                         trace_regs)
-      });
+  // The exit of an exec that changed the arch has the new arch, but t still
+  // has the old one: its registers don't hold syscall arguments of the new
+  // arch.
+  Task::SyscallArchScope scope(t, trace_frame.regs().arch() == t->arch()
+                                      ? step->syscall.arch
+                                      : t->arch());
+  Registers trace_regs = trace_frame.regs();
+  trace_regs.set_syscall_arch(step->syscall.arch);
+  RR_ARCH_FUNCTION(rep_process_syscall_arch, step->syscall.arch, t, step,
+                   trace_regs)
 }
 
 } // namespace rr

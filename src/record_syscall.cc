@@ -385,6 +385,7 @@ struct TaskSyscallState : TaskSyscallStateBase {
       return;
     }
     this->t = t;
+    arch = t->ev().Syscall().arch();
     scratch = t->scratch_ptr;
   }
 
@@ -536,6 +537,10 @@ struct TaskSyscallState : TaskSyscallStateBase {
 
   RecordTask* emulate_wait_for_child;
 
+  /** The arch of the syscall (which an x86-64 task can make with int $0x80 to
+   *  make an i386 syscall). Pointers in memory parameters have its size. */
+  SupportedArch arch;
+
   /** Saved syscall-entry registers, used by code paths that modify the
    *  registers temporarily.
    */
@@ -576,6 +581,7 @@ struct TaskSyscallState : TaskSyscallStateBase {
   TaskSyscallState()
       : t(nullptr),
         emulate_wait_for_child(nullptr),
+        arch(NativeArch::arch()),
         expect_errno(0),
         should_emulate_result(false),
         preparation_done(false),
@@ -589,9 +595,9 @@ static void set_remote_ptr_arch(RecordTask* t, remote_ptr<void> addr,
   t->write_mem(typed_addr, (typename Arch::unsigned_word)value.as_int());
 }
 
-static void set_remote_ptr(RecordTask* t, remote_ptr<void> addr,
-                           remote_ptr<void> value) {
-  RR_ARCH_FUNCTION(set_remote_ptr_arch, t->arch(), t, addr, value);
+static void set_remote_ptr(RecordTask* t, SupportedArch arch,
+                           remote_ptr<void> addr, remote_ptr<void> value) {
+  RR_ARCH_FUNCTION(set_remote_ptr_arch, arch, t, addr, value);
 }
 
 template <typename Arch>
@@ -602,8 +608,9 @@ static remote_ptr<void> get_remote_ptr_arch(RecordTask* t,
   return remote_ptr<void>(old);
 }
 
-static remote_ptr<void> get_remote_ptr(RecordTask* t, remote_ptr<void> addr) {
-  RR_ARCH_FUNCTION(get_remote_ptr_arch, t->arch(), t, addr);
+static remote_ptr<void> get_remote_ptr(RecordTask* t, SupportedArch arch,
+                                       remote_ptr<void> addr) {
+  RR_ARCH_FUNCTION(get_remote_ptr_arch, arch, t, addr);
 }
 
 static void align_scratch(remote_ptr<void>* scratch, uintptr_t amount = 8) {
@@ -644,7 +651,7 @@ remote_ptr<void> TaskSyscallState::mem_ptr_parameter(
   }
 
   MemoryParam param;
-  param.dest = get_remote_ptr(t, addr_of_buf_ptr);
+  param.dest = get_remote_ptr(t, arch, addr_of_buf_ptr);
   if (param.dest.is_null()) {
     return remote_ptr<void>();
   }
@@ -705,6 +712,14 @@ Switchable TaskSyscallState::done_preparing_internal(Switchable sw) {
   if (switchable == PREVENT_SWITCH || param_list.empty()) {
     return switchable;
   }
+  if (arch != t->arch() && (scratch.as_int() - 1) > UINT32_MAX) {
+    // An i386 syscall of an x86-64 task takes 32-bit pointers, and our
+    // scratch memory is above 4GB.
+    LOG(debug) << "`" << t->ev().Syscall().syscall_name()
+               << "' can't use scratch memory above 4GB. Allowing the "
+               << "syscall to proceed without scratch, which may race.";
+    return switchable;
+  }
 
   scratch_enabled = true;
 
@@ -737,7 +752,7 @@ Switchable TaskSyscallState::done_preparing_internal(Switchable sw) {
         // Update pointer to point to scratch.
         // Note that this can only happen after step 1 is complete and all
         // parameter data has been copied to scratch memory.
-        set_remote_ptr(t, p, param.scratch);
+        set_remote_ptr(t, arch, p, param.scratch);
       }
       // If the number of bytes to record is coming from a memory location,
       // update that location to scratch.
@@ -830,7 +845,7 @@ void TaskSyscallState::process_syscall_results() {
       }
       if (!param.ptr_in_memory.is_null()) {
         memory_cleaned_up = true;
-        set_remote_ptr(t, param.ptr_in_memory, param.dest);
+        set_remote_ptr(t, arch, param.ptr_in_memory, param.dest);
       }
     }
     if (write_back == WRITE_BACK) {
@@ -922,7 +937,7 @@ void TaskSyscallState::abort_syscall_results() {
         r.set_arg(param.ptr_in_reg, param.dest.as_int());
       }
       if (!param.ptr_in_memory.is_null()) {
-        set_remote_ptr(t, param.ptr_in_memory, param.dest);
+        set_remote_ptr(t, arch, param.ptr_in_memory, param.dest);
       }
     }
     t->set_regs(r);
@@ -1447,18 +1462,45 @@ static void record_page_below_stack_ptr(RecordTask* t) {
 
 typedef ethtool_gstrings GStrings;
 
+/**
+ * The name and ifru_data of a struct ifreq of Arch at p.
+ */
+template <typename Arch>
+static bool read_ifreq_name_and_data_arch(RecordTask* t, remote_ptr<void> p,
+                                          char* name, remote_ptr<void>* data) {
+  bool ok = true;
+  auto ifreq = t->read_mem(p.cast<typename Arch::ifreq>(), &ok);
+  if (!ok) {
+    return false;
+  }
+  memcpy(name, ifreq.ifr_ifrn.ifrn_name, sizeof(ifreq.ifr_ifrn.ifrn_name));
+  *data = ifreq.ifr_ifru.ifru_data.rptr();
+  return true;
+}
+
+static bool read_ifreq_name_and_data(RecordTask* t, SupportedArch arch,
+                                     remote_ptr<void> p, char* name,
+                                     remote_ptr<void>* data) {
+  RR_ARCH_FUNCTION(read_ifreq_name_and_data_arch, arch, t, p, name, data);
+}
+
 template <typename Arch> void get_ethtool_gstrings_arch(RecordTask* t) {
   auto& syscall_state = TaskSyscallState::get(t);
   Registers& regs = syscall_state.syscall_entry_registers;
-  bool ok = true;
-  auto ifreq = t->read_mem(remote_ptr<typename Arch::ifreq>(regs.arg3()), &ok);
   Registers new_regs = t->regs();
-  if (!ok) {
+  // The tracee's struct ifreq has the syscall's layout (an x86-64 task can
+  // make an i386 ioctl() with int $0x80). Our own ioctl()s use the task's
+  // (Arch).
+  typename Arch::ifreq ifreq;
+  memset(&ifreq, 0, sizeof(ifreq));
+  remote_ptr<void> p;
+  if (!read_ifreq_name_and_data(t, syscall_state.arch, regs.arg3(),
+                                ifreq.ifr_ifrn.ifrn_name, &p)) {
     new_regs.set_syscall_result(-EFAULT);
     t->set_regs(new_regs);
     return;
   }
-  remote_ptr<void> p = ifreq.ifr_ifru.ifru_data.rptr();
+  bool ok = true;
   auto orig_gstrings = p.cast<ethtool_gstrings>();
   auto et_gstrings = t->read_mem(orig_gstrings, &ok);
   if (!ok) {
@@ -1471,6 +1513,7 @@ template <typename Arch> void get_ethtool_gstrings_arch(RecordTask* t) {
     t->set_regs(new_regs);
     return;
   }
+  int fd = regs.arg1_signed();
 
   AutoRemoteSyscalls remote(t);
 
@@ -1488,8 +1531,8 @@ template <typename Arch> void get_ethtool_gstrings_arch(RecordTask* t) {
   ifreq.ifr_ifru.ifru_data = et_mem.get();
   AutoRestoreMem ifr_mem(remote, &ifreq, sizeof(ifreq));
 
-  long ret = remote.syscall(regs.original_syscallno(), regs.arg1(),
-      SIOCETHTOOL, ifr_mem.get());
+  int ioctl_no = syscall_number_for_ioctl(Arch::arch());
+  long ret = remote.syscall(ioctl_no, fd, SIOCETHTOOL, ifr_mem.get());
   if (ret < 0) {
     remote.regs().set_syscall_result(ret);
     return;
@@ -1497,8 +1540,9 @@ template <typename Arch> void get_ethtool_gstrings_arch(RecordTask* t) {
 
   uint32_t data = t->read_mem((et_mem.get() + sizeof(et)).cast<uint32_t>());
   // Now do the ETHTOOL_GSTRINGS call
-  ret = remote.syscall(regs.original_syscallno(), regs.arg1(), SIOCETHTOOL,
-      regs.arg3());
+  ifreq.ifr_ifru.ifru_data = orig_gstrings;
+  t->write_mem(ifr_mem.get().cast<typename Arch::ifreq>(), ifreq);
+  ret = remote.syscall(ioctl_no, fd, SIOCETHTOOL, ifr_mem.get());
   remote.regs().set_syscall_result(ret);
   if (ret < 0) {
     return;
@@ -2423,8 +2467,9 @@ static void maybe_pause_instead_of_waiting(RecordTask* t) {
   // pause() would be sufficient here, but we don't have that on all
   // architectures, so use ppoll(NULL, 0, NULL, NULL), which is what
   // glibc uses to implement pause() on architectures where the former
-  // doesn't exist
-  r.set_original_syscallno(syscall_number_for_ppoll(t->arch()));
+  // doesn't exist. (The syscall's arch: an x86-64 task can make i386
+  // waits with int $0x80.)
+  r.set_original_syscallno(syscall_number_for_ppoll(r.syscall_arch()));
   r.set_arg1(0);
   r.set_arg2(0);
   r.set_arg3(0);
@@ -3515,10 +3560,22 @@ static void prepare_mmap_register_params(RecordTask* t) {
       // Ensure stacks can grow to the minimum size we choose
       len = max<size_t>(AddressSpace::chaos_mode_min_stack_size(), len);
     }
-    remote_ptr<void> addr = t->vm()->chaos_mode_find_free_memory(t, len, hint);
+    // The syscall's arch: an i386 mmap() of an x86-64 task (int $0x80) gets
+    // memory below 4GB.
+    remote_ptr<void> addr =
+        t->vm()->chaos_mode_find_free_memory(t, len, hint, r.syscall_arch());
     if (addr.is_null()) {
       // force ENOMEM if other flags are valid
-      r.set_arg2(uintptr_t(1) << (word_size(t->arch())*8 - 1));
+      if (word_size(r.syscall_arch()) == 4) {
+        // A 32-bit mmap() (for an x86-64 task, an i386 one) gets memory
+        // below 4GB, where 2GB can still fit. Ask for more than any 32-bit
+        // address space has, and drop the hint (which the kernel accepts up
+        // to the task's TASK_SIZE).
+        r.set_arg1(0);
+        r.set_arg2(uintptr_t(0xfffff000));
+      } else {
+        r.set_arg2(uintptr_t(1) << (word_size(r.syscall_arch()) * 8 - 1));
+      }
       t->set_regs(r);
       return;
     }
@@ -3680,6 +3737,8 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
       t->session().clone(t, clone_flags_to_task_flags(flags), params.stack,
                          params.tls, params.ctid, new_tid));
 
+  // The new task is in the same syscall.
+  Task::SyscallArchScope new_task_scope(new_task, Arch::arch());
   // Restore modified registers in cloned task
   Registers new_r = new_task->regs();
   new_r.set_original_syscallno(
@@ -3698,7 +3757,7 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
   new_task->ip_at_last_recorded_syscall_exit = new_r.ip();
 
   /* record child id here */
-  if (is_clone_syscall(original_syscall, r.arch())) {
+  if (is_clone_syscall(original_syscall, Arch::arch())) {
     CloneParameters child_params = extract_clone_parameters(new_task);
     t->record_remote_even_if_null(params.ptid);
 
@@ -5712,14 +5771,13 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
 static Switchable rec_prepare_syscall_internal(
     RecordTask* t, TaskSyscallState& syscall_state) {
   SupportedArch arch = t->ev().Syscall().arch();
-  return with_converted_registers<Switchable>(
-      t->regs(), arch, [&](const Registers& regs) -> Switchable {
-        RR_ARCH_FUNCTION(rec_prepare_syscall_arch, arch, t, syscall_state,
-                         regs);
-      });
+  // A copy: the handlers may change t's registers.
+  Registers regs = t->regs();
+  RR_ARCH_FUNCTION(rec_prepare_syscall_arch, arch, t, syscall_state, regs);
 }
 
 Switchable rec_prepare_syscall(RecordTask* t) {
+  Task::SyscallArchScope scope(t, t->ev().Syscall().arch());
   t->syscall_state = make_unique<TaskSyscallState>();
   auto& syscall_state = TaskSyscallState::get(t);
   syscall_state.init(t);
@@ -5733,6 +5791,7 @@ void rec_abort_prepared_syscall(RecordTask* t) {
   if (!syscall_state) {
     return;
   }
+  Task::SyscallArchScope scope(t, t->ev().Syscall().arch());
   syscall_state->abort_syscall_results();
   t->syscall_state = nullptr;
 }
@@ -5742,6 +5801,7 @@ bool rec_return_normally_from_wait(RecordTask* t) {
   if (!syscall_state) {
     return false;
   }
+  Task::SyscallArchScope scope(t, t->ev().Syscall().arch());
   if (syscall_state->emulate_wait_for_child) {
     return true;
   }
@@ -5813,11 +5873,12 @@ static void rec_prepare_restart_syscall_arch(RecordTask* t,
 
 static void rec_prepare_restart_syscall_internal(
     RecordTask* t, TaskSyscallState& syscall_state) {
-  RR_ARCH_FUNCTION(rec_prepare_restart_syscall_arch, t->arch(), t,
-                   syscall_state);
+  RR_ARCH_FUNCTION(rec_prepare_restart_syscall_arch, t->ev().Syscall().arch(),
+                   t, syscall_state);
 }
 
 void rec_prepare_restart_syscall(RecordTask* t) {
+  Task::SyscallArchScope scope(t, t->ev().Syscall().arch());
   auto& syscall_state = TaskSyscallState::get(t);
   rec_prepare_restart_syscall_internal(t, syscall_state);
   t->syscall_state = nullptr;
@@ -7614,6 +7675,7 @@ static void rec_process_syscall_internal(RecordTask* t, SupportedArch arch,
 }
 
 void rec_did_sigreturn(RecordTask *t) {
+  Task::SyscallArchScope scope(t, t->ev().Syscall().arch());
   auto& syscall_state = TaskSyscallState::get(t);
   aarch64_kernel_bug_workaround(t, syscall_state);
   t->syscall_state = nullptr;
@@ -7622,6 +7684,7 @@ void rec_did_sigreturn(RecordTask *t) {
 void rec_process_syscall(RecordTask* t) {
   auto& syscall_state = TaskSyscallState::get(t);
   const SyscallEvent& sys_ev = t->ev().Syscall();
+  Task::SyscallArchScope scope(t, sys_ev.arch());
   if (sys_ev.arch() != t->arch()) {
     static bool did_warn = false;
     if (!did_warn) {

@@ -108,9 +108,12 @@ const ReplaySession::MemoryRanges& ReplaySession::always_free_address_space(
     // or had PR_SET_VMA_ANON_NAME called on it, we need to delete it as well.
     if (event.is_syscall_event()) {
       auto syscall_event = event.Syscall();
+      // The arguments of an i386 syscall of an x86-64 task (int $0x80) are
+      // in its i386 argument registers.
+      auto regs = frame.regs();
+      regs.set_syscall_arch(syscall_event.arch());
       if (is_mprotect_syscall(syscall_event.number, syscall_event.arch()) ||
           is_pkey_mprotect_syscall(syscall_event.number, syscall_event.arch())) {
-        auto regs = frame.regs();
         if (regs.arg3() != PROT_NONE) {
           remote_ptr<void> start = regs.arg1();
           size_t size = regs.arg2();
@@ -118,7 +121,6 @@ const ReplaySession::MemoryRanges& ReplaySession::always_free_address_space(
         }
       }
       if (is_prctl_syscall(syscall_event.number, syscall_event.arch())) {
-        auto regs = frame.regs();
         if (regs.arg2() == PR_SET_VMA_ANON_NAME) {
           remote_ptr<void> start = regs.arg3();
           size_t size = regs.arg4();

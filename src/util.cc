@@ -1204,7 +1204,8 @@ static CloneParameters extract_clone_parameters_arch(const Registers& regs) {
 }
 
 CloneParameters extract_clone_parameters(Task* t) {
-  RR_ARCH_FUNCTION(extract_clone_parameters_arch, t->arch(), t->regs());
+  RR_ARCH_FUNCTION(extract_clone_parameters_arch, t->regs().syscall_arch(),
+                   t->regs());
 }
 
 int read_elf_class(const string& filename) {

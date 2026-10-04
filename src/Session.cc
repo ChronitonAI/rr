@@ -474,8 +474,8 @@ KernelMapping Session::create_shared_mmap(
   if (child_map_addr.is_null()) {
     if (t->session().is_recording() &&
         static_cast<RecordTask*>(t)->enable_chaos_memory_allocations()) {
-      child_map_addr = t->vm()->chaos_mode_find_free_memory(static_cast<RecordTask*>(t),
-          size, nullptr);
+      child_map_addr = t->vm()->chaos_mode_find_free_memory(
+          static_cast<RecordTask*>(t), size, nullptr, t->arch());
     } else {
       child_map_addr = t->vm()->find_free_memory(t, size, RR_PAGE_ADDR,
           AddressSpace::FindFreeMemoryPolicy::USE_LAST_FREE_HINT);

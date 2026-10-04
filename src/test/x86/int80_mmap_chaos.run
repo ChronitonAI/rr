@@ -1,0 +1,5 @@
+source `dirname $0`/util.sh
+
+# Chaos mode randomizes the address of mmap()s, including i386 ones.
+RECORD_ARGS=--chaos
+compare_test EXIT-SUCCESS "" int80_mmap$bitness
