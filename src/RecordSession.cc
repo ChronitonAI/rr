@@ -1053,16 +1053,17 @@ static void syscall_not_restarted(RecordTask* t) {
  * syscall interruption, whether or whether not a syscall was
  * restarted.
  */
-static bool maybe_restart_syscall(RecordTask* t) {
-  if (is_restart_syscall_syscall(t->regs().original_syscallno(), t->arch())) {
+static bool maybe_restart_syscall(RecordTask* t, SupportedArch syscall_arch) {
+  if (is_restart_syscall_syscall(t->regs().original_syscallno(),
+                                 syscall_arch)) {
     LOG(debug) << "  " << t->tid << ": SYS_restart_syscall'ing " << t->ev();
   }
-  if (t->is_syscall_restart()) {
+  if (t->is_syscall_restart(syscall_arch)) {
     t->ev().transform(EV_SYSCALL);
     Registers regs = t->regs();
     regs.set_original_syscallno(t->ev().Syscall().regs.original_syscallno());
     t->set_regs(regs);
-    t->canonicalize_regs(t->arch());
+    t->canonicalize_regs(t->ev().Syscall().arch());
     return true;
   }
   if (EV_SYSCALL_INTERRUPTION == t->ev().type()) {
@@ -1092,8 +1093,10 @@ static void maybe_discard_syscall_interruption(RecordTask* t, intptr_t ret) {
     syscall_not_restarted(t);
   } else if (t->arch() == x86 || t->arch() == x86_64) {
     SupportedArch arch;
-    if (get_syscall_instruction_arch(t, t->regs().ip(), &arch) && arch == t->arch() &&
-        (syscallno == ret || is_restart_syscall_syscall(ret, t->ev().Syscall().arch()))) {
+    if (get_syscall_instruction_arch(t, t->regs().ip(), &arch) &&
+        arch == t->ev().Syscall().arch() &&
+        (syscallno == ret ||
+         is_restart_syscall_syscall(ret, t->ev().Syscall().arch()))) {
       return;
     }
     syscall_not_restarted(t);
@@ -1313,10 +1316,10 @@ void RecordSession::syscall_state_changed(RecordTask* t,
 
         /* TODO: is there any reason a restart_syscall can't
          * be interrupted by a signal and itself restarted? */
-        bool may_restart = !is_restart_syscall_syscall(syscallno, t->arch())
+        bool may_restart = !is_restart_syscall_syscall(syscallno, syscall_arch)
                            // SYS_pause is either interrupted or
                            // never returns.  It doesn't restart.
-                           && !is_pause_syscall(syscallno, t->arch()) &&
+                           && !is_pause_syscall(syscallno, syscall_arch) &&
                            t->regs().syscall_may_restart() &&
                            !return_normally_from_wait;
         /* no need to process the syscall in case its
@@ -1809,6 +1812,9 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
         Event *prev_ev = t->prev_ev();
         if (can_switch == PREVENT_SWITCH && !has_other_signals && prev_ev &&
             EV_SYSCALL_INTERRUPTION == prev_ev->type()) {
+          // The interrupted syscall's arch, which may not be the task's
+          // (an x86-64 task can make i386 syscalls with int $0x80).
+          SupportedArch syscall_arch = prev_ev->Syscall().arch();
           switch (prev_ev->Syscall().regs.syscall_result_signed()) {
             case -ERESTARTNOHAND:
             case -ERESTARTSYS:
@@ -1816,7 +1822,7 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
               r.set_syscallno(r.original_syscallno());
               break;
             case -ERESTART_RESTARTBLOCK:
-              r.set_syscallno(syscall_number_for_restart_syscall(t->arch()));
+              r.set_syscallno(syscall_number_for_restart_syscall(syscall_arch));
               break;
           }
           // On aarch64, the kernel modifies the registers before the signal stop.
@@ -1824,7 +1830,7 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
           // before the syscall.
           // [1] https://github.com/torvalds/linux/blob/caffb99b6929f41a69edbb5aef3a359bf45f3315/arch/arm64/kernel/signal.c#L855-L862
           if (t->arch() != aarch64)
-            r.set_ip(r.ip().decrement_by_syscall_insn_length(t->arch()));
+            r.set_ip(r.ip().decrement_by_syscall_insn_length(syscall_arch));
           // Now that we've mucked with the registers, we can't switch tasks. That
           // could allow more signals to be generated, breaking our assumption
           // that we are the last signal.
@@ -2062,7 +2068,7 @@ bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
   }
 
   // We just entered a syscall.
-  if (!maybe_restart_syscall(t)) {
+  if (!maybe_restart_syscall(t, syscall_arch)) {
     if (syscall_seccomp_ordering_ == PTRACE_SYSCALL_BEFORE_SECCOMP_UNKNOWN &&
         t->seccomp_bpf_enabled) {
       // We received a PTRACE_SYSCALL notification before the seccomp

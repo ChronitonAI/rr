@@ -1566,17 +1566,20 @@ const RecordTask::StashedSignal* RecordTask::peek_stashed_sig_to_deliver()
   return &stashed_signals[0];
 }
 
-bool RecordTask::is_syscall_restart() {
+bool RecordTask::is_syscall_restart(SupportedArch syscall_arch) {
   if (EV_SYSCALL_INTERRUPTION != ev().type()) {
     return false;
   }
 
   int syscallno = regs().original_syscallno();
-  SupportedArch syscall_arch = ev().Syscall().arch();
   string call_name = syscall_name(syscallno, syscall_arch);
   bool is_restart = false;
   LOG(debug) << "  is syscall interruption of recorded " << ev() << "? (now "
              << call_name << ")";
+  if (syscall_arch != ev().Syscall().arch()) {
+    LOG(debug) << "  interrupted " << ev() << " is a syscall of another arch";
+    goto done;
+  }
 
   /* It's possible for the tracee to resume after a sighandler
    * with a fresh syscall that happens to be the same as the one
@@ -1671,12 +1674,19 @@ bool RecordTask::at_may_restart_syscall() const {
           EV_SYSCALL_INTERRUPTION == prev_ev->type());
 }
 
-bool RecordTask::at_interrupted_non_restartable_signal_modifying_syscall() const {
+bool RecordTask::at_interrupted_non_restartable_signal_modifying_syscall() {
   auto r = regs();
+  if (r.syscall_result_signed() != -EINTR) {
+    return false;
+  }
+  // The syscall's arch: an x86-64 task can make i386 syscalls with
+  // int $0x80.
+  SupportedArch syscall_arch = arch();
+  get_syscall_instruction_arch(
+      this, r.ip().decrement_by_syscall_insn_length(arch()), &syscall_arch);
   // XXXkhuey io_uring_enter (not yet supported) can do this too.
-  return r.syscall_result_signed() == -EINTR &&
-    (is_epoll_pwait_syscall(r.original_syscallno(), arch()) ||
-     is_epoll_pwait2_syscall(r.original_syscallno(), arch()));
+  return is_epoll_pwait_syscall(r.original_syscallno(), syscall_arch) ||
+         is_epoll_pwait2_syscall(r.original_syscallno(), syscall_arch);
 }
 
 bool RecordTask::is_arm_desched_event_syscall() {
