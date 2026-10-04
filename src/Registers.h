@@ -415,6 +415,8 @@ public:
     RR_UPDATE_CHECK(u.x64regs.r11, value);
   }
 
+  uintptr_t bx() const { return RR_GET_REG_X86(ebx, rbx); }
+
   uintptr_t di() const { return RR_GET_REG_X86(edi, rdi); }
   bool set_di(uintptr_t value) { return RR_SET_REG_X86(edi, rdi, value); }
 

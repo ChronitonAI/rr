@@ -3249,6 +3249,9 @@ static Switchable prepare_ptrace(RecordTask* t,
           // in practice it actually sends SIGSTOP.
           tracee->apply_group_stop(SIGSTOP);
         } else if (tracee->status().is_syscall()) {
+          tracee->emulated_stop_syscall_arch =
+              tracee->ev().is_syscall_event() ? tracee->ev().Syscall().arch()
+                                              : tracee->arch();
           tracee->emulate_ptrace_stop(tracee->status(), SYSCALL_EXIT_STOP);
         } else if (tracee->emulated_stop_pending == NOT_STOPPED) {
           // The tracee is stopped from our perspective, but not stopped from
@@ -3272,14 +3275,31 @@ static Switchable prepare_ptrace(RecordTask* t,
           tracee->emulated_stop_type == SYSCALL_EXIT_STOP  ? PTRACE_SYSCALL_INFO_EXIT :
           tracee->emulated_stop_type == SECCOMP_STOP       ? PTRACE_SYSCALL_INFO_SECCOMP :
                                                              PTRACE_SYSCALL_INFO_NONE;
-        info.arch = to_audit_arch(tracee->arch());
+        SupportedArch syscall_arch = tracee->arch();
+        if (tracee->emulated_stop_type == SYSCALL_ENTRY_STOP ||
+            tracee->emulated_stop_type == SYSCALL_EXIT_STOP) {
+          // An x86-64 tracee can make i386 syscalls (with int $0x80). The
+          // kernel reports the syscall's arch at its stops whatever the op.
+          syscall_arch = tracee->emulated_stop_syscall_arch;
+        }
+        info.arch = to_audit_arch(syscall_arch);
         info.instruction_pointer = tracee->ip().register_value();
         info.stack_pointer = tracee->regs().sp().as_int();
         size_t max_size = 0;
         if (info.op == PTRACE_SYSCALL_INFO_ENTRY) {
-          info.entry.nr = tracee->regs().original_syscallno();
-          for (int i = 0; i < 6; ++i) {
-            info.entry.args[i] = tracee->regs().arg(i+1);
+          const Registers& r = tracee->regs();
+          info.entry.nr = r.original_syscallno();
+          if (syscall_arch == x86 && r.arch() == x86_64) {
+            // The i386 argument registers. Like the kernel, report all
+            // their bits.
+            uint64_t args[6] = {
+              r.bx(), r.cx(), r.dx(), r.si(), r.di(), r.bp()
+            };
+            memcpy(info.entry.args, args, sizeof(args));
+          } else {
+            for (int i = 0; i < 6; ++i) {
+              info.entry.args[i] = r.arg(i + 1);
+            }
           }
           max_size = ((char*)&info.entry.args[6] - (char*)&info);
         } else if (info.op == PTRACE_SYSCALL_INFO_EXIT) {

@@ -737,6 +737,9 @@ public:
   // If not NOT_STOPPED, then the task is logically stopped and this is the type
   // of stop.
   EmulatedStopType emulated_stop_type;
+  // The arch of the syscall at a SYSCALL_ENTRY_STOP or SYSCALL_EXIT_STOP.
+  // An x86-64 task can make i386 syscalls (with int $0x80).
+  SupportedArch emulated_stop_syscall_arch;
   // True if the task sigmask may have changed and we need to refetch it.
   bool blocked_sigs_dirty;
   // Most accesses to this should use set_sigmask and get_sigmask to ensure

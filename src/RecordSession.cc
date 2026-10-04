@@ -1117,8 +1117,10 @@ static void copy_syscall_arg_regs(Registers* to, const Registers& from) {
   to->set_arg6(from.arg6());
 }
 
-static void maybe_trigger_emulated_ptrace_syscall_exit_stop(RecordTask* t) {
+static void maybe_trigger_emulated_ptrace_syscall_exit_stop(
+    RecordTask* t, SupportedArch syscall_arch) {
   if (t->emulated_ptrace_cont_command == PTRACE_SYSCALL) {
+    t->emulated_stop_syscall_arch = syscall_arch;
     t->emulate_ptrace_stop(WaitStatus::for_syscall(t), SYSCALL_EXIT_STOP);
   } else if (is_ptrace_any_singlestep(t->arch(), t->emulated_ptrace_cont_command)) {
     // Deliver the singlestep trap now that we've finished executing the
@@ -1146,7 +1148,8 @@ static bool is_in_privileged_syscall(RecordTask* t) {
 
 void RecordSession::syscall_state_changed(RecordTask* t,
                                           StepState* step_state) {
-  Task::SyscallArchScope scope(t, t->ev().Syscall().arch());
+  SupportedArch syscall_arch = t->ev().Syscall().arch();
+  Task::SyscallArchScope scope(t, syscall_arch);
   switch (t->ev().Syscall().state) {
     case ENTERING_SYSCALL_PTRACE:
       debug_exec_state("EXEC_SYSCALL_ENTRY_PTRACE", t);
@@ -1170,7 +1173,7 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         if (t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
           ASSERT(t, t->ip() == r.ip());
           t->set_regs(orig_regs);
-          maybe_trigger_emulated_ptrace_syscall_exit_stop(t);
+          maybe_trigger_emulated_ptrace_syscall_exit_stop(t, syscall_arch);
         }
         return;
       }
@@ -1249,7 +1252,6 @@ void RecordSession::syscall_state_changed(RecordTask* t,
 
       DEBUG_ASSERT(t->stop_sig() == 0);
 
-      SupportedArch syscall_arch = t->ev().Syscall().arch();
       int syscallno = t->ev().Syscall().number;
       intptr_t retval = t->regs().syscall_result_signed();
 
@@ -1387,7 +1389,7 @@ void RecordSession::syscall_state_changed(RecordTask* t,
       step_state->continue_type = DONT_CONTINUE;
 
       if (!is_in_privileged_syscall(t)) {
-        maybe_trigger_emulated_ptrace_syscall_exit_stop(t);
+        maybe_trigger_emulated_ptrace_syscall_exit_stop(t, syscall_arch);
       }
       return;
     }
@@ -2106,6 +2108,7 @@ bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
         t->emulated_ptrace_cont_command)) &&
       !is_in_privileged_syscall(t)) {
     t->ev().Syscall().state = ENTERING_SYSCALL_PTRACE;
+    t->emulated_stop_syscall_arch = t->ev().Syscall().arch();
     t->emulate_ptrace_stop(WaitStatus::for_syscall(t), SYSCALL_ENTRY_STOP);
     t->record_current_event();
 
