@@ -1,0 +1,9 @@
+source `dirname $0`/util.sh
+debug_test_gdb_only
+
+# Start the debugger at the exit of the interrupted nanosleep(), with a
+# breakpoint on its syscall instruction: replay then restarts the syscall
+# with the breakpoint in memory.
+EXIT_EVENT=$(get_events | grep "SYSCALL: nanosleep' (state:EXITING_SYSCALL)" |
+             sed 's/.*global_time:\([0-9]*\),.*/\1/' | head -1)
+debug_gdb_only ${TEST_PREFIX}int80_restart_replay_bp "-g $EXIT_EVENT"
