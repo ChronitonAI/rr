@@ -522,7 +522,8 @@ void RecordSession::handle_seccomp_trap(RecordTask* t,
   // The architecture may be wrong, but that's ok, because an actual syscall
   // entry did happen, so the registers are already updated according to the
   // architecture of the system call.
-  t->canonicalize_regs(t->detect_syscall_arch());
+  SupportedArch syscall_arch = t->detect_syscall_arch();
+  t->canonicalize_regs(syscall_arch);
   t->apply_syscall_entry_regs();
 
   Registers r = t->regs();
@@ -584,7 +585,7 @@ void RecordSession::handle_seccomp_trap(RecordTask* t,
   si.native_api.si_signo = SIGSYS;
   si.native_api.si_errno = seccomp_data;
   si.native_api.si_code = SYS_SECCOMP;
-  si.native_api._sifields._sigsys._arch = to_audit_arch(r.arch());
+  si.native_api._sifields._sigsys._arch = to_audit_arch(syscall_arch);
   si.native_api._sifields._sigsys._syscall = syscallno;
   // Documentation says that si_call_addr is the address of the syscall
   // instruction, but in tests it's immediately after the syscall
