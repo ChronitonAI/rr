@@ -1141,6 +1141,7 @@ set(BASIC_TESTS
   x86/int80_args
   x86/int80_fork
   x86/int80_mmap
+  x86/int80_ptrace_syscall_info
   x86/int80_ptrace_wait
   x86/int80_regs
   x86/int80_restart
