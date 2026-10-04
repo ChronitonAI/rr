@@ -2271,19 +2271,9 @@ void Task::canonicalize_regs(SupportedArch syscall_arch) {
   ASSERT(this, stopped_or_unexpected_exit());
 
   if (registers.arch() == x86_64) {
-    if (syscall_arch == x86) {
-      // The int $0x80 compatibility handling clears r8-r11
-      // (see arch/x86/entry/entry_64_compat.S). The sysenter compatibility
-      // handling also clears r12-r15. However, to actually make such a syscall,
-      // the user process would have to switch itself into compatibility mode,
-      // which, though possible, does not appear to actually be done by any
-      // real application (contrary to int $0x80, which is accessible from 64bit
-      // mode as well).
-      registers_dirty |= registers.set_r8(0x0);
-      registers_dirty |= registers.set_r9(0x0);
-      registers_dirty |= registers.set_r10(0x0);
-      registers_dirty |= registers.set_r11(0x0);
-    } else {
+    // int $0x80 (syscall_arch x86) keeps all registers but rax (before
+    // Linux 4.18, the kernel cleared r8-r11 there itself).
+    if (syscall_arch != x86) {
       // x86-64 'syscall' instruction copies RFLAGS to R11 on syscall entry.
       // If we single-stepped into the syscall instruction, the TF flag will be
       // set in R11. We don't want the value in R11 to depend on whether we

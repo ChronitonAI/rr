@@ -1145,6 +1145,7 @@ set(BASIC_TESTS
   x86/hlt
   inotify
   int3
+  x86/int80_regs
   intr_futex_wait_restart
   intr_poll
   intr_ppoll
