@@ -651,6 +651,24 @@ void ReplaySession::clear_syscall_bp() {
 }
 
 /**
+ * Older versions of rr cleared r8-r11 at the int $0x80 syscalls of x86-64
+ * tasks. Do what the recording did.
+ */
+static void restore_i386_syscall_r8_to_r11(ReplayTask* t,
+                                           const TraceFrame& frame) {
+  if (t->arch() != x86_64 || frame.event().Syscall().arch() != x86) {
+    return;
+  }
+  const Registers& rec_regs = frame.regs();
+  Registers r = t->regs();
+  r.set_r8(rec_regs.r8());
+  r.set_r9(rec_regs.r9());
+  r.set_r10(rec_regs.r10());
+  r.set_r11(rec_regs.r11());
+  t->set_regs(r);
+}
+
+/**
  * Make it look like |t| entered the syscall at |syscall_instruction|
  */
 static void emulate_syscall_entry(ReplayTask* t, const TraceFrame& frame,
@@ -660,6 +678,7 @@ static void emulate_syscall_entry(ReplayTask* t, const TraceFrame& frame,
   r.emulate_syscall_entry();
   t->set_regs(r);
   t->canonicalize_regs(frame.event().Syscall().arch());
+  restore_i386_syscall_r8_to_r11(t, frame);
   t->validate_regs();
 }
 
@@ -732,6 +751,7 @@ Completion ReplaySession::enter_syscall(ReplayTask* t,
             << " while we're at " << t->ip();
       }
       t->canonicalize_regs(current_trace_frame().event().Syscall().arch());
+      restore_i386_syscall_r8_to_r11(t, current_trace_frame());
       t->validate_regs();
       t->finish_emulated_syscall();
     }
