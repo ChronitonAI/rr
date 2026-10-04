@@ -323,11 +323,11 @@ public:
   bool has_stashed_group_stop() const { return stashed_group_stop; }
 
   /**
-   * Return true if the current state of this looks like the
-   * interrupted syscall at the top of our event stack, if there
-   * is one.
+   * Return true if the current state of this, entering a syscall of
+   * |syscall_arch|, looks like the interrupted syscall at the top of our
+   * event stack, if there is one.
    */
-  bool is_syscall_restart();
+  bool is_syscall_restart(SupportedArch syscall_arch);
   /**
    * Return true iff this is at an execution state where
    * resuming execution may lead to the restart of an
@@ -344,7 +344,7 @@ public:
    * a syscall that modifies signals was interrupted but will not
    * be automatically restarted.
    **/
-  bool at_interrupted_non_restartable_signal_modifying_syscall() const;
+  bool at_interrupted_non_restartable_signal_modifying_syscall();
   /**
    * Return true if this is at an arm-desched-event syscall.
    */
