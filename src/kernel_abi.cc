@@ -173,6 +173,9 @@ bool get_syscall_instruction_arch(Task* t, remote_code_ptr ptr,
     }
     return false;
   }
+  // We may have set a breakpoint on the instruction.
+  t->vm()->replace_breakpoints_with_original_values(code.data(), code.size(),
+                                                    ptr.to_data_ptr<uint8_t>());
   switch (t->arch()) {
     // Compatibility mode switch can happen in user space (but even without
     // such tricks, int80, which uses the 32bit syscall table, can be invoked
