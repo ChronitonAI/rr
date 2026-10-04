@@ -378,6 +378,23 @@ public:
     RR_SET_REG_X86(edx, rdx, edx);
   }
 
+  uintptr_t r8() const {
+    DEBUG_ASSERT(arch() == x86_64);
+    return u.x64regs.r8;
+  }
+  uintptr_t r9() const {
+    DEBUG_ASSERT(arch() == x86_64);
+    return u.x64regs.r9;
+  }
+  uintptr_t r10() const {
+    DEBUG_ASSERT(arch() == x86_64);
+    return u.x64regs.r10;
+  }
+  uintptr_t r11() const {
+    DEBUG_ASSERT(arch() == x86_64);
+    return u.x64regs.r11;
+  }
+
   bool set_r8(uintptr_t value) {
     DEBUG_ASSERT(arch() == x86_64);
     RR_UPDATE_CHECK(u.x64regs.r8, value);
