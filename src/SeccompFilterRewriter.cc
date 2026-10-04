@@ -26,36 +26,74 @@ static void set_syscall_result(RecordTask* t, long ret) {
   t->set_regs(r);
 }
 
-static void pass_through_seccomp_filter(RecordTask* t) {
+namespace {
+/**
+ * The prctl(PR_SET_SECCOMP) or seccomp(SECCOMP_SET_MODE_FILTER) call that
+ * installs a filter. rr makes it with a syscall of the task's arch, but an
+ * x86-64 task can make it with an i386 syscall (int $0x80).
+ */
+struct FilterInstall {
+  // The same syscall of the task's arch
+  int syscallno;
+  // Its first two arguments (the filter program is the third)
+  uintptr_t arg1;
+  uintptr_t arg2;
+  bool is_seccomp;
+  // The program as the tracee passed it
+  remote_ptr<void> prog;
+  SupportedArch prog_arch;
+};
+} // namespace
+
+static void pass_through_seccomp_filter(RecordTask* t,
+                                        const FilterInstall& install) {
   long ret;
   {
     AutoRemoteSyscalls remote(t);
-    ret = remote.syscall(t->regs().original_syscallno(), t->regs().orig_arg1(),
-                         t->regs().arg2(), t->regs().arg3());
+    ret = remote.syscall(install.syscallno, install.arg1, install.arg2,
+                         install.prog.as_int());
   }
   set_syscall_result(t, ret);
   ASSERT(t, t->regs().syscall_failed());
 }
 
 template <typename Arch>
-static void install_patched_seccomp_filter_arch(
-    RecordTask* t, unordered_map<uint32_t, uint16_t>& result_to_index,
-    vector<uint32_t>& index_to_result) {
-  // Take advantage of the fact that the filter program is arg3() in both
-  // prctl and seccomp syscalls.
+static bool read_sock_fprog_arch(RecordTask* t, remote_ptr<void> p,
+                                 uint16_t* len, remote_ptr<void>* filter) {
   bool ok = true;
-  auto prog =
-      t->read_mem(remote_ptr<typename Arch::sock_fprog>(t->regs().arg3()), &ok);
+  auto prog = t->read_mem(p.cast<typename Arch::sock_fprog>(), &ok);
   if (!ok) {
+    return false;
+  }
+  *len = prog.len;
+  *filter = prog.filter.rptr();
+  return true;
+}
+
+static bool read_sock_fprog(RecordTask* t, SupportedArch arch,
+                            remote_ptr<void> p, uint16_t* len,
+                            remote_ptr<void>* filter) {
+  RR_ARCH_FUNCTION(read_sock_fprog_arch, arch, t, p, len, filter);
+}
+
+template <typename Arch>
+static void install_patched_seccomp_filter_arch(
+    RecordTask* t, const FilterInstall& install,
+    unordered_map<uint32_t, uint16_t>& result_to_index,
+    vector<uint32_t>& index_to_result) {
+  uint16_t len;
+  remote_ptr<void> filter;
+  if (!read_sock_fprog(t, install.prog_arch, install.prog, &len, &filter)) {
     // We'll probably return EFAULT but a kernel that doesn't support
     // seccomp(2) should return ENOSYS instead, so just run the original
     // system call to get the correct error.
-    pass_through_seccomp_filter(t);
+    pass_through_seccomp_filter(t, install);
     return;
   }
-  auto code = t->read_mem(prog.filter.rptr(), prog.len, &ok);
+  bool ok = true;
+  auto code = t->read_mem(filter.cast<typename Arch::sock_filter>(), len, &ok);
   if (!ok) {
-    pass_through_seccomp_filter(t);
+    pass_through_seccomp_filter(t, install);
     return;
   }
   // Convert all returns to TRACE returns so that rr can handle them.
@@ -95,6 +133,8 @@ static void install_patched_seccomp_filter_arch(
   long ret;
   {
     AutoRemoteSyscalls remote(t);
+    typename Arch::sock_fprog prog;
+    memset(&prog, 0, sizeof(prog));
     AutoRestoreMem mem(
         remote, nullptr,
         sizeof(prog) + f.filters.size() * sizeof(typename Arch::sock_filter));
@@ -106,14 +146,13 @@ static void install_patched_seccomp_filter_arch(
                         .cast<typename Arch::sock_fprog>();
     t->write_mem(prog_ptr, prog);
 
-    ret = remote.syscall(t->regs().original_syscallno(), t->regs().orig_arg1(),
-                         t->regs().arg2(), prog_ptr);
+    ret =
+        remote.syscall(install.syscallno, install.arg1, install.arg2, prog_ptr);
   }
   set_syscall_result(t, ret);
 
   if (!t->regs().syscall_failed()) {
-    if (is_seccomp_syscall(t->regs().original_syscallno(), t->arch()) &&
-        (t->regs().arg2() & SECCOMP_FILTER_FLAG_TSYNC)) {
+    if (install.is_seccomp && (install.arg2 & SECCOMP_FILTER_FLAG_TSYNC)) {
       for (Task* tt : t->thread_group()->task_set()) {
         static_cast<RecordTask*>(tt)->prctl_seccomp_status = 2;
       }
@@ -124,7 +163,20 @@ static void install_patched_seccomp_filter_arch(
 }
 
 void SeccompFilterRewriter::install_patched_seccomp_filter(RecordTask* t) {
-  RR_ARCH_FUNCTION(install_patched_seccomp_filter_arch, t->arch(), t,
+  // The syscall's arch, which an x86-64 task can make i386 with int $0x80.
+  // Take advantage of the fact that the filter program is arg3() in both
+  // prctl and seccomp syscalls.
+  const Registers& r = t->regs();
+  FilterInstall install;
+  install.prog_arch = r.syscall_arch();
+  install.is_seccomp =
+      is_seccomp_syscall(r.original_syscallno(), install.prog_arch);
+  install.syscallno = install.is_seccomp ? syscall_number_for_seccomp(t->arch())
+                                         : syscall_number_for_prctl(t->arch());
+  install.arg1 = r.orig_arg1();
+  install.arg2 = r.arg2();
+  install.prog = r.arg3();
+  RR_ARCH_FUNCTION(install_patched_seccomp_filter_arch, t->arch(), t, install,
                    result_to_index, index_to_result);
 }
 
