@@ -310,6 +310,10 @@ private:
   template <typename Arch> int send_fd_arch(const ScopedFd &fd);
 
   Task* t;
+  // We pass our syscalls' numbers and arguments in the registers of
+  // t->arch() syscalls, even while rr processes a syscall of another arch.
+  // Must be initialized before initial_regs.
+  Task::SyscallArchScope syscall_arch_scope;
   Registers initial_regs;
   remote_code_ptr initial_ip;
   remote_ptr<void> initial_sp;

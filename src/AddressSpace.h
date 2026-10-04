@@ -825,7 +825,13 @@ public:
   static uint32_t chaos_mode_min_stack_size() { return 8 * 1024 * 1024; }
 
   /* Returns null if we should return ENOMEM because there is no free space available. */
-  remote_ptr<void> chaos_mode_find_free_memory(RecordTask* t, size_t len, remote_ptr<void> hint);
+  /**
+   * Find free memory for a mapping of |len| bytes made with a syscall of
+   * |arch| (an x86-64 task can make i386 mmap()s, which must stay below 4GB).
+   */
+  remote_ptr<void> chaos_mode_find_free_memory(RecordTask* t, size_t len,
+                                               remote_ptr<void> hint,
+                                               SupportedArch arch);
   enum class FindFreeMemoryPolicy {
     /* Use the first free memory after `after` */
     STRICT_SEARCH,

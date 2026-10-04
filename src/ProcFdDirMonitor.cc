@@ -91,10 +91,23 @@ template <typename Arch> static void filter_dirents_arch(RecordTask* t) {
     }
 
     // We filtered out all the entries, so we need to repeat the syscall.
+    int syscallno = regs.original_syscallno();
+    if (Arch::arch() != t->arch()) {
+      // An i386 getdents()/getdents64() of an x86-64 task (int $0x80).
+      // We can only repeat it with a syscall of t's arch.
+      if (syscallno != Arch::getdents64) {
+        // No getdents() of t's arch writes i386 dirents. Leave our fds in.
+        LOG(warn) << "Can't hide rr's fds from an i386 getdents() of an "
+                     "x86-64 task";
+        return;
+      }
+      // getdents64() writes the same struct for both arches.
+      syscallno = syscall_number_for_getdents64(t->arch());
+    }
+    long fd = regs.orig_arg1();
     {
       AutoRemoteSyscalls remote(t);
-      remote.syscall(regs.original_syscallno(), regs.orig_arg1(), regs.arg2(),
-                     regs.arg3());
+      remote.syscall(syscallno, fd, ptr.as_int(), len);
       // Only copy over the syscall result. In particular, we don't want to
       // copy the AutoRemoteSyscalls ip().
       regs.set_syscall_result(t->regs().syscall_result());
@@ -111,7 +124,8 @@ template <typename Arch> static void filter_dirents_arch(RecordTask* t) {
 }
 
 static void filter_dirents(RecordTask* t) {
-  RR_ARCH_FUNCTION(filter_dirents_arch, t->arch(), t);
+  // The syscall's arch: an x86-64 task can make i386 syscalls (int $0x80).
+  RR_ARCH_FUNCTION(filter_dirents_arch, t->regs().syscall_arch(), t);
 }
 
 void ProcFdDirMonitor::filter_getdents(RecordTask* t) {
