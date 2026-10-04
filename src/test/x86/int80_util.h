@@ -11,6 +11,7 @@
  * but rax. Pointer arguments must be below 4GB. /proc/<tid>/syscall shows
  * these syscalls with the I386_* numbers. */
 
+#define I386_restart_syscall 0
 #define I386_exit 1
 #define I386_fork 2
 #define I386_read 3
