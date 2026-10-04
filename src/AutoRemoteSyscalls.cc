@@ -88,6 +88,7 @@ static bool is_SIGTRAP_default_and_unblocked(Task* t) {
 AutoRemoteSyscalls::AutoRemoteSyscalls(Task* t,
                                        MemParamsEnabled enable_mem_params)
     : t(t),
+      syscall_arch_scope(t, t->arch()),
       initial_regs(t->regs()),
       initial_ip(t->ip()),
       initial_sp(t->regs().sp()),

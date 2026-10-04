@@ -1142,6 +1142,7 @@ static bool is_in_privileged_syscall(RecordTask* t) {
 
 void RecordSession::syscall_state_changed(RecordTask* t,
                                           StepState* step_state) {
+  Task::SyscallArchScope scope(t, t->ev().Syscall().arch());
   switch (t->ev().Syscall().state) {
     case ENTERING_SYSCALL_PTRACE:
       debug_exec_state("EXEC_SYSCALL_ENTRY_PTRACE", t);
@@ -2031,6 +2032,7 @@ static bool is_ptrace_any_sysemu(SupportedArch arch, int command)
 bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
                                           RecordResult* step_result,
                                           SupportedArch syscall_arch) {
+  Task::SyscallArchScope scope(t, syscall_arch);
   if (const RecordTask::StashedSignal* sig = t->stashed_sig_not_synthetic_SIGCHLD()) {
     // The only four cases where we allow a stashed signal to be pending on
     // syscall entry are:

@@ -70,12 +70,15 @@ static int64_t retrieve_offset_arch(Task* t, int syscallno,
 }
 
 static int64_t retrieve_offset(Task* t, int syscallno, const Registers& regs) {
-  RR_ARCH_FUNCTION(retrieve_offset_arch, t->arch(), t, syscallno, regs);
+  // The syscall's arch: an x86-64 task can make i386 syscalls (int $0x80).
+  RR_ARCH_FUNCTION(retrieve_offset_arch, regs.syscall_arch(), t, syscallno,
+                   regs);
 }
 
 int64_t FileMonitor::LazyOffset::retrieve(bool needed_for_replay) {
   bool is_replay = t->session().is_replaying();
-  bool is_implicit_offset = is_implicit_offset_syscall(t->arch(), syscallno);
+  bool is_implicit_offset =
+      is_implicit_offset_syscall(regs.syscall_arch(), syscallno);
   ASSERT(t, needed_for_replay || !is_replay);
   // There is no way we can figure out this information now, so retrieve it
   // from the trace (we record it below under the same circumstance).

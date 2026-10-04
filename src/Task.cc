@@ -1739,8 +1739,21 @@ void Task::set_regs(const Registers& regs) {
   bool changed = registers != regs;
   if (changed) {
     registers_dirty = true;
+    bool i386_syscall = registers.syscall_arch() != registers.arch();
     registers = regs;
+    registers.set_syscall_arch(i386_syscall ? x86 : registers.arch());
   }
+}
+
+Task::SyscallArchScope::SyscallArchScope(Task* t, SupportedArch syscall_arch)
+    : t(t),
+      saved_i386_syscall(t->registers.syscall_arch() != t->registers.arch()) {
+  t->registers.set_syscall_arch(syscall_arch);
+}
+
+Task::SyscallArchScope::~SyscallArchScope() {
+  // t's arch may have changed meanwhile (exec).
+  t->registers.set_syscall_arch(saved_i386_syscall ? x86 : t->registers.arch());
 }
 
 bool Task::flush_regs() {

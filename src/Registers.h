@@ -58,13 +58,37 @@ class Registers {
 public:
   enum { MAX_SIZE = 32 };
 
-  Registers(SupportedArch a = x86) : arch_(a) {
+  Registers(SupportedArch a = x86) : arch_(a), i386_syscall_args_(false) {
     memset(&u, 0, sizeof(u));
   }
 
   SupportedArch arch() const { return arch_; }
 
-  void set_arch(SupportedArch a) { arch_ = a; }
+  void set_arch(SupportedArch a) {
+    arch_ = a;
+    i386_syscall_args_ = false;
+  }
+
+  /**
+   * The arch of the syscall whose arguments the syscall argument accessors
+   * (arg1() to arg6(), orig_arg1(), arg() and their setters) access. This is
+   * usually arch(), but an x86-64 task can make i386 syscalls (with int $0x80).
+   * The kernel then takes the arguments from ebx, ecx, edx, esi, edi and ebp
+   * instead of rdi, rsi, rdx, r10, r8 and r9, and ignores (and keeps) the
+   * upper halves of those registers. With syscall_arch() x86 on x86-64
+   * Registers, the accessors read the lower halves of those registers and
+   * the setters write only the lower halves.
+   * This is not part of the register state: it's not compared or traced.
+   */
+  SupportedArch syscall_arch() const {
+    return i386_syscall_args_ ? x86 : arch_;
+  }
+  void set_syscall_arch(SupportedArch a) {
+    // Other combinations happen only around an exec that changes the arch,
+    // where the registers are the new arch's and the syscall is the old one's
+    // (or vice versa). The syscall arguments don't matter there.
+    i386_syscall_args_ = a == x86 && arch_ == x86_64;
+  }
 
   /**
    * Copy a user_regs_struct into these Registers. If the tracee architecture
@@ -220,13 +244,39 @@ public:
   }
 
   SYSCALL_REGISTER(syscall_result, eax, rax, x[0]);
-  SYSCALL_REGISTER(orig_arg1, ebx, rdi, orig_x0)
-  SYSCALL_REGISTER(arg1, ebx, rdi, x[0])
-  SYSCALL_REGISTER(arg2, ecx, rsi, x[1])
-  SYSCALL_REGISTER(arg3, edx, rdx, x[2])
-  SYSCALL_REGISTER(arg4, esi, r10, x[3])
-  SYSCALL_REGISTER(arg5, edi, r8, x[4])
-  SYSCALL_REGISTER(arg6, ebp, r9, x[5])
+
+// Syscall argument registers. i386case is the x86-64 register that holds
+// the argument of an i386 syscall made by an x86-64 task.
+#define SYSCALL_ARG_REGISTER(name, x86case, x64case, arm64case, i386case)      \
+  uintptr_t name() const {                                                     \
+    if (i386_syscall_args_) {                                                  \
+      return (uint32_t)u.x64regs.i386case;                                     \
+    }                                                                          \
+    return RR_GET_REG(x86case, x64case, arm64case);                            \
+  }                                                                            \
+  intptr_t name##_signed() const {                                             \
+    if (i386_syscall_args_) {                                                  \
+      return (int32_t)u.x64regs.i386case;                                      \
+    }                                                                          \
+    return RR_GET_REG_SIGNED(x86case, x64case, arm64case);                     \
+  }                                                                            \
+  bool set_##name(uintptr_t value) {                                           \
+    if (i386_syscall_args_) {                                                  \
+      return set_i386_syscall_arg(u.x64regs.i386case, value);                  \
+    }                                                                          \
+    return RR_SET_REG(x86case, x64case, arm64case, value);                     \
+  }                                                                            \
+  template <typename T> bool set_##name(remote_ptr<T> value) {                 \
+    return set_##name(value.as_int());                                         \
+  }
+
+  SYSCALL_ARG_REGISTER(orig_arg1, ebx, rdi, orig_x0, rbx)
+  SYSCALL_ARG_REGISTER(arg1, ebx, rdi, x[0], rbx)
+  SYSCALL_ARG_REGISTER(arg2, ecx, rsi, x[1], rcx)
+  SYSCALL_ARG_REGISTER(arg3, edx, rdx, x[2], rdx)
+  SYSCALL_ARG_REGISTER(arg4, esi, r10, x[3], rsi)
+  SYSCALL_ARG_REGISTER(arg5, edi, r8, x[4], rdi)
+  SYSCALL_ARG_REGISTER(arg6, ebp, r9, x[5], rbp)
 
   uintptr_t arg(int index) const {
     switch (index) {
@@ -575,7 +625,17 @@ private:
 
   template <typename Arch> size_t total_registers_arch() const;
 
+  static bool set_i386_syscall_arg(uint64_t& reg, uintptr_t value) {
+    // The value must fit in 32 bits (it may be sign-extended).
+    DEBUG_ASSERT((int64_t)value >= INT32_MIN &&
+                 (int64_t)value <= (int64_t)UINT32_MAX);
+    uint64_t new_reg = (reg & ~(uint64_t)UINT32_MAX) | (uint32_t)value;
+    RR_UPDATE_CHECK(reg, new_reg);
+  }
+
   SupportedArch arch_;
+  // See syscall_arch().
+  bool i386_syscall_args_;
   union {
     rr::X86Arch::user_regs_struct x86regs;
     rr::X64Arch::user_regs_struct x64regs;

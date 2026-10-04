@@ -604,8 +604,28 @@ public:
   /** Return the session this is part of. */
   Session& session() const { return *session_; }
 
-  /** Set the tracee's registers to |regs|. Lazy. */
+  /**
+   * Set the tracee's registers to |regs|. Lazy. Keeps the current
+   * syscall_arch() of regs() (see SyscallArchScope).
+   */
   void set_regs(const Registers& regs);
+
+  /**
+   * While a SyscallArchScope exists, regs() (and copies of it) access syscall
+   * arguments the way the kernel does for a syscall of |syscall_arch| (see
+   * Registers::syscall_arch()): rr uses one while it processes a syscall whose
+   * arch may differ from the task's (an i386 syscall made by an x86-64 task
+   * with int $0x80). Scopes nest.
+   */
+  class SyscallArchScope {
+  public:
+    SyscallArchScope(Task* t, SupportedArch syscall_arch);
+    ~SyscallArchScope();
+
+  private:
+    Task* t;
+    bool saved_i386_syscall;
+  };
 
   /** Ensure registers are flushed back to the underlying task.
    *  Returns false if that failed due to the tracee being in
