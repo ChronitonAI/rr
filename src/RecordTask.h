@@ -235,6 +235,13 @@ public:
    */
   bool signal_handler_takes_siginfo(int sig) const;
   /**
+   * True when |sig| has a handler that this x86-64 task installed with an
+   * i386 sigaction() or rt_sigaction() (int $0x80), and the kernel is Linux
+   * 4.9 or later. The kernel then runs such a handler in 32-bit compatibility
+   * mode, with an i386 signal frame (SA_IA32_ABI), which rr doesn't support.
+   */
+  bool signal_handler_is_ia32(int sig) const;
+  /**
    * Return |sig|'s current sigaction. Returned as raw bytes since the
    * data is architecture-dependent.
    */

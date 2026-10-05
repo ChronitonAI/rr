@@ -6,9 +6,13 @@
 #include <elf.h>
 #include <limits.h>
 #include <linux/perf_event.h>
+#include <linux/version.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
+
+#include <sstream>
 
 #include "AutoRemoteSyscalls.h"
 #include "ContextSwitchEvent.h"
@@ -33,7 +37,7 @@ namespace rr {
  * the |refcount|s while they still refer to this.
  */
 struct Sighandler {
-  Sighandler() : resethand(false), takes_siginfo(false) {}
+  Sighandler() : resethand(false), takes_siginfo(false), ia32(false) {}
 
   template <typename Arch>
   void init_arch(const typename Arch::kernel_sigaction& ksa) {
@@ -42,6 +46,7 @@ struct Sighandler {
     memcpy(sa.data(), &ksa, sizeof(ksa));
     resethand = (ksa.sa_flags & SA_RESETHAND) != 0;
     takes_siginfo = (ksa.sa_flags & SA_SIGINFO) != 0;
+    ia32 = false;
   }
 
   /**
@@ -91,6 +96,9 @@ struct Sighandler {
   vector<uint8_t> sa;
   bool resethand;
   bool takes_siginfo;
+  // An x86-64 task installed this with an i386 syscall (see
+  // RecordTask::signal_handler_is_ia32)
+  bool ia32;
 };
 
 static void reset_handler(Sighandler* handler, SupportedArch arch) {
@@ -1264,6 +1272,11 @@ bool RecordTask::signal_handler_takes_siginfo(int sig) const {
   return sighandlers->get(sig).takes_siginfo;
 }
 
+bool RecordTask::signal_handler_is_ia32(int sig) const {
+  const Sighandler& h = sighandlers->get(sig);
+  return h.ia32 && h.disposition() == SIGNAL_HANDLER;
+}
+
 static bool is_unstoppable_signal(int sig) {
   return sig == SIGSTOP || sig == SIGKILL;
 }
@@ -1329,6 +1342,29 @@ void RecordTask::set_siginfo(const siginfo_t& si) {
   ptrace_if_stopped(PTRACE_SETSIGINFO, nullptr, (void*)&si);
 }
 
+/**
+ * Whether the kernel runs a handler that an x86-64 task installed with an
+ * i386 sigaction() or rt_sigaction() in 32-bit mode. Since Linux 4.9
+ * (sigaction_compat_abi()), it marks such a handler SA_IA32_ABI. Before, the
+ * frame depended on the task (TIF_IA32), so the handler ran in 64-bit mode.
+ */
+static bool kernel_marks_ia32_sigactions() {
+  static int result = -1;
+  if (result < 0) {
+    result = 1;
+    struct utsname uname_buf;
+    memset(&uname_buf, 0, sizeof(uname_buf));
+    if (!uname(&uname_buf)) {
+      unsigned int major = 0, minor = 0;
+      char dot;
+      stringstream stream(uname_buf.release);
+      stream >> major >> dot >> minor;
+      result = KERNEL_VERSION(major, minor, 0) >= KERNEL_VERSION(4, 9, 0);
+    }
+  }
+  return result;
+}
+
 template <typename Arch>
 void RecordTask::update_sigaction_arch(const Registers& regs,
                                        bool old_sigaction) {
@@ -1360,8 +1396,12 @@ void RecordTask::update_sigaction_arch(const Registers& regs,
     memcpy(&mask, &sa.sa_mask, min(sizeof(mask), sizeof(sa.sa_mask)));
   }
   // Store it with the task's layout, which rr uses to install it again.
-  init_handler_from_fields(&sighandlers->get(sig), arch(), handler, flags,
-                           restorer, mask);
+  Sighandler& h = sighandlers->get(sig);
+  init_handler_from_fields(&h, arch(), handler, flags, restorer, mask);
+  // An i386 syscall of an x86-64 task (int $0x80): since Linux 4.9, the
+  // kernel sets SA_IA32_ABI on the handler.
+  h.ia32 =
+      Arch::arch() == x86 && arch() == x86_64 && kernel_marks_ia32_sigactions();
 }
 
 sig_set_t RecordTask::read_sigmask_from_process() {

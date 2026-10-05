@@ -1735,6 +1735,22 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
         LOG(debug) << "  " << t->tid << ": " << signal_name(sig)
                    << " has user handler";
 
+        if (t->signal_handler_is_ia32(sig)) {
+          // The kernel would run the handler in 32-bit compatibility mode,
+          // with an i386 signal frame. rr assumes that a task runs in the
+          // mode of its executable (its rr page, its registers, its remote
+          // syscalls ...), so it can't record this. Keep the trace up to here
+          // replayable.
+          close_trace_writer(TraceWriter::CLOSE_ERROR);
+          CLEAN_FATAL()
+              << "Can't deliver " << signal_name(sig) << " to its handler "
+              << t->get_signal_user_handler(sig)
+              << ": an x86-64 process installed the handler with an i386 "
+                 "sigaction() or rt_sigaction() (int $0x80), so the kernel "
+                 "would run it in 32-bit compatibility mode, which rr doesn't "
+                 "support.";
+        }
+
         if (!inject_handled_signal(t)) {
           // Signal delivery isn't happening. Prepare to process the new
           // signal that aborted signal delivery.
