@@ -105,7 +105,7 @@ static void interrupt_stop(void) {
   }
   test_assert(0 == ptrace(PTRACE_INTERRUPT, child, NULL, NULL));
   test_assert(child == waitpid(child, &status, 0));
-  test_assert(WIFSTOPPED(status) && (status >> 16) == PTRACE_EVENT_STOP);
+  test_assert(status == ((PTRACE_EVENT_STOP << 16) | (SIGTRAP << 8) | 0x7f));
   test_assert(0 == ptrace(PTRACE_CONT, child, NULL, (void*)SIGUSR1));
   test_assert(1 == write(to_child_fds[1], "x", 1));
   test_assert(child == waitpid(child, &status, 0));
