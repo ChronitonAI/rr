@@ -1455,6 +1455,7 @@ set(BASIC_TESTS
   tgkill
   thread_yield
   timer
+  timer_starvation
   timerfd
   times
   x86/tpause

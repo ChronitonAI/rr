@@ -309,6 +309,45 @@ public:
     remote_code_ptr ip;
   };
   const StashedSignal* stashed_sig_not_synthetic_SIGCHLD() const;
+
+  /**
+   * Note that the task returned from a signal handler.
+   */
+  void did_sigreturn() {
+    ticks_at_last_sigreturn = tick_count();
+    ip_at_last_sigreturn = ip();
+  }
+  /**
+   * True if the task is stopped for a timer signal that we should delay
+   * because the task hasn't run any code since its last signal handler
+   * returned. See delay_signal().
+   */
+  bool is_delayable_signal_stop();
+  /**
+   * Delay the signal of the current signal-delivery stop: block it, on top of
+   * the task's own sigmask, and resume the task with it, so that the kernel
+   * queues it again (ptrace_signal requeues a signal that the tracer
+   * blocked). The task stops before it makes a syscall. At its next stop the
+   * signal is unblocked again, unless the task stopped for another signal
+   * that we delay too.
+   */
+  void delay_signal(int sig);
+  /**
+   * The signals we're delaying (blocked on top of the task's own sigmask).
+   */
+  sig_set_t delayed_signals() const { return delayed_sigs; }
+  /** Unblock the signals that delay_signal() blocked. */
+  void end_signal_delay();
+  bool has_signal_to_requeue() const { return sig_to_requeue != 0; }
+  /**
+   * The signal to resume the task with after delay_signal(). Clears it.
+   */
+  int take_signal_to_requeue() {
+    int sig = sig_to_requeue;
+    sig_to_requeue = 0;
+    return sig;
+  }
+
   bool has_stashed_sig(int sig) const;
   const StashedSignal* peek_stashed_sig_to_deliver() const;
   void pop_stash_sig(const StashedSignal* stashed);
@@ -792,6 +831,12 @@ public:
   // Stashed signal-delivery state, ready to be delivered at
   // next opportunity.
   std::deque<StashedSignal> stashed_signals;
+  // See delay_signal().
+  sig_set_t delayed_sigs;
+  int sig_to_requeue;
+  // Where the last signal handler returned to (see did_sigreturn).
+  Ticks ticks_at_last_sigreturn;
+  remote_code_ptr ip_at_last_sigreturn;
   // When true, we're blocking signals during a syscall to
   // prevent new signals from being delivered. `blocked_sigs_dirty`
   // is false and `blocked_sigs` contains the previous sigmask.

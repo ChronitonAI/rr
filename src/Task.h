@@ -745,7 +745,7 @@ public:
    * be true and is_stopped will be false.
    * This can't reap the task.
    */
-  bool wait(double interrupt_after_elapsed = -1);
+  bool wait(double interrupt_after_elapsed = -1, bool warn_on_interrupt = true);
 
   /**
    * Currently we don't allow recording across uid changes, so we can

@@ -826,6 +826,10 @@ static bool is_ptrace_any_singlestep(SupportedArch arch, int command)
   RR_ARCH_FUNCTION(is_ptrace_any_singlestep_arch, arch, command);
 }
 
+// How long a task may run before we deliver the signals we're delaying for it
+// (see RecordTask::delay_signal).
+static const Ticks DELAYED_SIGNAL_TICKS = 50000;
+
 void RecordSession::task_continue(const StepState& step_state) {
   RecordTask* t = scheduler().current();
 
@@ -862,6 +866,11 @@ void RecordSession::task_continue(const StepState& step_state) {
     } else {
       ticks_request = (TicksRequest)max<Ticks>(
           0, scheduler().current_timeslice_end() - t->tick_count());
+    }
+    if (t->delayed_signals() &&
+        (ticks_request <= 0 || ticks_request > DELAYED_SIGNAL_TICKS)) {
+      // Stop the task again soon, to deliver the signals we're delaying.
+      ticks_request = (TicksRequest)DELAYED_SIGNAL_TICKS;
     }
 
     // Clear any lingering state, then see if we need to stop earlier for a
@@ -928,7 +937,8 @@ void RecordSession::task_continue(const StepState& step_state) {
       }
     }
   }
-  t->resume_execution(resume, RESUME_NONBLOCKING, ticks_request);
+  t->resume_execution(resume, RESUME_NONBLOCKING, ticks_request,
+                      t->take_signal_to_requeue());
 }
 
 /**
@@ -1269,6 +1279,7 @@ void RecordSession::syscall_state_changed(RecordTask* t,
           ASSERT(t, t->regs().original_syscallno() == -1);
         }
         rec_did_sigreturn(t);
+        t->did_sigreturn();
         t->record_current_event();
         t->pop_syscall();
 
@@ -2012,6 +2023,21 @@ bool RecordSession::handle_signal_event(RecordTask* t, StepState* step_state) {
         << "Tracee is using SIGSTKFLT??? (code=" << si.si_code
         << ", fd=" << si.si_fd << ")";
   }
+  if (t->is_delayable_signal_stop()) {
+    // A timer whose period is shorter than the time it takes us to record a
+    // signal (several ptrace stops, a few hundred microseconds on a busy
+    // machine) has expired again by the time the task returns from the
+    // handler, so the next signal arrives before the interrupted code has
+    // run at all. Natively the code runs between the signals. Let it run
+    // first: RecordTask::delay_signal keeps the signal pending and blocked
+    // until the task's next stop, which task_continue and the scheduler
+    // make happen soon.
+    t->delay_signal(sig);
+    return true;
+  }
+  if (t->delayed_signals()) {
+    t->end_signal_delay();
+  }
   t->stash_sig();
   return true;
 }
@@ -2730,7 +2756,11 @@ RecordSession::RecordResult RecordSession::record_step() {
   }
 
   t->verify_signal_states();
-  t->unmap_dead_syscallbufs_if_required();
+  if (!t->has_signal_to_requeue()) {
+    // This could resume the task, which would drop the signal that
+    // task_continue must requeue.
+    t->unmap_dead_syscallbufs_if_required();
+  }
 
   // We try to inject a signal if there's one pending; otherwise we continue
   // task execution.
