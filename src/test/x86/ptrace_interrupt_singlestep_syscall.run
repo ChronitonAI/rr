@@ -1,0 +1,4 @@
+source `dirname $0`/util.sh
+# Recordings in chaos mode nearly always have the race the test checks.
+RECORD_ARGS=--chaos
+compare_test EXIT-SUCCESS
