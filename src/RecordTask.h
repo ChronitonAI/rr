@@ -247,6 +247,27 @@ public:
    */
   bool is_sig_ignored(int sig) const;
   /**
+   * Call when an emulated ptracer has attached to this task (PTRACE_ATTACH,
+   * PTRACE_SEIZE or PTRACE_TRACEME). Remembers the signals pending for the
+   * task, or its process, that it ignores and doesn't block; see
+   * |ignored_signals_pending_at_ptrace_attach|.
+   */
+  void note_ignored_signals_pending_at_ptrace_attach();
+  /**
+   * Call when the task dequeues |sig|. Returns true if it's a signal that
+   * Linux would have discarded when it was generated, because the task
+   * ignored it and had no ptracer then, and forgets that copy. Like the
+   * kernel, takes the task's own copy before the process's.
+   */
+  bool take_signal_ignored_before_ptrace_attach(int sig);
+  /**
+   * Forget the remembered signals (see above) that are no longer pending,
+   * e.g. because a stop signal discarded a pending SIGCONT, a SIGCONT
+   * discarded pending stop signals, or the task's process started ignoring
+   * the signal.
+   */
+  void forget_ignored_signals_no_longer_pending();
+  /**
    * Return true iff |sig| is a stopping signal.
    */
   bool is_sig_stopping(int sig) const;
@@ -742,6 +763,13 @@ public:
   // Most accesses to this should use set_sigmask and get_sigmask to ensure
   // the mirroring to syscallbuf is correct.
   sig_set_t blocked_sigs;
+  // Signals that were pending for the task (not for its whole process; see
+  // ThreadGroup::ignored_shared_signals_pending_at_ptrace_attach) when its
+  // emulated ptracer attached, and that the task ignored and didn't block.
+  // Linux doesn't queue a signal that the task ignores unless the task is
+  // traced, but we trace all tasks. So the task gets these signals later,
+  // and Linux would have discarded them.
+  sig_set_t ignored_signals_pending_at_ptrace_attach;
   uint32_t syscallbuf_blocked_sigs_generation;
 
   // Syscallbuf state

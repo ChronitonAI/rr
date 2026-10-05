@@ -181,6 +181,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       creator_tid(0),
       emulated_stop_type(NOT_STOPPED),
       blocked_sigs_dirty(true),
+      ignored_signals_pending_at_ptrace_attach(0),
       syscallbuf_blocked_sigs_generation(0),
       flushed_num_rec_bytes(0),
       flushed_syscallbuf(false),
@@ -614,6 +615,10 @@ void RecordTask::on_syscall_exit_arch(int syscallno, const Registers& regs) {
     case Arch::rt_sigaction:
       // TODO: SYS_signal
       update_sigaction(regs);
+      // Ignoring a signal discards its pending copies.
+      for (Task* t : thread_group()->task_set()) {
+        static_cast<RecordTask*>(t)->forget_ignored_signals_no_longer_pending();
+      }
       return;
     case Arch::set_tid_address:
       set_tid_addr(regs.orig_arg1());
@@ -1161,6 +1166,122 @@ bool RecordTask::is_signal_pending(int sig) {
   char* end2;
   sig_set_t mask2 = strtoull(pending_strs[1].c_str(), &end2, 16);
   return !*end1 && !*end2 && ((mask1 | mask2) & signal_bit(sig));
+}
+
+/**
+ * Returns true if Linux would discard |sig| when it's generated for |t|, if
+ * |t| wasn't traced (see sig_task_ignored() in kernel/signal.c): if the
+ * handler is SIG_IGN, or SIG_DFL and the default action ignores the signal.
+ * That includes SIGCONT, which continues the process when it's generated.
+ */
+static bool is_sig_ignored_by_kernel(const RecordTask* t, int sig) {
+  return t->is_sig_ignored(sig) ||
+         (sig == SIGCONT && t->sig_disposition(sig) == SIGNAL_DEFAULT);
+}
+
+/**
+ * Reads the hex signal mask |field| of /proc/<tid>/status into |*mask|.
+ */
+static bool read_proc_status_sigmask(pid_t tid, const char* field,
+                                     sig_set_t* mask) {
+  auto strs = read_proc_status_fields(tid, field);
+  if (strs.size() < 1) {
+    return false;
+  }
+  char* end;
+  *mask = strtoull(strs[0].c_str(), &end, 16);
+  return !*end;
+}
+
+/**
+ * The signals in |pending| that Linux would have discarded for |t| if |t|
+ * wasn't traced: those it ignores and that aren't in |blocked|.
+ */
+static sig_set_t ignored_signals(const RecordTask* t, sig_set_t pending,
+                                 sig_set_t blocked) {
+  sig_set_t ignored = 0;
+  for (int sig = 1; sig < _NSIG; ++sig) {
+    if ((pending & ~blocked & signal_bit(sig)) &&
+        is_sig_ignored_by_kernel(t, sig)) {
+      ignored |= signal_bit(sig);
+    }
+  }
+  return ignored;
+}
+
+void RecordTask::note_ignored_signals_pending_at_ptrace_attach() {
+  ignored_signals_pending_at_ptrace_attach = 0;
+  sig_set_t pending;
+  sig_set_t blocked;
+  if (read_proc_status_sigmask(tid, "SigPnd", &pending) &&
+      read_proc_status_sigmask(tid, "SigBlk", &blocked)) {
+    ignored_signals_pending_at_ptrace_attach =
+        ignored_signals(this, pending, blocked);
+  }
+  // A signal for the whole process was discarded if the task it was sent to,
+  // usually the main thread, ignored it then. We use the main thread's
+  // current signal mask.
+  sig_set_t shared_pending;
+  sig_set_t leader_blocked;
+  if (read_proc_status_sigmask(tid, "ShdPnd", &shared_pending) &&
+      (read_proc_status_sigmask(tgid(), "SigBlk", &leader_blocked) ||
+       read_proc_status_sigmask(tid, "SigBlk", &leader_blocked))) {
+    thread_group()->ignored_shared_signals_pending_at_ptrace_attach =
+        ignored_signals(this, shared_pending, leader_blocked);
+  }
+  LOG(debug)
+      << "Ignored signals pending at ptrace attach of " << tid << ": "
+      << HEX(ignored_signals_pending_at_ptrace_attach) << " (thread), "
+      << HEX(thread_group()->ignored_shared_signals_pending_at_ptrace_attach)
+      << " (process)";
+}
+
+bool RecordTask::take_signal_ignored_before_ptrace_attach(int sig) {
+  // Like dequeue_signal() in kernel/signal.c, take the task's own copy before
+  // the process's.
+  if (ignored_signals_pending_at_ptrace_attach & signal_bit(sig)) {
+    ignored_signals_pending_at_ptrace_attach &= ~signal_bit(sig);
+  } else if (thread_group()->ignored_shared_signals_pending_at_ptrace_attach &
+             signal_bit(sig)) {
+    thread_group()->ignored_shared_signals_pending_at_ptrace_attach &=
+        ~signal_bit(sig);
+  } else {
+    return false;
+  }
+  return is_sig_ignored_by_kernel(this, sig);
+}
+
+/**
+ * The signals that |t| has dequeued from the kernel but we haven't delivered
+ * yet. Synthetic SIGCHLDs come from us, not from before an attach.
+ */
+static sig_set_t stashed_signals_from_kernel(const RecordTask* t) {
+  sig_set_t stashed = 0;
+  for (auto& s : t->stashed_signals) {
+    if (!is_synthetic_SIGCHLD(s.siginfo)) {
+      stashed |= signal_bit(s.siginfo.si_signo);
+    }
+  }
+  return stashed;
+}
+
+void RecordTask::forget_ignored_signals_no_longer_pending() {
+  // A signal that we have taken from the kernel but not delivered yet is
+  // still pending as far as the task is concerned.
+  sig_set_t pending;
+  if (ignored_signals_pending_at_ptrace_attach &&
+      read_proc_status_sigmask(tid, "SigPnd", &pending)) {
+    ignored_signals_pending_at_ptrace_attach &=
+        pending | stashed_signals_from_kernel(this);
+  }
+  sig_set_t& shared =
+      thread_group()->ignored_shared_signals_pending_at_ptrace_attach;
+  if (shared && read_proc_status_sigmask(tid, "ShdPnd", &pending)) {
+    for (Task* t : thread_group()->task_set()) {
+      pending |= stashed_signals_from_kernel(static_cast<RecordTask*>(t));
+    }
+    shared &= pending;
+  }
 }
 
 bool RecordTask::has_any_actionable_signal() {
