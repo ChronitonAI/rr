@@ -1314,6 +1314,14 @@ struct BaseArch : public wordsize,
     ptr<void> sa_restorer;
     kernel_sigset_t sa_mask;
   };
+  // The struct of the old sigaction() syscall (i386 only), which has only the
+  // first word of the signal mask.
+  struct old_sigaction {
+    ptr<void> k_sa_handler;
+    unsigned_long sa_mask;
+    unsigned_long sa_flags;
+    ptr<void> sa_restorer;
+  };
   struct tms {
     clock_t tms_utime;
     clock_t tms_stime;

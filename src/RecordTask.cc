@@ -44,6 +44,22 @@ struct Sighandler {
     takes_siginfo = (ksa.sa_flags & SA_SIGINFO) != 0;
   }
 
+  /**
+   * Set from the fields of a sigaction of another arch, stored as a
+   * kernel_sigaction of Arch (the task's).
+   */
+  template <typename Arch>
+  void init_from_fields_arch(uint64_t handler, uint64_t flags,
+                             uint64_t restorer, uint64_t mask) {
+    typename Arch::kernel_sigaction ksa;
+    memset(&ksa, 0, sizeof(ksa));
+    ksa.k_sa_handler = remote_ptr<void>(handler);
+    ksa.sa_flags = flags;
+    ksa.sa_restorer = remote_ptr<void>(restorer);
+    memcpy(&ksa.sa_mask, &mask, min(sizeof(ksa.sa_mask), sizeof(mask)));
+    init_arch<Arch>(ksa);
+  }
+
   template <typename Arch> void reset_arch() {
     typename Arch::kernel_sigaction ksa;
     memset(&ksa, 0, sizeof(ksa));
@@ -71,7 +87,7 @@ struct Sighandler {
   }
 
   remote_ptr<void> k_sa_handler;
-  // Saved kernel_sigaction; used to restore handler
+  // Saved kernel_sigaction of the task's arch; used to restore handler
   vector<uint8_t> sa;
   bool resethand;
   bool takes_siginfo;
@@ -79,6 +95,13 @@ struct Sighandler {
 
 static void reset_handler(Sighandler* handler, SupportedArch arch) {
   RR_ARCH_FUNCTION(handler->reset_arch, arch);
+}
+
+static void init_handler_from_fields(Sighandler* handler, SupportedArch arch,
+                                     uint64_t handler_addr, uint64_t flags,
+                                     uint64_t restorer, uint64_t mask) {
+  RR_ARCH_FUNCTION(handler->init_from_fields_arch, arch, handler_addr, flags,
+                   restorer, mask);
 }
 
 struct Sighandlers {
@@ -612,9 +635,11 @@ void RecordTask::on_syscall_exit_arch(int syscallno, const Registers& regs) {
       set_robust_list(regs.orig_arg1(), (size_t)regs.arg2());
       return;
     case Arch::sigaction:
+      update_sigaction_arch<Arch>(regs, true);
+      return;
     case Arch::rt_sigaction:
       // TODO: SYS_signal
-      update_sigaction(regs);
+      update_sigaction_arch<Arch>(regs, false);
       return;
     case Arch::set_tid_address:
       set_tid_addr(regs.orig_arg1());
@@ -1297,23 +1322,38 @@ void RecordTask::set_siginfo(const siginfo_t& si) {
 }
 
 template <typename Arch>
-void RecordTask::update_sigaction_arch(const Registers& regs) {
+void RecordTask::update_sigaction_arch(const Registers& regs,
+                                       bool old_sigaction) {
   int sig = regs.orig_arg1_signed();
-  remote_ptr<typename Arch::kernel_sigaction> new_sigaction = regs.arg2();
-  if (0 == regs.syscall_result() && !new_sigaction.is_null()) {
-    // A new sighandler was installed.  Update our
-    // sighandler table.
-    // TODO: discard attempts to handle or ignore signals
-    // that can't be by POSIX
-    typename Arch::kernel_sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    read_bytes_helper(new_sigaction, sizeof(sa), &sa);
-    sighandlers->get(sig).init_arch<Arch>(sa);
+  remote_ptr<void> new_sigaction = regs.arg2();
+  if (0 != regs.syscall_result() || new_sigaction.is_null()) {
+    return;
   }
-}
-
-void RecordTask::update_sigaction(const Registers& regs) {
-  RR_ARCH_FUNCTION(update_sigaction_arch, regs.arch(), regs);
+  // A new sighandler was installed.  Update our
+  // sighandler table.
+  // TODO: discard attempts to handle or ignore signals
+  // that can't be by POSIX
+  uint64_t handler, flags, restorer, mask = 0;
+  if (old_sigaction) {
+    auto sa = read_mem(new_sigaction.cast<typename Arch::old_sigaction>());
+    handler = sa.k_sa_handler.rptr().as_int();
+    flags = sa.sa_flags;
+    restorer = sa.sa_restorer.rptr().as_int();
+    mask = sa.sa_mask;
+  } else {
+    auto sa = read_mem(new_sigaction.cast<typename Arch::kernel_sigaction>());
+    if (Arch::arch() == arch()) {
+      sighandlers->get(sig).init_arch<Arch>(sa);
+      return;
+    }
+    handler = sa.k_sa_handler.rptr().as_int();
+    flags = sa.sa_flags;
+    restorer = sa.sa_restorer.rptr().as_int();
+    memcpy(&mask, &sa.sa_mask, min(sizeof(mask), sizeof(sa.sa_mask)));
+  }
+  // Store it with the task's layout, which rr uses to install it again.
+  init_handler_from_fields(&sighandlers->get(sig), arch(), handler, flags,
+                           restorer, mask);
 }
 
 sig_set_t RecordTask::read_sigmask_from_process() {
