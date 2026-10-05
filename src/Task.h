@@ -642,6 +642,13 @@ public:
 
   bool set_aarch64_debug_regs(int which, ARM64Arch::user_hwdebug_state *regs, size_t nregs);
   bool get_aarch64_debug_regs(int which, ARM64Arch::user_hwdebug_state *regs);
+  /**
+   * The task is stopped by a SIGTRAP from a hardware breakpoint or watchpoint
+   * in its debug registers, on aarch64. Those trap before their instruction
+   * executes. Execute the instruction with the task's breakpoints and
+   * watchpoints disabled, then restore them. Returns false if the task died.
+   */
+  bool step_over_aarch64_debug_trap();
 
   uintptr_t get_debug_reg(size_t regno);
   bool set_x86_debug_reg(size_t regno, uintptr_t value);

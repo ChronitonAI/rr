@@ -821,10 +821,11 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
               auto set = ptrace_get_regs_set<Arch>(
                   this, regs, offsetof(ARM64Arch::user_hwdebug_state, dbg_regs[0]));
               ASSERT(this, set.size() >= sizeof(int));
-              tracee->set_aarch64_debug_regs((int)regs.arg3(),
-                (ARM64Arch::user_hwdebug_state*)set.data(),
-                (set.size() - offsetof(ARM64Arch::user_hwdebug_state, dbg_regs[0]))/
-                  2*sizeof(ARM64Arch::hw_bp));
+              tracee->set_aarch64_debug_regs(
+                  (int)regs.arg3(), (ARM64Arch::user_hwdebug_state*)set.data(),
+                  (set.size() -
+                   offsetof(ARM64Arch::user_hwdebug_state, dbg_regs[0])) /
+                      sizeof(ARM64Arch::hw_bp));
               break;
             }
             case NT_ARM_PACA_KEYS: {
@@ -1326,6 +1327,82 @@ bool Task::get_aarch64_debug_regs(int which, ARM64Arch::user_hwdebug_state *regs
   fallible_ptrace(PTRACE_GETREGSET, which, (void*)&iov);
   return errno == 0;
 }
+/**
+ * Returns the number of slots in |state| up to the last enabled breakpoint
+ * or watchpoint.
+ */
+static size_t aarch64_debug_regs_in_use(
+    const ARM64Arch::user_hwdebug_state& state) {
+  // The low byte of dbg_info is the number of breakpoints or watchpoints.
+  size_t num = min<size_t>(state.dbg_info & 0xff, 16);
+  size_t n = 0;
+  for (size_t i = 0; i < num; ++i) {
+    if (state.dbg_regs[i].ctrl.enabled) {
+      n = i + 1;
+    }
+  }
+  return n;
+}
+
+bool Task::step_over_aarch64_debug_trap() {
+  ARM64Arch::user_hwdebug_state bps;
+  ARM64Arch::user_hwdebug_state wps;
+  if (!get_aarch64_debug_regs(NT_ARM_HW_BREAK, &bps) ||
+      !get_aarch64_debug_regs(NT_ARM_HW_WATCH, &wps)) {
+    return false;
+  }
+  // Only write the slots up to the last enabled one. The kernel creates a
+  // ptrace breakpoint for every slot that is written, even a disabled one,
+  // and it keeps it until exec or exit, taking up a hardware slot that rr
+  // might need later. The ones up to an enabled one exist already.
+  size_t num_bps = aarch64_debug_regs_in_use(bps);
+  size_t num_wps = aarch64_debug_regs_in_use(wps);
+  ARM64Arch::user_hwdebug_state disabled_bps = bps;
+  ARM64Arch::user_hwdebug_state disabled_wps = wps;
+  for (size_t i = 0; i < num_bps; ++i) {
+    disabled_bps.dbg_regs[i].ctrl.enabled = 0;
+  }
+  for (size_t i = 0; i < num_wps; ++i) {
+    disabled_wps.dbg_regs[i].ctrl.enabled = 0;
+  }
+  if (num_bps) {
+    set_aarch64_debug_regs(NT_ARM_HW_BREAK, &disabled_bps, num_bps);
+  }
+  if (num_wps) {
+    set_aarch64_debug_regs(NT_ARM_HW_WATCH, &disabled_wps, num_wps);
+  }
+  bool ok;
+  while (true) {
+    ok = resume_execution(RESUME_SINGLESTEP, RESUME_WAIT_NO_EXIT,
+                          RESUME_UNLIMITED_TICKS);
+    if (!ok) {
+      break;
+    }
+    int sig = stop_sig();
+    if (sig == SIGTRAP && get_siginfo().si_code == TRAP_TRACE) {
+      break;
+    }
+    // Another signal stopped the task before the instruction executed.
+    // Ignore rr's own signals, stash the others, and try again.
+    ASSERT(this, sig) << "Expected a signal stop, got " << status();
+    if (sig == PerfCounters::TIME_SLICE_SIGNAL ||
+        (session().is_recording() &&
+         sig == session().as_record()->syscallbuf_desched_sig())) {
+      continue;
+    }
+    ASSERT(this, session().is_recording() && !is_deterministic_signal(this))
+        << "Unexpected " << get_siginfo()
+        << " while stepping over a debug register trap";
+    static_cast<RecordTask*>(this)->stash_sig();
+  }
+  if (num_bps) {
+    set_aarch64_debug_regs(NT_ARM_HW_BREAK, &bps, num_bps);
+  }
+  if (num_wps) {
+    set_aarch64_debug_regs(NT_ARM_HW_WATCH, &wps, num_wps);
+  }
+  return ok;
+}
 std::vector<uint8_t> Task::pac_keys(bool *ok)
 {
   std::vector<uint8_t> pac_data(
@@ -1377,6 +1454,10 @@ bool Task::set_aarch64_debug_regs(int, ARM64Arch::user_hwdebug_state *, size_t) 
 bool Task::get_aarch64_debug_regs(int, ARM64Arch::user_hwdebug_state *regs) {
   // Following memset just to silence a warning about dbg_info may be used uninitialized.
   memset(regs, 0, sizeof(*regs));
+  FATAL() << "Reached aarch64 code path on non-aarch64 system";
+  return false;
+}
+bool Task::step_over_aarch64_debug_trap() {
   FATAL() << "Reached aarch64 code path on non-aarch64 system";
   return false;
 }

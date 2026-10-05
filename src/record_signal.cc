@@ -377,11 +377,12 @@ bool handle_syscallbuf_debug_trap(RecordTask* t) {
   // syscallbuf, the syscallbuf code copies the data into the buffer in user
   // mode, and the watchpoint fires there. The tracee must not see that trap.
   // On x86, a data breakpoint traps after the access and the kernel sets RF
-  // for an instruction breakpoint, so the tracee can just continue. (On
-  // aarch64, a watchpoint traps before the access.)
+  // for an instruction breakpoint, so the tracee can just continue. On
+  // aarch64, both trap before their instruction executes, so we execute it
+  // with the debug registers disabled.
   const siginfo_t& si = t->get_siginfo();
-  if (!is_x86ish(t->arch()) || si.si_signo != SIGTRAP ||
-      si.si_code != TRAP_HWBKPT || !t->is_in_syscallbuf()) {
+  if (si.si_signo != SIGTRAP || si.si_code != TRAP_HWBKPT ||
+      !t->is_in_syscallbuf()) {
     return false;
   }
   // The syscall hooks run instructions of the application that the syscall
@@ -399,6 +400,23 @@ bool handle_syscallbuf_debug_trap(RecordTask* t) {
   // blocked: our cached sigmask is the application's, from before the trap.
   SignalBlocked signal_was_blocked =
       t->is_sig_blocked(SIGTRAP) ? SIG_BLOCKED : SIG_UNBLOCKED;
+  if (t->arch() == aarch64) {
+    // The copies into the tracee's buffers run before commit_raw_syscall
+    // disarms the desched event, so it may still be armed. Then every stop
+    // while we step would queue another desched signal. Disarm it meanwhile.
+    bool desched_armed = desched_event_armed(t);
+    if (desched_armed) {
+      disarm_desched_event(t);
+    }
+    if (!t->step_over_aarch64_debug_trap()) {
+      // The task died.
+      return true;
+    }
+    if (desched_armed) {
+      arm_desched_event(t);
+    }
+  }
+  // The single-step's SIGTRAP on aarch64 has the same effects as the trap's.
   restore_signal_state(t, SIGTRAP, signal_was_blocked);
   return true;
 }
