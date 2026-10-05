@@ -2824,9 +2824,16 @@ static Switchable prepare_ptrace(RecordTask* t,
         // deliver SIGSTOP to some other thread of the process, and we won't
         // generate any ptrace event if that thread isn't being ptraced.
         tracee->tgkill(SIGSTOP);
+        // That discards the pending SIGCONTs of the whole process.
+        for (Task* tt : tracee->thread_group()->task_set()) {
+          static_cast<RecordTask*>(tt)
+              ->forget_ignored_signals_no_longer_pending();
+        }
       } else {
         ptrace_attach_to_already_stopped_task(tracee);
       }
+      // After the SIGSTOP, which discards a pending SIGCONT.
+      tracee->note_ignored_signals_pending_at_ptrace_attach();
       break;
     }
     case PTRACE_TRACEME: {
@@ -2835,6 +2842,7 @@ static Switchable prepare_ptrace(RecordTask* t,
         break;
       }
       t->set_emulated_ptracer(tracer);
+      t->note_ignored_signals_pending_at_ptrace_attach();
       t->emulated_ptrace_seized = false;
       t->emulated_ptrace_options = 0;
       syscall_state.emulate_result(0);
@@ -2853,6 +2861,7 @@ static Switchable prepare_ptrace(RecordTask* t,
         break;
       }
       tracee->set_emulated_ptracer(t);
+      tracee->note_ignored_signals_pending_at_ptrace_attach();
       tracee->emulated_ptrace_seized = true;
       tracee->emulated_ptrace_options = (int)t->regs().arg4();
       if (tracee->emulated_stop_type == GROUP_STOP) {
@@ -7445,6 +7454,19 @@ static void rec_process_syscall_arch(RecordTask* t,
       t->fd_table()->filter_getdents(fd, t);
       break;
     }
+
+    case Arch::kill:
+    case Arch::tkill:
+    case Arch::tgkill:
+    case Arch::rt_sigqueueinfo:
+    case Arch::rt_tgsigqueueinfo:
+    case Arch::pidfd_send_signal:
+      // A stop signal discards pending SIGCONTs and vice versa.
+      for (auto& p : t->session().tasks()) {
+        static_cast<RecordTask*>(p.second)
+            ->forget_ignored_signals_no_longer_pending();
+      }
+      break;
 
     case Arch::waitpid:
     case Arch::wait4:
