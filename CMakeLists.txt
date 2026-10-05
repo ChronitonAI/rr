@@ -1489,6 +1489,7 @@ set(BASIC_TESTS
   x86/x87env
   wait
   wait_sigstop
+  wait_stop_and_exit
   write_race
   writev
   xattr
