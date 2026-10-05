@@ -1213,6 +1213,7 @@ bool RecordTask::has_any_actionable_signal() {
 }
 
 void RecordTask::emulate_SIGCONT() {
+  thread_group()->stopping_signal = 0;
   // All threads in the process are resumed, but SIGCONT doesn't end ptrace
   // stops (see prepare_signal() in kernel/signal.c).
   for (Task* t : thread_group()->task_set()) {
@@ -1243,6 +1244,7 @@ void RecordTask::signal_delivered(int sig) {
   }
 
   if (is_sig_stopping(sig)) {
+    thread_group()->stopping_signal = sig;
     // All threads in the process are stopped.
     for (Task* t : thread_group()->task_set()) {
       auto rt = static_cast<RecordTask*>(t);
