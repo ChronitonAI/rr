@@ -80,17 +80,14 @@ static void record_robust_futex_change(
  * TID, not the actual TID of the dying task.
  */
 template <typename Arch>
-static void record_robust_futex_changes_arch(RecordTask* t) {
-  if (t->did_record_robust_futex_changes) {
-    return;
-  }
-  t->did_record_robust_futex_changes = true;
-
-  auto head_ptr = t->robust_list().cast<typename Arch::robust_list_head>();
+static void record_robust_futex_changes_arch(RecordTask* t,
+                                             remote_ptr<void> list,
+                                             size_t len) {
+  auto head_ptr = list.cast<typename Arch::robust_list_head>();
   if (head_ptr.is_null()) {
     return;
   }
-  ASSERT(t, t->robust_list_len() == sizeof(typename Arch::robust_list_head));
+  ASSERT(t, len == sizeof(typename Arch::robust_list_head));
   bool ok = true;
   auto head = t->read_mem(head_ptr, &ok);
   if (!ok) {
@@ -109,8 +106,24 @@ static void record_robust_futex_changes_arch(RecordTask* t) {
   }
 }
 
+static void record_robust_futex_list_changes(RecordTask* t, SupportedArch arch,
+                                             remote_ptr<void> list,
+                                             size_t len) {
+  RR_ARCH_FUNCTION(record_robust_futex_changes_arch, arch, t, list, len);
+}
+
 static void record_robust_futex_changes(RecordTask* t) {
-  RR_ARCH_FUNCTION(record_robust_futex_changes_arch, t->arch(), t);
+  if (t->did_record_robust_futex_changes) {
+    return;
+  }
+  t->did_record_robust_futex_changes = true;
+
+  record_robust_futex_list_changes(t, t->arch(), t->robust_list(),
+                                   t->robust_list_len());
+  // An x86-64 task can also have a list from an i386 set_robust_list()
+  // (int $0x80), which the kernel processes too.
+  record_robust_futex_list_changes(t, x86, t->compat_robust_list(),
+                                   t->compat_robust_list_len());
 }
 
 static bool looks_like_syscall_entry(RecordTask* t) {

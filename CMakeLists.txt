@@ -1145,6 +1145,7 @@ set(BASIC_TESTS
   x86/int80_ptrace_wait
   x86/int80_regs
   x86/int80_restart
+  x86/int80_robust_list
   x86/int80_seccomp
   x86/int80_sigaction
   intr_futex_wait_restart
