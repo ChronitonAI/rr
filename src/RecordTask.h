@@ -650,16 +650,15 @@ private:
    */
   void futex_wait(remote_ptr<int> futex, int val, bool* ok);
 
-  /**
-   * Call this when SYS_sigaction is finishing with |regs|.
-   */
-  void update_sigaction(const Registers& regs);
-
   template <typename Arch> void init_buffers_arch();
   template <typename Arch>
   void on_syscall_exit_arch(int syscallno, const Registers& regs);
-  /** Helper function for update_sigaction. */
-  template <typename Arch> void update_sigaction_arch(const Registers& regs);
+  /**
+   * Call this when an rt_sigaction() (or, with |old_sigaction|, a sigaction())
+   * syscall of arch Arch is finishing with |regs|.
+   */
+  template <typename Arch>
+  void update_sigaction_arch(const Registers& regs, bool old_sigaction);
 
   /** Update the clear-tid futex to |tid_addr|. */
   void set_tid_addr(remote_ptr<int> tid_addr);

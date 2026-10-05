@@ -1146,6 +1146,7 @@ set(BASIC_TESTS
   x86/int80_regs
   x86/int80_restart
   x86/int80_seccomp
+  x86/int80_sigaction
   intr_futex_wait_restart
   intr_poll
   intr_ppoll

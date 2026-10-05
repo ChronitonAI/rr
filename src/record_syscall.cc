@@ -3880,9 +3880,32 @@ static bool protect_rr_sigs_sa_mask_arch(RecordTask* t, remote_ptr<void> p,
   return true;
 }
 
-static bool protect_rr_sigs_sa_mask(RecordTask* t, remote_ptr<void> p,
-                                    void* save) {
-  RR_ARCH_FUNCTION(protect_rr_sigs_sa_mask_arch, t->arch(), t, p, save);
+/**
+ * The same as protect_rr_sigs_sa_mask_arch for the struct of the old
+ * (i386-only) sigaction() syscall.
+ */
+template <typename Arch>
+static bool protect_rr_sigs_old_sa_mask_arch(RecordTask* t, remote_ptr<void> p,
+                                             void* save) {
+  remote_ptr<typename Arch::old_sigaction> sap =
+      p.cast<typename Arch::old_sigaction>();
+  if (sap.is_null()) {
+    return false;
+  }
+
+  auto sa = t->read_mem(sap);
+  auto new_mask = sa.sa_mask & ~t->session().rr_signal_mask();
+  if (new_mask == sa.sa_mask) {
+    return false;
+  }
+
+  if (save) {
+    memcpy(save, &sa, sizeof(sa));
+  }
+  sa.sa_mask = new_mask;
+  t->write_mem(sap, sa);
+
+  return true;
 }
 
 static void record_ranges(RecordTask* t,
@@ -5365,10 +5388,18 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       return PREVENT_SWITCH;
     }
 
-    case Arch::sigaction:
+    // The structs have the syscall's layout: Arch, which for an x86-64 task
+    // can be x86 (int $0x80).
+    case Arch::sigaction: {
+      syscall_state.reg_parameter<typename Arch::old_sigaction>(
+          2, IN, protect_rr_sigs_old_sa_mask_arch<Arch>);
+      syscall_state.reg_parameter<typename Arch::old_sigaction>(3, OUT);
+      return PREVENT_SWITCH;
+    }
+
     case Arch::rt_sigaction: {
       syscall_state.reg_parameter<typename Arch::kernel_sigaction>(
-          2, IN, protect_rr_sigs_sa_mask);
+          2, IN, protect_rr_sigs_sa_mask_arch<Arch>);
       syscall_state.reg_parameter<typename Arch::kernel_sigaction>(3, OUT);
       return PREVENT_SWITCH;
     }
