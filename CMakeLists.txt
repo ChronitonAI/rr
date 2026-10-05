@@ -1312,6 +1312,8 @@ set(BASIC_TESTS
   ptrace_exec
   x86/ptrace_exec32
   ptrace_group_stop
+  ptrace_interrupt_restarted_syscall
+  ptrace_interrupt_syscall_stops
   ptrace_interrupt_syscall
   ptrace_kill_grandtracee
   ptrace_resume_signal_ignored
@@ -1327,6 +1329,7 @@ set(BASIC_TESTS
   ptrace_syscall
   ptrace_syscall_clone_untraced
   x86/ptrace_sysemu
+  ptrace_sysemu_interrupt
   ptrace_sysemu_syscall
   ptrace_trace_clone
   ptrace_trace_exit
@@ -1673,6 +1676,7 @@ set(TESTS_WITH_PROGRAM
   patch_syscall_killed_task
   prctl_tsc
   priority
+  x86/ptrace_interrupt_singlestep_syscall
   ptrace_remote_unmap
   x86/rdtsc_loop
   x86/rdtsc_loop2

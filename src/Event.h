@@ -236,7 +236,11 @@ struct SyscallEvent {
         is_restart(false),
         failed_during_preparation(false),
         in_sysemu(false),
-        should_retry_patch(false) {}
+        should_retry_patch(false),
+        ptrace_cont_command_at_exit(-1),
+        ptrace_interrupt_stop_at_exit(false),
+        ptrace_interrupt_pending(false),
+        ptrace_interrupt_after_stop(false) {}
 
   std::string syscall_name() const { return rr::syscall_name(number, arch()); }
 
@@ -284,6 +288,30 @@ struct SyscallEvent {
   bool in_sysemu;
   // True if we should retry patching on exit from this syscall
   bool should_retry_patch;
+  // If the task's emulated ptracer used PTRACE_INTERRUPT during this
+  // syscall, the ptracer's resume command at that point, or -1. That command
+  // decides whether Linux reports the syscall's exit to the ptracer: the
+  // syscall exits before the PTRACE_INTERRUPT stop would happen, and a
+  // syscall-exit stop discards the PTRACE_INTERRUPT trap.
+  int ptrace_cont_command_at_exit;
+  // True if we report a PTRACE_EVENT_STOP to the emulated ptracer for its
+  // PTRACE_INTERRUPT when the syscall exits. A ptrace event stop in the
+  // syscall (e.g. PTRACE_EVENT_EXEC) discards the PTRACE_INTERRUPT trap
+  // before that, like any ptrace stop.
+  bool ptrace_interrupt_stop_at_exit;
+  // True if the emulated ptracer used PTRACE_INTERRUPT during this syscall
+  // while we had the task stopped. We forward the PTRACE_INTERRUPT to the
+  // task whenever task_continue resumes it in the syscall, until the syscall
+  // exits, so that the syscall gets interrupted as it would natively. (Any
+  // ptrace stop that we get in the syscall discards the PTRACE_INTERRUPT
+  // trap.)
+  bool ptrace_interrupt_pending;
+  // True if the emulated ptracer used PTRACE_INTERRUPT while the task was at
+  // a ptrace stop in this syscall (its syscall-entry stop, or a ptrace event
+  // stop that we hold it at). Linux reports the PTRACE_INTERRUPT trap after
+  // that stop, so we handle the PTRACE_INTERRUPT when the ptracer resumes
+  // the task, with the new resume command.
+  bool ptrace_interrupt_after_stop;
 };
 
 struct syscall_interruption_t {
