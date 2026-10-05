@@ -646,6 +646,19 @@ void RecordSession::handle_seccomp_errno(RecordTask* t,
   step_state->continue_type = RecordSession::DONT_CONTINUE;
 }
 
+/**
+ * Hold |t| at the ptrace event stop in its syscall that we're reporting to
+ * its emulated ptracer, until the ptracer resumes it.
+ */
+static void hold_at_emulated_ptrace_event(RecordTask* t) {
+  t->held_at_emulated_ptrace_event = true;
+  // Like any ptrace stop, the event stop discards a pending PTRACE_INTERRUPT
+  // trap, so the resume command from this stop decides the syscall exit.
+  t->ev().Syscall().ptrace_cont_command_at_exit = -1;
+  t->ev().Syscall().ptrace_interrupt_stop_at_exit = false;
+  t->ev().Syscall().ptrace_interrupt_pending = false;
+}
+
 bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
                                         StepState* step_state,
                                         RecordResult* result,
@@ -793,7 +806,7 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
       }
 
       if (t->emulated_stop_pending) {
-        t->held_at_emulated_ptrace_event = true;
+        hold_at_emulated_ptrace_event(t);
         last_task_switchable = ALLOW_SWITCH;
         step_state->continue_type = DONT_CONTINUE;
       } else {
@@ -928,6 +941,13 @@ void RecordSession::task_continue(const StepState& step_state) {
         resume = RESUME_CONT;
       }
     }
+  }
+  if (t->ev().type() == EV_SYSCALL &&
+      t->ev().Syscall().state == PROCESSING_SYSCALL &&
+      t->ev().Syscall().ptrace_interrupt_pending) {
+    // See SyscallEvent::ptrace_interrupt_pending. The PTRACE_INTERRUPT trap
+    // stays pending while the task is in this ptrace stop.
+    t->fallible_ptrace(PTRACE_INTERRUPT, nullptr, nullptr);
   }
   t->resume_execution(resume, RESUME_NONBLOCKING, ticks_request);
 }
@@ -1114,10 +1134,40 @@ static void copy_syscall_arg_regs(Registers* to, const Registers& from) {
   to->set_arg6(from.arg6());
 }
 
-static void maybe_trigger_emulated_ptrace_syscall_exit_stop(RecordTask* t) {
-  if (t->emulated_ptrace_cont_command == PTRACE_SYSCALL) {
+/**
+ * Returns the resume command of |t|'s emulated ptracer that decides what the
+ * ptracer gets at the exit of |t|'s current syscall, and sets
+ * |*ptrace_interrupt_stop| if the ptracer gets a PTRACE_EVENT_STOP after the
+ * exit. Resets that state, since the syscall event is reused if the syscall
+ * is restarted.
+ */
+static int take_ptrace_syscall_exit_state(RecordTask* t,
+                                          bool* ptrace_interrupt_stop) {
+  SyscallEvent& syscall = t->ev().Syscall();
+  int ptrace_cont_command = syscall.ptrace_cont_command_at_exit;
+  if (ptrace_cont_command < 0) {
+    ptrace_cont_command = t->emulated_ptrace_cont_command;
+  }
+  *ptrace_interrupt_stop = syscall.ptrace_interrupt_stop_at_exit;
+  syscall.ptrace_cont_command_at_exit = -1;
+  syscall.ptrace_interrupt_stop_at_exit = false;
+  syscall.ptrace_interrupt_pending = false;
+  return ptrace_cont_command;
+}
+
+static void maybe_trigger_emulated_ptrace_interrupt_stop(
+    RecordTask* t, bool ptrace_interrupt_stop) {
+  // The ptracer may have exited or detached since.
+  if (ptrace_interrupt_stop && t->emulated_ptracer) {
+    t->apply_ptrace_interrupt_stop();
+  }
+}
+
+static void maybe_trigger_emulated_ptrace_syscall_exit_stop(
+    RecordTask* t, int ptrace_cont_command) {
+  if (ptrace_cont_command == PTRACE_SYSCALL) {
     t->emulate_ptrace_stop(WaitStatus::for_syscall(t), SYSCALL_EXIT_STOP);
-  } else if (is_ptrace_any_singlestep(t->arch(), t->emulated_ptrace_cont_command)) {
+  } else if (is_ptrace_any_singlestep(t->arch(), ptrace_cont_command)) {
     // Deliver the singlestep trap now that we've finished executing the
     // syscall.
     t->emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGTRAP), SIGNAL_DELIVERY_STOP, nullptr,
@@ -1156,6 +1206,9 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         // We'll have recorded just the ENTERING_SYSCALL_PTRACE event and
         // nothing else. Resume with an invalid syscall to ensure no real
         // syscall runs.
+        bool ptrace_interrupt_stop;
+        int ptrace_cont_command =
+            take_ptrace_syscall_exit_state(t, &ptrace_interrupt_stop);
         t->pop_syscall();
         Registers r = t->regs();
         Registers orig_regs = r;
@@ -1166,7 +1219,10 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         if (t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
           ASSERT(t, t->ip() == r.ip());
           t->set_regs(orig_regs);
-          maybe_trigger_emulated_ptrace_syscall_exit_stop(t);
+          maybe_trigger_emulated_ptrace_syscall_exit_stop(t,
+                                                          ptrace_cont_command);
+          maybe_trigger_emulated_ptrace_interrupt_stop(t,
+                                                       ptrace_interrupt_stop);
         }
         return;
       }
@@ -1195,7 +1251,7 @@ void RecordSession::syscall_state_changed(RecordTask* t,
       t->ev().Syscall().state = PROCESSING_SYSCALL;
 
       if (t->emulated_stop_pending) {
-        t->held_at_emulated_ptrace_event = true;
+        hold_at_emulated_ptrace_event(t);
         step_state->continue_type = DONT_CONTINUE;
       } else {
         // Resume the syscall execution in the kernel context.
@@ -1249,6 +1305,9 @@ void RecordSession::syscall_state_changed(RecordTask* t,
       SupportedArch syscall_arch = t->ev().Syscall().arch();
       int syscallno = t->ev().Syscall().number;
       intptr_t retval = t->regs().syscall_result_signed();
+      bool ptrace_interrupt_stop;
+      int ptrace_cont_command =
+          take_ptrace_syscall_exit_state(t, &ptrace_interrupt_stop);
 
       if (t->desched_rec()) {
         // If we enabled the desched event above, disable it.
@@ -1384,8 +1443,9 @@ void RecordSession::syscall_state_changed(RecordTask* t,
       step_state->continue_type = DONT_CONTINUE;
 
       if (!is_in_privileged_syscall(t)) {
-        maybe_trigger_emulated_ptrace_syscall_exit_stop(t);
+        maybe_trigger_emulated_ptrace_syscall_exit_stop(t, ptrace_cont_command);
       }
+      maybe_trigger_emulated_ptrace_interrupt_stop(t, ptrace_interrupt_stop);
       return;
     }
 
