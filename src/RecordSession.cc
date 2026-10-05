@@ -1007,12 +1007,18 @@ static bool advance_to_disarm_desched_syscall(RecordTask* t) {
     if (t->session().syscallbuf_desched_sig() == sig) {
       continue;
     }
-    if (SIGTRAP == sig && handle_syscallbuf_debug_trap(t)) {
-      // Restoring the SIGTRAP state may have used AutoRemoteSyscalls, which
-      // re-arms the desched event because the syscallbuf still says it's
-      // relevant. Disarm it again.
-      disarm_desched_event(t);
-      continue;
+    if (SIGTRAP == sig) {
+      SyscallbufDebugTrap trap = handle_syscallbuf_debug_trap(t);
+      if (trap == SYSCALLBUF_DEBUG_TRAP_DROPPED) {
+        // Restoring the SIGTRAP state may have used AutoRemoteSyscalls, which
+        // re-arms the desched event because the syscallbuf still says it's
+        // relevant. Disarm it again.
+        disarm_desched_event(t);
+        continue;
+      }
+      if (trap == SYSCALLBUF_DEBUG_TRAP_TASK_KILLED) {
+        return false;
+      }
     }
     if (sig && sig == old_sig) {
       LOG(debug) << "  coalescing pending " << signal_name(sig);
@@ -2051,9 +2057,21 @@ bool RecordSession::handle_signal_event(RecordTask* t, StepState* step_state) {
     return true;
   }
 
-  if (sig == SIGTRAP &&
-      (handle_syscallbuf_breakpoint(t) || handle_syscallbuf_debug_trap(t))) {
-    return true;
+  if (sig == SIGTRAP) {
+    if (handle_syscallbuf_breakpoint(t)) {
+      return true;
+    }
+    switch (handle_syscallbuf_debug_trap(t)) {
+      case NOT_SYSCALLBUF_DEBUG_TRAP:
+        break;
+      case SYSCALLBUF_DEBUG_TRAP_DROPPED:
+        return true;
+      case SYSCALLBUF_DEBUG_TRAP_TASK_KILLED:
+        last_task_switchable = scheduler().wait_for_killed_task(t) ?
+            PREVENT_SWITCH : ALLOW_SWITCH;
+        step_state->continue_type = DONT_CONTINUE;
+        return true;
+    }
   }
 
   SignalDeterministic deterministic = is_deterministic_signal(t);

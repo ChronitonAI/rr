@@ -1309,6 +1309,7 @@ set(BASIC_TESTS
   ptrace_change_patched_syscall
   x86/ptrace_debug_regs
   x86/ptrace_debug_regs_syscallbuf
+  arm/ptrace_hw_watch_syscallbuf
   ptrace_event_stop_sigcont
   ptrace_exec
   x86/ptrace_exec32
