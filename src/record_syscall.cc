@@ -3211,16 +3211,13 @@ static Switchable prepare_ptrace(RecordTask* t,
         uint64_t result = 0;
         // Is the tracee in a syscall, as far as the ptracer knows? (We may
         // have it stopped at the syscall entry or exit, at a stop we haven't
-        // reported to the ptracer, or haven't processed yet.) Leave out
-        // syscalls that the syscall buffer descheduled, whose syscall-exit
-        // stops we don't report.
+        // reported to the ptracer, or haven't processed yet.)
         bool in_syscall =
             tracee->emulated_stop_type == NOT_STOPPED &&
             tracee->ev().type() == EV_SYSCALL &&
             (tracee->ev().Syscall().state == ENTERING_SYSCALL_PTRACE ||
              tracee->ev().Syscall().state == ENTERING_SYSCALL ||
-             tracee->ev().Syscall().state == PROCESSING_SYSCALL) &&
-            !tracee->desched_rec();
+             tracee->ev().Syscall().state == PROCESSING_SYSCALL);
         if (in_syscall) {
           // Linux interrupts the syscall if it blocks, and the
           // PTRACE_INTERRUPT stop can only happen after the syscall exits.
