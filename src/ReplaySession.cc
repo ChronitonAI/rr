@@ -562,6 +562,24 @@ bool ReplaySession::handle_unrecorded_cpuid_fault(
 }
 
 /**
+ * On aarch64, a hardware breakpoint or watchpoint traps before its
+ * instruction executes. If one that the tracee's ptracer set triggered, in
+ * syscallbuf code, recording executed the instruction without reporting the
+ * trap (see handle_syscallbuf_debug_trap). Do the same, so that the task is
+ * stopped after the instruction, as on x86. Recorded traps of the debug
+ * registers are replayed as deterministic signals, so callers don't call this
+ * then.
+ */
+static void maybe_step_over_debug_trap(ReplayTask* t) {
+  if (t->arch() == aarch64 && t->stop_sig() == SIGTRAP &&
+      t->get_siginfo().si_code == TRAP_HWBKPT &&
+      t->vm()->get_hw_watchpoints().empty()) {
+    LOG(debug) << "Stepping over debug register trap at " << t->ip();
+    t->step_over_aarch64_debug_trap();
+  }
+}
+
+/**
  * Continue until reaching either the "entry" of an emulated syscall,
  * or the entry or exit of an executed syscall.  |emu| is nonzero when
  * we're emulating the syscall.  Return COMPLETE when the next syscall
@@ -605,6 +623,7 @@ Completion ReplaySession::cont_syscall_boundary(
       }
       break;
     case SIGTRAP:
+      maybe_step_over_debug_trap(t);
       return INCOMPLETE;
     default:
       break;
@@ -855,6 +874,9 @@ Completion ReplaySession::continue_or_step(ReplayTask* t,
     } else if (handle_unrecorded_cpuid_fault(t, constraints)) {
       return INCOMPLETE;
     }
+  }
+  if (current_step.action != TSTEP_DETERMINISTIC_SIGNAL) {
+    maybe_step_over_debug_trap(t);
   }
   check_pending_sig(t);
   return COMPLETE;
