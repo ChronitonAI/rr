@@ -212,6 +212,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       delay_syscallbuf_reset_for_seccomp_trap(false),
       prctl_seccomp_status(0),
       robust_futex_list_len(0),
+      compat_robust_futex_list_len(0),
       termination_signal(0),
       tsc_mode(PR_TSC_ENABLE),
       cpuid_mode(1),
@@ -375,6 +376,9 @@ void RecordTask::post_wait_clone(Task* cloned_from, int flags) {
   prctl_seccomp_status = rt->prctl_seccomp_status;
   robust_futex_list = rt->robust_futex_list;
   robust_futex_list_len = rt->robust_futex_list_len;
+  // The kernel doesn't pass robust lists on to new tasks (copy_process() ->
+  // futex_init_task()). glibc registers the x86-64 list again in new threads
+  // and processes, but nothing does that for an i386 list, so don't copy it.
   tsc_mode = rt->tsc_mode;
   cpuid_mode = rt->cpuid_mode;
   if (CLONE_SHARE_SIGHANDLERS & flags) {
@@ -410,6 +414,7 @@ void RecordTask::post_exec() {
   // soon after exec, we must not do a bogus set_robust_list syscall for
   // the clone.
   set_robust_list(nullptr, 0);
+  set_compat_robust_list(nullptr, 0);
   sighandlers = sighandlers->clone();
   sighandlers->reset_user_handlers(arch());
 
@@ -632,7 +637,13 @@ void RecordTask::on_syscall_exit_arch(int syscallno, const Registers& regs) {
 
   switch (syscallno) {
     case Arch::set_robust_list:
-      set_robust_list(regs.orig_arg1(), (size_t)regs.arg2());
+      if (Arch::arch() != arch()) {
+        // An i386 syscall of an x86-64 task (int $0x80). The kernel keeps
+        // that list separately and processes both at exit.
+        set_compat_robust_list(regs.orig_arg1(), (size_t)regs.arg2());
+      } else {
+        set_robust_list(regs.orig_arg1(), (size_t)regs.arg2());
+      }
       return;
     case Arch::sigaction:
       update_sigaction_arch<Arch>(regs, true);

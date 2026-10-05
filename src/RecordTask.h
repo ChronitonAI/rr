@@ -536,6 +536,10 @@ public:
 
   remote_ptr<void> robust_list() const { return robust_futex_list; }
   size_t robust_list_len() const { return robust_futex_list_len; }
+  remote_ptr<void> compat_robust_list() const {
+    return compat_robust_futex_list;
+  }
+  size_t compat_robust_list_len() const { return compat_robust_futex_list_len; }
 
   /** Uses /proc so not trivially cheap. */
   pid_t get_parent_pid() const;
@@ -628,6 +632,14 @@ public:
   void set_robust_list(remote_ptr<void> list, size_t len) {
     robust_futex_list = list;
     robust_futex_list_len = len;
+  }
+  /**
+   * The same for the list of an i386 set_robust_list() of an x86-64 task
+   * (int $0x80), which the kernel keeps separately (compat_robust_list).
+   */
+  void set_compat_robust_list(remote_ptr<void> list, size_t len) {
+    compat_robust_futex_list = list;
+    compat_robust_futex_list_len = len;
   }
 
   void set_stopped(bool stopped) override;
@@ -778,6 +790,9 @@ public:
   // the time of the most recent set_robust_list() call.
   remote_ptr<void> robust_futex_list;
   size_t robust_futex_list_len;
+  // The same for an i386 set_robust_list() of an x86-64 task.
+  remote_ptr<void> compat_robust_futex_list;
+  size_t compat_robust_futex_list_len;
   // The memory cell the kernel will clear and notify on exit,
   // if our clone parent requested it.
   remote_ptr<int> tid_futex;
