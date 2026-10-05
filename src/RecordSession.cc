@@ -300,6 +300,7 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
   if (may_wait_exit) {
     t->did_reach_zombie();
   } else if (!t->was_reaped()) {
+    t->end_job_control_stop_if_process_exited();
     t->waiting_for_reap = true;
   }
   return true;
