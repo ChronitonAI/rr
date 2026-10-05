@@ -2861,9 +2861,16 @@ static Switchable prepare_ptrace(RecordTask* t,
         // deliver SIGSTOP to some other thread of the process, and we won't
         // generate any ptrace event if that thread isn't being ptraced.
         tracee->tgkill(SIGSTOP);
+        // That discards the pending SIGCONTs of the whole process.
+        for (Task* tt : tracee->thread_group()->task_set()) {
+          static_cast<RecordTask*>(tt)
+              ->forget_ignored_signals_no_longer_pending();
+        }
       } else {
         ptrace_attach_to_already_stopped_task(tracee);
       }
+      // After the SIGSTOP, which discards a pending SIGCONT.
+      tracee->note_ignored_signals_pending_at_ptrace_attach();
       break;
     }
     case PTRACE_TRACEME: {
@@ -2872,6 +2879,7 @@ static Switchable prepare_ptrace(RecordTask* t,
         break;
       }
       t->set_emulated_ptracer(tracer);
+      t->note_ignored_signals_pending_at_ptrace_attach();
       t->emulated_ptrace_seized = false;
       t->emulated_ptrace_options = 0;
       syscall_state.emulate_result(0);
@@ -2890,6 +2898,7 @@ static Switchable prepare_ptrace(RecordTask* t,
         break;
       }
       tracee->set_emulated_ptracer(t);
+      tracee->note_ignored_signals_pending_at_ptrace_attach();
       tracee->emulated_ptrace_seized = true;
       tracee->emulated_ptrace_options = (int)t->regs().arg4();
       if (tracee->emulated_stop_type == GROUP_STOP) {
@@ -7234,6 +7243,17 @@ static void record_madvise(RecordTask* t) {
 }
 
 /**
+ * Call after a tracee sends a signal. A stop signal discards pending SIGCONTs
+ * and vice versa.
+ */
+static void forget_ignored_signals_discarded_by_kill(RecordTask* t) {
+  for (auto& p : t->session().tasks()) {
+    static_cast<RecordTask*>(p.second)
+        ->forget_ignored_signals_no_longer_pending();
+  }
+}
+
+/**
  * The kernel continues a stopped process as soon as it generates a SIGCONT
  * for it. rr emulates group stops, so it has to end the emulated stop itself.
  * Usually the scheduler does that when it finds the SIGCONT pending (see
@@ -7721,6 +7741,7 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::tkill:
     case Arch::rt_sigqueueinfo:
     case Arch::pidfd_send_signal:
+      forget_ignored_signals_discarded_by_kill(t);
       if ((int)syscall_state.syscall_entry_registers.arg2() == SIGCONT &&
           !t->regs().syscall_failed()) {
         emulate_SIGCONT_sent_by_tracee(t);
@@ -7729,6 +7750,7 @@ static void rec_process_syscall_arch(RecordTask* t,
 
     case Arch::tgkill:
     case Arch::rt_tgsigqueueinfo:
+      forget_ignored_signals_discarded_by_kill(t);
       if ((int)syscall_state.syscall_entry_registers.arg3() == SIGCONT &&
           !t->regs().syscall_failed()) {
         emulate_SIGCONT_sent_by_tracee(t);

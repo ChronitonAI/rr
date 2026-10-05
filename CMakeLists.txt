@@ -1317,6 +1317,7 @@ set(BASIC_TESTS
   ptrace_resume_signal_ignored
   x86/ptrace_tls
   ptrace_seize
+  ptrace_seize_ignored_signals
   ptrace_sigchld
   ptrace_sigchld_blocked
   ptrace_signal_during_clone
