@@ -1263,6 +1263,40 @@ static bool is_in_privileged_syscall(RecordTask* t) {
   return type && type->privileged == AddressSpace::PRIVILEGED;
 }
 
+/**
+ * True if we'll report the exit of the syscall that |t| is at the exit of to
+ * its emulated ptracer, as a syscall-exit stop or a singlestep SIGTRAP.
+ * |ptrace_cont_command| is the ptracer's resume command that decides that
+ * (see take_ptrace_syscall_exit_state).
+ */
+static bool will_report_syscall_exit_to_ptracer(RecordTask* t,
+                                                int ptrace_cont_command) {
+  return t->emulated_ptracer && !is_in_privileged_syscall(t) &&
+         (ptrace_cont_command == PTRACE_SYSCALL ||
+          is_ptrace_any_singlestep(t->arch(), ptrace_cont_command));
+}
+
+/**
+ * |t| is at the exit of a syscall that the syscall buffer descheduled, and
+ * its current event is EV_DESCHED. Leaving the desched critical section runs
+ * |t| on to the syscall buffer code's next syscall. If the emulated ptracer
+ * gets a stop for the syscall's exit, or a PTRACE_EVENT_STOP after it
+ * (|ptrace_interrupt_stop|), we report that first and return true:
+ * record_step leaves the desched critical section when the ptracer has
+ * resumed |t|.
+ */
+static bool defer_leaving_desched_critical_section(RecordTask* t,
+                                                   int ptrace_cont_command,
+                                                   bool ptrace_interrupt_stop) {
+  if (!will_report_syscall_exit_to_ptracer(t, ptrace_cont_command) &&
+      !(ptrace_interrupt_stop && t->emulated_ptracer)) {
+    return false;
+  }
+  LOG(debug) << "  deferring exit from desched critical section";
+  t->ev().Desched().ptracer_may_change_result = true;
+  return true;
+}
+
 void RecordSession::syscall_state_changed(RecordTask* t,
                                           StepState* step_state) {
   switch (t->ev().Syscall().state) {
@@ -1291,6 +1325,11 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         if (t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
           ASSERT(t, t->ip() == r.ip());
           t->set_regs(orig_regs);
+          if (EV_DESCHED == t->ev().type()) {
+            // A syscall that the syscall buffer descheduled. The ptracer
+            // decided its result.
+            t->ev().Desched().ptracer_may_change_result = true;
+          }
           maybe_trigger_emulated_ptrace_syscall_exit_stop(
               t, ptrace_cont_command, ptrace_interrupt_stop);
           maybe_trigger_emulated_ptrace_interrupt_stop(t,
@@ -1411,17 +1450,24 @@ void RecordSession::syscall_state_changed(RecordTask* t,
 
         maybe_discard_syscall_interruption(t, retval);
 
+        bool did_seccomp_trap = false;
         if (EV_SECCOMP_TRAP == t->ev().type()) {
           LOG(debug) << "  exiting seccomp trap";
           save_interrupted_syscall_ret_in_syscallbuf(t, retval);
           seccomp_trap_done(t);
+          did_seccomp_trap = true;
         }
-        if (EV_DESCHED == t->ev().type()) {
-          LOG(debug) << "  exiting desched critical section";
+        // If we recorded data for the seccomp trap above, the event that
+        // desched_state_changed records has to come next, to carry it.
+        if (EV_DESCHED == t->ev().type() &&
+            (did_seccomp_trap ||
+             !defer_leaving_desched_critical_section(t, ptrace_cont_command,
+                                                     ptrace_interrupt_stop))) {
           // The signal handler could have modified the apparent syscall
           // return handler. Save that value into the syscall buf again so
           // replay will pick it up later.
           save_interrupted_syscall_ret_in_syscallbuf(t, retval);
+          LOG(debug) << "  exiting desched critical section";
           desched_state_changed(t);
         }
       } else {
@@ -1501,7 +1547,9 @@ void RecordSession::syscall_state_changed(RecordTask* t,
             orig_syscall_ip = t->ev().Syscall().regs.ip();
           }
           t->pop_syscall();
-          if (EV_DESCHED == t->ev().type()) {
+          if (EV_DESCHED == t->ev().type() &&
+              !defer_leaving_desched_critical_section(t, ptrace_cont_command,
+                                                      ptrace_interrupt_stop)) {
             LOG(debug) << "  exiting desched critical section";
             desched_state_changed(t);
           }
@@ -2951,7 +2999,17 @@ RecordSession::RecordResult RecordSession::record_step() {
 
       switch (t->ev().type()) {
         case EV_DESCHED:
-          desched_state_changed(t);
+          if (!t->ev().Desched().ptracer_may_change_result) {
+            desched_state_changed(t);
+          } else if (!t->peek_stashed_sig_to_deliver()) {
+            // Save the result we have now into the syscall buf again, so
+            // that replay picks it up.
+            save_interrupted_syscall_ret_in_syscallbuf(
+                t, t->regs().syscall_result_signed());
+            desched_state_changed(t);
+          }
+          // Otherwise prepare_to_inject_signal delivers the stashed signal
+          // first, at the syscall's exit.
           break;
         case EV_SYSCALL:
           syscall_state_changed(t, &step_state);

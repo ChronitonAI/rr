@@ -13,24 +13,28 @@
 #define RR_PTRACE_SYSCALL_INFO_EXIT 2
 #define RR_ERESTARTSYS 512
 
-/* A tracer follows its child through a readv() on a pipe that a signal or a
-   PTRACE_INTERRUPT interrupts, while the child has a signal handler with
-   SA_RESTART. (The syscall buffer doesn't handle readv().) At some of the
-   stops at the exit of the interrupted readv(), the tracer changes the
-   result or sets the syscall number to -1, so that Linux doesn't restart
-   the readv(). */
+/* A tracer follows its child through a read() (or readv()) on a pipe that a
+   signal or a PTRACE_INTERRUPT interrupts, while the child has a signal
+   handler with SA_RESTART. Under rr with the syscall buffer, the read()s are
+   buffered syscalls that rr descheduled (the child starts them while the
+   tracer uses PTRACE_CONT); the syscall buffer doesn't handle readv(). At
+   some of the stops at the exit of the interrupted read, the tracer changes
+   the result or sets the syscall number to -1, so that Linux doesn't restart
+   the read. */
 
 static int fds[2];
+static int use_readv;
+static long sysno;
 
 static void handle_signal(__attribute__((unused)) int sig,
                           __attribute__((unused)) siginfo_t* si,
                           __attribute__((unused)) void* ctx) {}
 
-/* Read a byte with readv() until we get 'q'. Each result must match the
-   next character of |expected|: the byte we read, '0' for 0, 'E' for EINTR,
-   or 'R' or 'r' for ERESTARTSYS. After 'r', read again right away, with the
-   same arguments. After each other result but 'q', send ourselves
-   SIGUSR2. */
+/* Read a byte with read() or readv() until we get 'q'. Each result must
+   match the next character of |expected|: the byte we read, '0' for 0, 'E'
+   for EINTR, or 'R' or 'r' for ERESTARTSYS. After 'r', read again right
+   away, with the same arguments. After each other result but 'q', send
+   ourselves SIGUSR2. */
 static void child(const char* expected) {
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
@@ -42,10 +46,14 @@ static void child(const char* expected) {
     ssize_t ret;
     char ch = 0;
     char result;
-    struct iovec iov;
-    iov.iov_base = &ch;
-    iov.iov_len = 1;
-    ret = readv(fds[0], &iov, 1);
+    if (use_readv) {
+      struct iovec iov;
+      iov.iov_base = &ch;
+      iov.iov_len = 1;
+      ret = readv(fds[0], &iov, 1);
+    } else {
+      ret = read(fds[0], &ch, 1);
+    }
     if (ret < 0 && errno == EINTR) {
       result = 'E';
     } else if (ret < 0) {
@@ -117,9 +125,10 @@ static void wait_for_stop(pid_t pid, int expected_status) {
 
 /* Wait for the SIGUSR2 that the child sends itself after a read returned,
    and resume the child with PTRACE_CONT. The child then blocks in its next
-   read. We may get a signal-delivery stop for the SIGUSR1 that we passed at
-   a syscall-exit stop before (Linux sends that signal again, see
-   ptrace_report_syscall()); we pass it on. */
+   read, which the syscall buffer handles if it's a read(). We may get a
+   signal-delivery stop for the SIGUSR1 that we passed at a syscall-exit stop
+   before (Linux sends that signal again, see ptrace_report_syscall()); we
+   pass it on. */
 static void finish_read(pid_t pid) {
   int status;
   for (;;) {
@@ -131,7 +140,7 @@ static void finish_read(pid_t pid) {
   }
   test_assert(status == ((SIGUSR2 << 8) | 0x7f));
   test_assert(0 == ptrace(PTRACE_CONT, pid, NULL, NULL));
-  wait_for_task_asleep_in_syscall(pid, SYS_readv, fds[0]);
+  wait_for_task_asleep_in_syscall(pid, sysno, fds[0]);
 }
 
 /* The child is blocked in a read after PTRACE_CONT. Interrupt it, and
@@ -140,9 +149,9 @@ static void restart_with_ptrace_syscall(pid_t pid) {
   test_assert(0 == ptrace(PTRACE_INTERRUPT, pid, NULL, NULL));
   wait_for_stop(pid, (PTRACE_EVENT_STOP << 16) | (SIGTRAP << 8) | 0x7f);
   test_assert(0 == ptrace(PTRACE_SYSCALL, pid, NULL, NULL));
-  wait_for_syscall_entry(pid, SYS_readv);
+  wait_for_syscall_entry(pid, sysno);
   test_assert(0 == ptrace(PTRACE_SYSCALL, pid, NULL, NULL));
-  wait_for_task_asleep_in_syscall(pid, SYS_readv, fds[0]);
+  wait_for_task_asleep_in_syscall(pid, sysno, fds[0]);
 }
 
 /* The child is blocked in a read after PTRACE_CONT. Get to the
@@ -172,7 +181,7 @@ static void set_result(pid_t pid, long result) {
 static void set_regs_at_exit(pid_t pid, long result, long nr) {
   struct user_regs_struct regs;
   ptrace_getregs(pid, &regs);
-  test_assert((long)regs.ORIG_SYSCALLNO == SYS_readv);
+  test_assert((long)regs.ORIG_SYSCALLNO == sysno);
   test_assert((long)regs.SYSCALL_RESULT == -RR_ERESTARTSYS);
   regs.SYSCALL_RESULT = result;
   regs.ORIG_SYSCALLNO = nr;
@@ -181,7 +190,7 @@ static void set_regs_at_exit(pid_t pid, long result, long nr) {
 
 /* Set the result to -EINTR. */
 static void set_eintr_at_exit(pid_t pid) {
-  set_regs_at_exit(pid, -EINTR, SYS_readv);
+  set_regs_at_exit(pid, -EINTR, sysno);
 }
 
 /* Set the syscall number to -1, as debuggers do when they set the
@@ -204,7 +213,7 @@ static void run(void) {
   test_assert(child_pid > 0);
   test_assert(0 == ptrace(PTRACE_SEIZE, child_pid, NULL,
                           (void*)PTRACE_O_TRACESYSGOOD));
-  wait_for_task_asleep_in_syscall(child_pid, SYS_readv, fds[0]);
+  wait_for_task_asleep_in_syscall(child_pid, sysno, fds[0]);
 
   /* A signal interrupts the read, and we follow the handler's sigreturn
      with PTRACE_SYSCALL. The read restarts after the sigreturn. */
@@ -216,7 +225,7 @@ static void run(void) {
   test_assert(child_pid == waitpid(child_pid, &status, 0));
   test_assert(status == (((SIGTRAP | 0x80) << 8) | 0x7f));
   test_assert(0 == ptrace(PTRACE_SYSCALL, child_pid, NULL, NULL));
-  wait_for_syscall_entry(child_pid, SYS_readv);
+  wait_for_syscall_entry(child_pid, sysno);
   test_assert(1 == write(fds[1], "a", 1));
   test_assert(0 == ptrace(PTRACE_SYSCALL, child_pid, NULL, NULL));
   wait_for_syscall_exit(child_pid, 1);
@@ -300,7 +309,7 @@ static void run(void) {
   interrupt_to_syscall_exit(child_pid);
   cancel_restart_at_exit(child_pid);
   test_assert(0 == ptrace(PTRACE_CONT, child_pid, NULL, NULL));
-  wait_for_task_asleep_in_syscall(child_pid, SYS_readv, fds[0]);
+  wait_for_task_asleep_in_syscall(child_pid, sysno, fds[0]);
 
   /* The same, but we pass a signal. */
   interrupt_to_syscall_exit(child_pid);
@@ -314,7 +323,7 @@ static void run(void) {
   wait_for_stop(child_pid, (PTRACE_EVENT_STOP << 16) | (SIGTRAP << 8) | 0x7f);
   cancel_restart_at_exit(child_pid);
   test_assert(0 == ptrace(PTRACE_CONT, child_pid, NULL, NULL));
-  wait_for_task_asleep_in_syscall(child_pid, SYS_readv, fds[0]);
+  wait_for_task_asleep_in_syscall(child_pid, sysno, fds[0]);
 #endif
 
   /* We change the result to 0 and detach. */
@@ -334,7 +343,7 @@ static void run(void) {
     test_assert(child_pid > 0);
     test_assert(0 == ptrace(PTRACE_SEIZE, child_pid, NULL,
                             (void*)PTRACE_O_TRACESYSGOOD));
-    wait_for_task_asleep_in_syscall(child_pid, SYS_readv, fds[0]);
+    wait_for_task_asleep_in_syscall(child_pid, sysno, fds[0]);
     interrupt_to_syscall_exit(child_pid);
     set_result(child_pid, 0);
     exit(66);
@@ -349,8 +358,20 @@ static void run(void) {
 }
 
 int main(void) {
+  char ch;
+
   test_assert(0 == pipe(fds));
+  /* Let rr patch read() for the syscall buffer before the children are
+     created. */
+  test_assert(1 == write(fds[1], "x", 1));
+  test_assert(1 == read(fds[0], &ch, 1));
+
+  sysno = SYS_read;
   run();
+  use_readv = 1;
+  sysno = SYS_readv;
+  run();
+
   atomic_puts("EXIT-SUCCESS");
   return 0;
 }

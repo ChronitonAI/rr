@@ -1211,7 +1211,7 @@ void RecordTask::apply_ptrace_interrupt_stop() {
 void RecordTask::discard_syscall_interruption_if_restart_cancelled() {
   if (!stopped_at_interrupted_syscall_exit ||
       EV_SYSCALL_INTERRUPTION != ev().type() ||
-      emulated_stop_type == NOT_STOPPED || desched_rec()) {
+      emulated_stop_type == NOT_STOPPED) {
     return;
   }
   // On x86, Linux decides whether to restart the syscall after the ptrace
@@ -1236,6 +1236,11 @@ void RecordTask::discard_syscall_interruption_if_restart_cancelled() {
   // we leave a deferred patch (should_retry_patch) to the next time the task
   // makes the syscall.
   pop_syscall_interruption();
+  if (EV_DESCHED == ev().type()) {
+    // record_step leaves the desched critical section with the ptracer's
+    // result.
+    ev().Desched().ptracer_may_change_result = true;
+  }
 }
 
 bool RecordTask::is_signal_pending(int sig) {

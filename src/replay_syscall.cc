@@ -1112,8 +1112,12 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
 
   // sigreturns are never restartable, and the value of the
   // syscall-result register after a sigreturn is not actually the
-  // syscall result.
-  if (trace_regs.syscall_may_restart() && !is_sigreturn(sys, Arch::arch())) {
+  // syscall result. The same goes for SYS_rrcall_notify_syscall_hook_exit,
+  // which returns the result of the syscall that the syscall hook handled.
+  bool is_hook_exit =
+      sys == t->session().syscall_number_for_rrcall_notify_syscall_hook_exit();
+  if (trace_regs.syscall_may_restart() && !is_sigreturn(sys, Arch::arch()) &&
+      !is_hook_exit) {
     // During recording, when a sys exits with a
     // restart "error", the kernel sometimes restarts the
     // tracee by resetting its $ip to the syscall entry

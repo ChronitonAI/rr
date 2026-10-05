@@ -3277,16 +3277,13 @@ static Switchable prepare_ptrace(RecordTask* t,
         uint64_t result = 0;
         // Is the tracee in a syscall, as far as the ptracer knows? (We may
         // have it stopped at the syscall entry or exit, at a stop we haven't
-        // reported to the ptracer, or haven't processed yet.) Leave out
-        // syscalls that the syscall buffer descheduled, whose syscall-exit
-        // stops we don't report.
+        // reported to the ptracer, or haven't processed yet.)
         bool in_syscall =
             tracee->emulated_stop_type == NOT_STOPPED &&
             tracee->ev().type() == EV_SYSCALL &&
             (tracee->ev().Syscall().state == ENTERING_SYSCALL_PTRACE ||
              tracee->ev().Syscall().state == ENTERING_SYSCALL ||
-             tracee->ev().Syscall().state == PROCESSING_SYSCALL) &&
-            !tracee->desched_rec();
+             tracee->ev().Syscall().state == PROCESSING_SYSCALL);
         // Is the tracee at a ptrace stop in a syscall, as the ptracer sees
         // it (whether or not the ptracer has waited for the stop yet)?
         bool at_stop_in_syscall =
@@ -7978,7 +7975,13 @@ static void rec_process_syscall_arch(RecordTask* t,
       auto params_ptr = r.sp() + sizeof(typename Arch::unsigned_word);
       auto params = t->read_mem(params_ptr.cast<rrcall_params>());
       r.set_syscall_result((uintptr_t)params.result);
-      r.set_original_syscallno((intptr_t)params.original_syscallno);
+      // The syscall that the syscall hook handled has returned to user space
+      // without being restarted. If a ptracer left a -ERESTART* result, the
+      // syscall number -1 keeps the kernel (and replay, see
+      // ReplayTask::will_resume_execution()) from restarting a syscall here.
+      r.set_original_syscallno(r.syscall_may_restart()
+                                   ? -1
+                                   : (intptr_t)params.original_syscallno);
       t->set_regs(r);
       break;
     }

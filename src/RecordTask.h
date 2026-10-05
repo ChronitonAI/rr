@@ -217,10 +217,10 @@ public:
   /**
    * Call this when the emulated ptracer resumes this task from a ptrace stop,
    * detaches from it or exits, before anything else changes the task's
-   * events. If the task is at the exit of an interrupted syscall that the
-   * syscall buffer didn't deschedule, and the ptracer changed the syscall's
-   * result or set its syscall number to -1 there, so that the kernel doesn't
-   * restart the syscall, this pops the EV_SYSCALL_INTERRUPTION.
+   * events. If the task is at the exit of an interrupted syscall and the
+   * ptracer changed the syscall's result or set its syscall number to -1
+   * there, so that the kernel doesn't restart the syscall, this pops the
+   * EV_SYSCALL_INTERRUPTION.
    */
   void discard_syscall_interruption_if_restart_cancelled();
   /**
