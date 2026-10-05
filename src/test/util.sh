@@ -256,15 +256,19 @@ function skip_if_test_32_bit {
     fi
 }
 
+function is_rr_32_bit {
+    [[ "$(file $RESOURCE_PATH/lib/rr/librrpage.so | grep 32-bit -c)" == "1" ]]
+}
+
 function skip_if_rr_32_bit {
-    if [[ "$(file $RESOURCE_PATH/lib/rr/librrpage.so | grep 32-bit -c)" == "1" ]]; then
+    if is_rr_32_bit; then
         echo NOTE: Skipping "'$TESTNAME'" because 32-bit rr
         exit 0
     fi
 }
 
 function skip_if_rr_32_bit_with_shell_64_bit {
-    if [[ "$(file $RESOURCE_PATH/lib/rr/librrpage.so | grep 32-bit -c)" == "1" ]] &&
+    if is_rr_32_bit &&
        [[ "$(file -L $(which sh) | grep 64-bit -c)" == "1" ]];
     then
         echo NOTE: Skipping "'$TESTNAME'" because 32-bit rr with 64-bit shell
