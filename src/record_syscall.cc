@@ -7213,7 +7213,9 @@ static void record_madvise(RecordTask* t) {
  * Scheduler::is_task_runnable). But a stop signal sent before then makes the
  * kernel discard the pending SIGCONT, and rr never sees it. So when a tracee
  * has just sent a SIGCONT, end the emulated group stops of the processes that
- * have it pending right away.
+ * have it pending right away, and the group stops that only
+ * ThreadGroup::stopping_signal tracks: rr may dequeue the SIGCONT much later,
+ * or never.
  */
 static void emulate_SIGCONT_sent_by_tracee(RecordTask* t) {
   for (auto& p : t->session().tasks()) {
@@ -7223,6 +7225,10 @@ static void emulate_SIGCONT_sent_by_tracee(RecordTask* t) {
       // This ends the emulated group stop of every untraced thread in rt's
       // process.
       rt->emulate_SIGCONT();
+    } else if (rt->thread_group()->stopping_signal &&
+               rt->is_signal_pending(SIGCONT)) {
+      // SIGCONT doesn't end the ptrace stops of traced threads.
+      rt->thread_group()->stopping_signal = 0;
     }
   }
 }
