@@ -66,6 +66,14 @@ public:
   // couldn't push a signal handler frame. Only used during recording.
   bool received_sigframe_SIGSEGV;
 
+  // During recording: while a stopping signal has stopped this process, that
+  // signal; otherwise 0. This is Linux's SIGNAL_STOP_STOPPED, with the signal
+  // that the threads' later stops report (JOBCTL_STOP_SIGMASK), so a later
+  // stopping signal replaces it. Only a SIGCONT ends it; a ptracer resuming a
+  // thread doesn't. The emulated stops of the threads don't tell us this: we
+  // use GROUP_STOP for some ptrace stops too.
+  int stopping_signal;
+
 private:
   ThreadGroup(const ThreadGroup&) = delete;
   ThreadGroup operator=(const ThreadGroup&) = delete;
