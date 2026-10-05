@@ -2,6 +2,10 @@
 
 #include "util.h"
 
+#ifndef PTRACE_EVENT_STOP
+#define PTRACE_EVENT_STOP 128
+#endif
+
 #define NUM_ITERATIONS 1000
 
 static int fds[2];
@@ -25,9 +29,7 @@ int main(void) {
     wait_for_task_asleep_in_syscall(child, SYS_read, fds[0]);
     test_assert(0 == ptrace(PTRACE_INTERRUPT, child, NULL, NULL));
     test_assert(child == waitpid(child, &status, 0));
-    /* Linux reports a PTRACE_EVENT_STOP with SIGTRAP here, but rr doesn't
-       emulate that exactly. */
-    test_assert(WIFSTOPPED(status));
+    test_assert(status == ((PTRACE_EVENT_STOP << 16) | (SIGTRAP << 8) | 0x7f));
     test_assert(0 == ptrace(PTRACE_CONT, child, NULL, NULL));
   }
 
