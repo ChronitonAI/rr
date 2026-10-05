@@ -1154,6 +1154,13 @@ void RecordTask::apply_group_stop(int sig) {
   }
 }
 
+void RecordTask::apply_ptrace_interrupt_stop() {
+  int sig = thread_group()->stopping_signal;
+  // Technically PTRACE_INTERRUPT stops are distinct from group stops, but not
+  // in any way we currently care about.
+  apply_group_stop(sig ? sig : SIGTRAP);
+}
+
 bool RecordTask::is_signal_pending(int sig) {
   auto pending_strs = read_proc_status_fields(tid, "SigPnd", "ShdPnd");
   if (pending_strs.size() < 2) {

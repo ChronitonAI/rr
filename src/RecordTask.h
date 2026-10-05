@@ -202,6 +202,12 @@ public:
    */
   void apply_group_stop(int sig);
   /**
+   * Emulate the stop of a PTRACE_INTERRUPT from the emulated ptracer: a
+   * PTRACE_EVENT_STOP with SIGTRAP, or with the stop signal if the process is
+   * in a group stop (see do_jobctl_trap() in kernel/signal.c).
+   */
+  void apply_ptrace_interrupt_stop();
+  /**
    * Call this after |sig| is delivered to this task.  Emulate
    * sighandler updates induced by the signal delivery.
    */

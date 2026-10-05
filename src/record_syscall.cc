@@ -3209,29 +3209,64 @@ static Switchable prepare_ptrace(RecordTask* t,
       RecordTask* tracee = verify_ptrace_target(t, syscall_state, tid, false);
       if (tracee) {
         uint64_t result = 0;
-        // Linux reports a PTRACE_EVENT_STOP with SIGTRAP, or with the stop
-        // signal if the tracee's process is in a group stop (see
-        // do_jobctl_trap() in kernel/signal.c).
-        int sig = tracee->thread_group()->stopping_signal;
-        if (!sig) {
-          sig = SIGTRAP;
-        }
-        if (!tracee->is_stopped()) {
-          // Running in a blocked syscall. Forward the PTRACE_INTERRUPT.
-          // Regular syscall exit handling will take over from here.
+        // Is the tracee in a syscall, as far as the ptracer knows? (We may
+        // have it stopped at the syscall entry or exit, at a stop we haven't
+        // reported to the ptracer, or haven't processed yet.) Leave out
+        // syscalls that the syscall buffer descheduled, whose syscall-exit
+        // stops we don't report.
+        bool in_syscall =
+            tracee->emulated_stop_type == NOT_STOPPED &&
+            tracee->ev().type() == EV_SYSCALL &&
+            (tracee->ev().Syscall().state == ENTERING_SYSCALL_PTRACE ||
+             tracee->ev().Syscall().state == ENTERING_SYSCALL ||
+             tracee->ev().Syscall().state == PROCESSING_SYSCALL) &&
+            !tracee->desched_rec();
+        if (in_syscall) {
+          // Linux interrupts the syscall if it blocks, and the
+          // PTRACE_INTERRUPT stop can only happen after the syscall exits.
+          // Any ptrace stop before that discards the PTRACE_INTERRUPT trap
+          // (see ptrace_stop() in kernel/signal.c): a ptrace event stop in
+          // the syscall (e.g. PTRACE_EVENT_EXEC), or the syscall-exit stop if
+          // the ptracer's resume command asks for one. So remember that
+          // command for the syscall's exit, and report the PTRACE_EVENT_STOP
+          // when we process the exit.
+          SyscallEvent& syscall = tracee->ev().Syscall();
+          if (syscall.ptrace_cont_command_at_exit < 0) {
+            int command = tracee->emulated_ptrace_cont_command;
+            syscall.ptrace_cont_command_at_exit = command;
+            if (command == PTRACE_SINGLESTEP ||
+                command == Arch::PTRACE_SYSEMU_SINGLESTEP) {
+              // We report the singlestep's SIGTRAP when the syscall exits,
+              // and Linux reports the PTRACE_EVENT_STOP before it. Report it
+              // now.
+              tracee->apply_ptrace_interrupt_stop();
+            } else if (command != PTRACE_SYSCALL) {
+              syscall.ptrace_interrupt_stop_at_exit = true;
+            }
+          }
+          if (!tracee->is_stopped()) {
+            // The tracee is in the syscall. Forward the PTRACE_INTERRUPT.
+            LOG(debug) << "Interrupting " << tracee->tid;
+            errno = 0;
+            tracee->fallible_ptrace(PTRACE_INTERRUPT, nullptr, nullptr);
+            result = -errno;
+          } else {
+            // Forward the PTRACE_INTERRUPT when we resume the tracee into the
+            // syscall. If we have it at the syscall's exit, we process that
+            // first, and nothing is left to interrupt.
+            syscall.ptrace_interrupt_pending = true;
+          }
+        } else if (!tracee->is_stopped()) {
+          // Running. Forward the PTRACE_INTERRUPT.
           LOG(debug) << "Interrupting " << tracee->tid;
           errno = 0;
           tracee->fallible_ptrace(PTRACE_INTERRUPT, nullptr, nullptr);
           result = -errno;
-          // Technically PTRACE_INTERRUPT stops are distinct from group stops,
-          // but not in any way we currently care about.
-          tracee->apply_group_stop(sig);
-        } else if (tracee->status().is_syscall()) {
-          tracee->emulate_ptrace_stop(tracee->status(), SYSCALL_EXIT_STOP);
+          tracee->apply_ptrace_interrupt_stop();
         } else if (tracee->emulated_stop_pending == NOT_STOPPED) {
           // The tracee is stopped from our perspective, but not stopped from
           // the perspective of the ptracer. Emulate a stop now.
-          tracee->apply_group_stop(sig);
+          tracee->apply_ptrace_interrupt_stop();
         }
         // Otherwise, there's nothing to do.
         syscall_state.emulate_result(result);
