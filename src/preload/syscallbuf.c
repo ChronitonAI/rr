@@ -784,6 +784,10 @@ static void __attribute__((constructor)) init_process(void) {
   extern char _syscallbuf_code_start;
   extern char _syscallbuf_code_end;
   extern char do_breakpoint_fault_addr;
+#ifdef __x86_64__
+  extern char _syscallbuf_hook_trampolines_start;
+  extern char _syscallbuf_hook_trampolines_end;
+#endif
 
 #if defined(__i386__)
   extern RR_HIDDEN void __morestack(void);
@@ -1122,6 +1126,14 @@ static void __attribute__((constructor)) init_process(void) {
 #else
   params.get_pc_thunks_start = NULL;
   params.get_pc_thunks_end = NULL;
+#endif
+#ifdef __x86_64__
+  params.syscallbuf_hook_trampolines_start =
+      &_syscallbuf_hook_trampolines_start;
+  params.syscallbuf_hook_trampolines_end = &_syscallbuf_hook_trampolines_end;
+#else
+  params.syscallbuf_hook_trampolines_start = NULL;
+  params.syscallbuf_hook_trampolines_end = NULL;
 #endif
   params.syscallbuf_code_start = &_syscallbuf_code_start;
   params.syscallbuf_code_end = &_syscallbuf_code_end;
@@ -4053,13 +4065,19 @@ static long sys_rt_sigprocmask(struct syscall_info* call) {
     return traced_raw_syscall(call);
   }
 
-  if (set && (how == SIG_BLOCK || how == SIG_SETMASK)) {
+  // Don't access the caller's memory in the critical section below: a
+  // ptracer's watchpoint on it would trap there, and rr can't tell which
+  // signals were blocked then. With an invalid |how|, pass the caller's set
+  // to the kernel, which fails (with EFAULT if the set is invalid, as
+  // natively) without changing the mask.
+  if (set && (how == SIG_BLOCK || how == SIG_UNBLOCK || how == SIG_SETMASK)) {
     local_memcpy(&modified_set, set, sizeof(kernel_sigset_t));
-    // SIGSTKFLT (PerfCounters::TIME_SLICE_SIGNAL) and
-    // SIGPWR(SYSCALLBUF_DESCHED_SIGNAL) are used by rr
-    modified_set &=
-        ~(((uint64_t)1) << (SIGSTKFLT - 1)) &
-        ~(((uint64_t)1) << (globals.desched_sig - 1));
+    if (how == SIG_BLOCK || how == SIG_SETMASK) {
+      // SIGSTKFLT (PerfCounters::TIME_SLICE_SIGNAL) and
+      // SIGPWR(SYSCALLBUF_DESCHED_SIGNAL) are used by rr
+      modified_set &= ~(((uint64_t)1) << (SIGSTKFLT - 1)) &
+                      ~(((uint64_t)1) << (globals.desched_sig - 1));
+    }
     set = &modified_set;
   }
 
@@ -4068,31 +4086,30 @@ static long sys_rt_sigprocmask(struct syscall_info* call) {
 
   ret =
       untraced_syscall4(syscallno, how, set, oldset2, sizeof(kernel_sigset_t));
-  if (ret >= 0 && !buffer_hdr()->failed_during_preparation) {
-    if (oldset) {
-      local_memcpy(oldset, oldset2, sizeof(kernel_sigset_t));
+  if (ret >= 0 && !buffer_hdr()->failed_during_preparation && set) {
+    kernel_sigset_t previous_set;
+    local_memcpy(&previous_set, oldset2, sizeof(kernel_sigset_t));
+    switch (how) {
+      case SIG_UNBLOCK:
+        previous_set &= ~*set;
+        break;
+      case SIG_BLOCK:
+        previous_set |= *set;
+        break;
+      case SIG_SETMASK:
+        previous_set = *set;
+        break;
     }
-    if (set) {
-      kernel_sigset_t previous_set;
-      local_memcpy(&previous_set, oldset2, sizeof(kernel_sigset_t));
-      switch (how) {
-        case SIG_UNBLOCK:
-          previous_set &= ~*set;
-          break;
-        case SIG_BLOCK:
-          previous_set |= *set;
-          break;
-        case SIG_SETMASK:
-          previous_set = *set;
-          break;
-      }
-      hdr->blocked_sigs = previous_set;
-      // We must update the generation last to ensure that an update is not
-      // lost.
-      ++hdr->blocked_sigs_generation;
-    }
+    hdr->blocked_sigs = previous_set;
+    // We must update the generation last to ensure that an update is not
+    // lost.
+    ++hdr->blocked_sigs_generation;
   }
   hdr->in_sigprocmask_critical_section = 0;
+
+  if (ret >= 0 && !buffer_hdr()->failed_during_preparation && oldset) {
+    local_memcpy(oldset, oldset2, sizeof(kernel_sigset_t));
+  }
 
   commit_raw_syscall(syscallno, ptr, ret);
 
