@@ -535,6 +535,11 @@ struct TaskSyscallState : TaskSyscallStateBase {
   std::unique_ptr<TraceTaskEvent> exec_saved_event;
 
   RecordTask* emulate_wait_for_child;
+  // True if the stop of |emulate_wait_for_child| is a ptrace stop that a
+  // thread of its (emulated) ptracer's process waits for. Otherwise it's the
+  // job-control stop of the child's process, which a wait reports with the
+  // process's id.
+  bool emulate_wait_for_ptrace_stop;
 
   /** Saved syscall-entry registers, used by code paths that modify the
    *  registers temporarily.
@@ -576,6 +581,7 @@ struct TaskSyscallState : TaskSyscallStateBase {
   TaskSyscallState()
       : t(nullptr),
         emulate_wait_for_child(nullptr),
+        emulate_wait_for_ptrace_stop(false),
         expect_errno(0),
         should_emulate_result(false),
         preparation_done(false),
@@ -2366,6 +2372,14 @@ static Switchable prepare_bpf(RecordTask* t,
   return PREVENT_SWITCH;
 }
 
+/**
+ * Returns true if |tracee| is traced by a task in |t|'s thread group.
+ */
+static bool is_traced_by_thread_group_of(RecordTask* tracee, RecordTask* t) {
+  return tracee->emulated_ptracer &&
+         tracee->emulated_ptracer->thread_group() == t->thread_group();
+}
+
 static bool maybe_emulate_wait(RecordTask* t, TaskSyscallState& syscall_state) {
   if (t->in_wait_type == WAIT_TYPE_NONE) {
     return false;
@@ -2376,15 +2390,26 @@ static bool maybe_emulate_wait(RecordTask* t, TaskSyscallState& syscall_state) {
     for (RecordTask* child : rthread->emulated_ptrace_tracees) {
       if (t->is_waiting_for_ptrace(child) && child->emulated_stop_pending) {
         syscall_state.emulate_wait_for_child = child;
+        syscall_state.emulate_wait_for_ptrace_stop = true;
         return true;
       }
     }
   }
 
   for (ThreadGroup* child_process : t->thread_group()->children()) {
+    // Linux hides the job-control stop of a child process whose main thread
+    // is traced by our thread group (see wait_consider_task() in
+    // kernel/exit.c). And the stops of threads traced by our thread group
+    // are ptrace stops, which we reported above if at all.
+    RecordTask* leader = t->session().find_task(child_process->tgid);
+    if (leader && leader->thread_group().get() == child_process &&
+        is_traced_by_thread_group_of(leader, t)) {
+      continue;
+    }
     for (Task* child : child_process->task_set()) {
       auto rchild = static_cast<RecordTask*>(child);
-      if (rchild->emulated_stop_type == NOT_STOPPED) {
+      if (rchild->emulated_stop_type == NOT_STOPPED ||
+          is_traced_by_thread_group_of(rchild, t)) {
         continue;
       }
       if (!(t->in_wait_options & WUNTRACED) && rchild->emulated_stop_type != CHILD_STOP) {
@@ -2394,6 +2419,7 @@ static bool maybe_emulate_wait(RecordTask* t, TaskSyscallState& syscall_state) {
         continue;
       }
       syscall_state.emulate_wait_for_child = rchild;
+      syscall_state.emulate_wait_for_ptrace_stop = false;
       return true;
     }
   }
@@ -7465,7 +7491,11 @@ static void rec_process_syscall_arch(RecordTask* t,
       if (tracee) {
         // Finish emulation of ptrace result or stop-signal
         Registers r = t->regs();
-        r.set_syscall_result(syscallno == Arch::waitid ? 0 : tracee->tid);
+        // A wait for a ptrace stop returns the tracee's tid, a wait for the
+        // stop of a child process its pid.
+        pid_t pid = syscall_state.emulate_wait_for_ptrace_stop ? tracee->tid
+                                                               : tracee->tgid();
+        r.set_syscall_result(syscallno == Arch::waitid ? 0 : pid);
         t->set_regs(r);
         if (syscallno == Arch::waitid) {
           remote_ptr<typename Arch::siginfo_t> sip = r.arg3();
@@ -7485,12 +7515,16 @@ static void rec_process_syscall_arch(RecordTask* t,
         if (syscallno == Arch::waitid && (r.arg4() & WNOWAIT)) {
           // Leave the child in a waitable state
         } else {
-          if (tracee->emulated_ptracer == t) {
+          if (syscall_state.emulate_wait_for_ptrace_stop) {
             tracee->emulated_stop_pending = false;
           } else {
+            // The job-control stop of the process. The stops of threads
+            // that our thread group traces are ptrace stops; leave those.
             for (Task* thread : tracee->thread_group()->task_set()) {
               auto rt = static_cast<RecordTask*>(thread);
-              rt->emulated_stop_pending = false;
+              if (!is_traced_by_thread_group_of(rt, t)) {
+                rt->emulated_stop_pending = false;
+              }
             }
           }
           if (tracee->detached_proxy &&

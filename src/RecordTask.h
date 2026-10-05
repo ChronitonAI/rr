@@ -589,6 +589,11 @@ public:
    * it, emulating ptrace stops, etc.)
    */
   void did_reach_zombie();
+  /**
+   * Call when a task of this task's process has exited. If they all have,
+   * end the process's emulated job-control stop.
+   */
+  void end_job_control_stop_if_process_exited();
 
   // Is this task a container init? (which has special signal behavior)
   bool is_container_init() const { return tg->tgid_own_namespace == 1; }

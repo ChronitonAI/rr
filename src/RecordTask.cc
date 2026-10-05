@@ -869,11 +869,33 @@ void RecordTask::do_ptrace_exit_stop(WaitStatus exit_status) {
   }
 }
 
+void RecordTask::end_job_control_stop_if_process_exited() {
+  for (Task* t : thread_group()->task_set()) {
+    if (!t->is_exiting()) {
+      return;
+    }
+  }
+  // The process isn't in a job-control stop anymore: the group exit
+  // (complete_signal() for SIGKILL, or do_group_exit()) clears
+  // SIGNAL_STOP_STOPPED. Its parent can't wait for that stop now, so it
+  // mustn't keep us from reaping the tasks. Consume the stop as a wait would
+  // and leave the rest, e.g. for the siginfo of a synthetic SIGCHLD for the
+  // stop that's still to be delivered.
+  for (Task* t : thread_group()->task_set()) {
+    auto rt = static_cast<RecordTask*>(t);
+    if (!rt->emulated_ptracer && rt->emulated_stop_type == GROUP_STOP) {
+      rt->emulated_stop_pending = false;
+    }
+  }
+}
+
 void RecordTask::did_reach_zombie() {
   // Remove from address-space and fds list since we really aren't associated
   // with them anymore (and we can't be used to operate on them)
   as->erase_task(this);
   fds->erase_task(this);
+
+  end_job_control_stop_if_process_exited();
 
   if (!was_reaped()) {
     if (may_reap()) {
