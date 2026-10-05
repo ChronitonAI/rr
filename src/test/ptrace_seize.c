@@ -62,6 +62,21 @@ int main(void) {
 
   test_assert(WIFSTOPPED(status));
 
+  /* SIGCONT ends the group stop. Linux reports a PTRACE_EVENT_STOP for it
+     before the signal-delivery stop, but rr doesn't emulate that. */
+  test_assert(0 == kill(child, SIGCONT));
+  do {
+    test_assert(0 == ptrace(PTRACE_CONT, child, NULL, 0));
+    test_assert(child == waitpid(child, &status, 0));
+  } while (status != ((SIGCONT << 8) | 0x7f));
+
+  /* Without a group stop, PTRACE_INTERRUPT stops have SIGTRAP. */
+  test_assert(0 == ptrace(PTRACE_CONT, child, NULL, 0));
+  sched_yield();
+  test_assert(0 == ptrace(PTRACE_INTERRUPT, child, NULL, 0));
+  test_assert(child == waitpid(child, &status, 0));
+  test_assert(status == ((PTRACE_EVENT_STOP << 16) | (SIGTRAP << 8) | 0x7f));
+
   test_assert(0 == kill(child, SIGKILL));
 
   atomic_puts("EXIT-SUCCESS");
