@@ -53,8 +53,10 @@ public:
 
   /**
    * Start numbering custom data values from here. This avoids overlapping
-   * values that might be returned from a PTRACE_EVENT_EXIT, so we can
-   * distinguish unexpected exits from real results of PTRACE_GETEVENTMSG.
+   * values that might be returned from a PTRACE_EVENT_EXIT for a signal death
+   * or exit status 0. (Other exit statuses arrive as status << 8;
+   * RecordTask::get_ptrace_eventmsg_seccomp_data checks that the task is still
+   * at its seccomp stop.)
    */
   enum { BASE_CUSTOM_DATA = 0x100 };
 

@@ -21,6 +21,7 @@
 #include "log.h"
 #include "record_signal.h"
 #include "rr/rr.h"
+#include "seccomp-bpf.h"
 #include "util.h"
 
 using namespace std;
@@ -1719,12 +1720,30 @@ bool RecordTask::running_inside_desched() const {
 
 int RecordTask::get_ptrace_eventmsg_seccomp_data() {
   unsigned long data = 0;
-  // in theory we could hit an assertion failure if the tracee suffers
-  // a SIGKILL before we get here. But the SIGKILL would have to be
-  // precisely timed between the generation of a PTRACE_EVENT_FORK/CLONE/
-  // SYS_clone event, and us fetching the event message here.
+  // We may have collected the stop a while ago. If a SIGKILL (e.g. another
+  // thread's exit_group) has kicked the task out of the stop since,
+  // PTRACE_GETEVENTMSG fails with ESRCH while the task is between stops, and
+  // returns the exit status (status << 8 or a signal number) once the task
+  // is at its PTRACE_EVENT_EXIT stop.
   if (fallible_ptrace(PTRACE_GETEVENTMSG, nullptr, &data) < 0) {
     ASSERT(this, errno == ESRCH);
+    return -1;
+  }
+  if (data == SECCOMP_RET_DATA) {
+    // rr's own filter's value. An exit status is at most 0xff00, so this is
+    // the message of the stop we collected.
+    return data;
+  }
+  // Check that the task is still at the stop we read the message for: once
+  // it has left the stop, it can't come back.
+  siginfo_t si;
+  if (fallible_ptrace(PTRACE_GETSIGINFO, nullptr, &si) < 0) {
+    ASSERT(this, errno == ESRCH);
+    return -1;
+  }
+  if (si.si_signo != SIGTRAP || (si.si_code >> 8) != status().ptrace_event()) {
+    LOG(debug) << "Task " << tid << " is no longer at its "
+               << ptrace_event_name(status().ptrace_event()) << " stop";
     return -1;
   }
   return data;

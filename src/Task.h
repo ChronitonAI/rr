@@ -274,6 +274,17 @@ public:
   bool did_waitpid(WaitStatus status);
 
   /**
+   * Call when we find that the task has left the stop that we collected for
+   * it, before we processed the stop, because of a SIGKILL or equivalent
+   * (e.g. another thread's exit_group). As when did_waitpid() returns false,
+   * we treat the stop as if it never happened, and we'll wait for the task's
+   * next status: is_stopped will be false and in_unexpected_exit true.
+   * (So callers of RecordSession::handle_ptrace_event must allow for the task
+   * not being stopped afterwards.)
+   */
+  void did_leave_stop_unexpectedly();
+
+  /**
    * Syscalls have side effects on registers (e.g. setting the flags register).
    * Perform those side effects on |registers| to make it look like a syscall
    * happened.

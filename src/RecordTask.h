@@ -389,7 +389,8 @@ public:
    */
   bool running_inside_desched() const;
   /**
-   * Returns -1 if we failed (the process unexpectedly exited).
+   * Returns -1 if we failed because the task is no longer at its
+   * PTRACE_EVENT_SECCOMP stop (the process unexpectedly exited).
    */
   int get_ptrace_eventmsg_seccomp_data();
 

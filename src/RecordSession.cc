@@ -682,6 +682,7 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
       t->apply_syscall_entry_regs();
       if (seccomp_data < 0) {
         // Process just died. Urk. Just wait for the exit event and pretend this stop never happened!
+        t->did_leave_stop_unexpectedly();
         last_task_switchable = ALLOW_SWITCH;
         step_state->continue_type = DONT_CONTINUE;
         return true;
@@ -1965,7 +1966,7 @@ bool RecordSession::handle_signal_event(RecordTask* t, StepState* step_state) {
                               &dummy_did_enter_syscall);
           ASSERT(t, !dummy_did_enter_syscall);
         }
-        if (t->ptrace_event() == PTRACE_EVENT_EXIT) {
+        if (!t->is_stopped() || t->ptrace_event() == PTRACE_EVENT_EXIT) {
           // Tracee was nuked (probably SIGKILL) during desched processing.
           return true;
         }
