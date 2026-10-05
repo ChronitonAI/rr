@@ -1196,6 +1196,37 @@ static bool is_in_privileged_syscall(RecordTask* t) {
   return type && type->privileged == AddressSpace::PRIVILEGED;
 }
 
+/**
+ * True if we'll report the exit of the syscall that |t| is at the exit of to
+ * its emulated ptracer, as a syscall-exit stop or a singlestep SIGTRAP.
+ * |ptrace_cont_command| is the ptracer's resume command that decides that
+ * (see take_ptrace_syscall_exit_state).
+ */
+static bool will_report_syscall_exit_to_ptracer(RecordTask* t,
+                                                int ptrace_cont_command) {
+  return t->emulated_ptracer && !is_in_privileged_syscall(t) &&
+         (ptrace_cont_command == PTRACE_SYSCALL ||
+          is_ptrace_any_singlestep(t->arch(), ptrace_cont_command));
+}
+
+/**
+ * |t| is at the exit of a syscall that the syscall buffer descheduled, and
+ * its current event is EV_DESCHED. Leaving the desched critical section runs
+ * |t| on to the syscall buffer code's next syscall. If the emulated ptracer
+ * gets a stop for the syscall's exit, we report that first and return true:
+ * record_step leaves the desched critical section when the ptracer has
+ * resumed |t|.
+ */
+static bool defer_leaving_desched_critical_section(RecordTask* t,
+                                                   int ptrace_cont_command) {
+  if (!will_report_syscall_exit_to_ptracer(t, ptrace_cont_command)) {
+    return false;
+  }
+  LOG(debug) << "  deferring exit from desched critical section";
+  t->ev().Desched().ptracer_may_change_result = true;
+  return true;
+}
+
 void RecordSession::syscall_state_changed(RecordTask* t,
                                           StepState* step_state) {
   switch (t->ev().Syscall().state) {
@@ -1235,6 +1266,11 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         if (ok) {
           ASSERT(t, t->ip() == r.ip());
           t->set_regs(orig_regs);
+          if (EV_DESCHED == t->ev().type()) {
+            // A syscall that the syscall buffer descheduled. The ptracer
+            // decided its result.
+            t->ev().Desched().ptracer_may_change_result = true;
+          }
           maybe_trigger_emulated_ptrace_syscall_exit_stop(t,
                                                           ptrace_cont_command);
           maybe_trigger_emulated_ptrace_interrupt_stop(t,
@@ -1361,12 +1397,14 @@ void RecordSession::syscall_state_changed(RecordTask* t,
           seccomp_trap_done(t);
         }
         if (EV_DESCHED == t->ev().type()) {
-          LOG(debug) << "  exiting desched critical section";
           // The signal handler could have modified the apparent syscall
           // return handler. Save that value into the syscall buf again so
           // replay will pick it up later.
           save_interrupted_syscall_ret_in_syscallbuf(t, retval);
-          desched_state_changed(t);
+          if (!defer_leaving_desched_critical_section(t, ptrace_cont_command)) {
+            LOG(debug) << "  exiting desched critical section";
+            desched_state_changed(t);
+          }
         }
       } else {
         LOG(debug) << "  original_syscallno:" << t->regs().original_syscallno()
@@ -1438,7 +1476,8 @@ void RecordSession::syscall_state_changed(RecordTask* t,
             orig_syscall_ip = t->ev().Syscall().regs.ip();
           }
           t->pop_syscall();
-          if (EV_DESCHED == t->ev().type()) {
+          if (EV_DESCHED == t->ev().type() &&
+              !defer_leaving_desched_critical_section(t, ptrace_cont_command)) {
             LOG(debug) << "  exiting desched critical section";
             desched_state_changed(t);
           }
@@ -2789,6 +2828,12 @@ RecordSession::RecordResult RecordSession::record_step() {
 
       switch (t->ev().type()) {
         case EV_DESCHED:
+          if (t->ev().Desched().ptracer_may_change_result) {
+            // Save the result we have now into the syscall buf again, so
+            // that replay picks it up.
+            save_interrupted_syscall_ret_in_syscallbuf(
+                t, t->regs().syscall_result_signed());
+          }
           desched_state_changed(t);
           break;
         case EV_SYSCALL:

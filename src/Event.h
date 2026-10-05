@@ -101,13 +101,20 @@ enum EventType {
  */
 struct DeschedEvent {
   /** Desched of |rec|. */
-  DeschedEvent(remote_ptr<const struct syscallbuf_record> rec) : rec(rec) {}
+  DeschedEvent(remote_ptr<const struct syscallbuf_record> rec)
+      : rec(rec), ptracer_may_change_result(false) {}
   // Record of the syscall that was interrupted by a desched
   // notification.  It's legal to reference this memory /while
   // the desched is being processed only/, because |t| is in the
   // middle of a desched, which means it's successfully
   // allocated (but not yet committed) this syscall record.
   remote_ptr<const struct syscallbuf_record> rec;
+  // True if the task's emulated ptracer may have changed the syscall's result
+  // since we stored it in the syscall buffer record: at the syscall-exit stop
+  // we reported, or at the syscall-entry stop of a syscall that it skips with
+  // PTRACE_SYSEMU. We store the result again when we leave the desched
+  // critical section.
+  bool ptracer_may_change_result;
 };
 
 struct PatchSyscallEvent {
