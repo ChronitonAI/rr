@@ -1903,6 +1903,15 @@ ReplayTask* ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
     case EV_SYSCALLBUF_ABORT_COMMIT:
       t->write_mem(REMOTE_PTR_FIELD(t->syscallbuf_child, abort_commit),
                    (uint8_t)1);
+      // Recording sets notify_on_syscall_hook_exit after every
+      // SYSCALLBUF_ABORT_COMMIT (in desched_state_changed and
+      // seccomp_trap_done) without recording another event first, and the
+      // tracee reads it only in syscall_hook after the aborted syscall
+      // returns. Set it here, so that it's already set at any event that a
+      // tracer's single-steps add before rrcall_notify_syscall_hook_exit.
+      t->write_mem(
+          REMOTE_PTR_FIELD(t->syscallbuf_child, notify_on_syscall_hook_exit),
+          (uint8_t)1);
       t->apply_all_data_records_from_trace();
       current_step.action = TSTEP_RETIRE;
       break;

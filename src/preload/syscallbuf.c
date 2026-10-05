@@ -4405,8 +4405,11 @@ RR_HIDDEN long syscall_hook(struct syscall_info* call) {
     // right without races.
     //
     // During recording, this flag is set when the recorder needs to delay
-    // delivery of a signal until we've stopped using the syscallbuf.
-    // During replay, this flag is set when the next event is entering a
+    // delivery of a signal until we've stopped using the syscallbuf, and
+    // after it records a SYSCALLBUF_ABORT_COMMIT event (in
+    // desched_state_changed and seccomp_trap_done).
+    // During replay, this flag is set when replaying a
+    // SYSCALLBUF_ABORT_COMMIT event, and when the next event is entering a
     // SYS_rrcall_notify_syscall_hook_exit.
     //
     // The correctness argument is as follows:
@@ -4415,15 +4418,24 @@ RR_HIDDEN long syscall_hook(struct syscall_info* call) {
     // SYS_rrcall_notify_syscall_hook_exit and b) replay's setting of the flag
     // must happen after we read the flag in the previous execution of
     // syscall_hook.
-    // Condition a) holds as long as no events are recorded between the
-    // checking of the flag above and the execution of this syscall. This
-    // should be the case; no synchronous signals or syscalls are
-    // triggerable, all async signals other than SYSCALLBUF_DESCHED_SIGNAL
-    // are delayed, and SYSCALLBUF_DESCHED_SIGNAL shouldn't fire since we've
-    // disarmed the desched fd at this point. SYSCALLBUF_FLUSH events may be
-    // emitted when we process the SYS_rrcall_notify_syscall_hook_exit event,
-    // but replay of those events ends at the last flushed syscall, before
-    // we exit syscall_hook_internal.
+    // After a SYSCALLBUF_ABORT_COMMIT, condition a) holds because replay sets
+    // the flag when it replays that event, which comes before we return from
+    // syscall_hook_internal. Events can follow it before this syscall: when
+    // a ptracer single-steps or otherwise holds the syscallbuf locked
+    // (SYSCALLBUF_LOCKED_TRACER), signals and single-step traps are
+    // delivered in syscallbuf code.
+    // When the recorder delays a signal, condition a) holds as long as no
+    // events are recorded between the checking of the flag above and the
+    // execution of this syscall. This should be the case: the recorder
+    // delays signals only while SYSCALLBUF_LOCKED_TRACER is clear, and no
+    // ptracer can stop us to set it before this syscall; no synchronous
+    // signals or syscalls are triggerable, all async signals other than
+    // SYSCALLBUF_DESCHED_SIGNAL are delayed, and SYSCALLBUF_DESCHED_SIGNAL
+    // shouldn't fire since we've disarmed the desched fd at this point.
+    // SYSCALLBUF_FLUSH events may be emitted when we process the
+    // SYS_rrcall_notify_syscall_hook_exit event, but replay of those events
+    // ends at the last flushed syscall, before we exit
+    // syscall_hook_internal.
     // Condition b) failing would mean no new events were generated between
     // testing the flag in the previous syscall_hook and the execution of this
     // SYS_rrcall_notify_syscall_hook_exit. However, every invocation of
