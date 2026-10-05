@@ -9,6 +9,76 @@
 static int parent_to_child_fds[2];
 static int child_to_parent_fds[2];
 
+/* Group-stop |child| with SIGSTOP. */
+static void group_stop(pid_t child) {
+  int status;
+
+  test_assert(0 == kill(child, SIGSTOP));
+  test_assert(child == waitpid(child, &status, 0));
+  test_assert(status == ((SIGSTOP << 8) | 0x7f));
+  test_assert(0 == ptrace(PTRACE_CONT, child, NULL, (void*)SIGSTOP));
+  test_assert(child == waitpid(child, &status, 0));
+  test_assert(status == ((PTRACE_EVENT_STOP << 16) | (SIGSTOP << 8) | 0x7f));
+}
+
+/* A SIGCONT ends a group stop when it's sent. Then PTRACE_INTERRUPT stops
+   have SIGTRAP, also while the SIGCONT is pending, and if the process never
+   dequeues it: a stop signal sent after it discards it. This child doesn't
+   make syscalls, so its stops aren't in one. */
+static void sigcont_sent(void) {
+  pid_t child;
+  int status;
+
+  if (0 == (child = fork())) {
+    for (;;) {
+    }
+  }
+  test_assert(child > 0);
+
+  test_assert(0 == ptrace(PTRACE_SEIZE, child, NULL, NULL));
+  group_stop(child);
+
+  /* Linux also reports a PTRACE_EVENT_STOP for the SIGCONT, before its
+     signal-delivery stop. That may be the same stop as the
+     PTRACE_INTERRUPT's. (Under rr, the child may get to the signal-delivery
+     stop first.) */
+  test_assert(0 == ptrace(PTRACE_CONT, child, NULL, 0));
+  test_assert(0 == kill(child, SIGCONT));
+  test_assert(0 == ptrace(PTRACE_INTERRUPT, child, NULL, 0));
+  for (;;) {
+    test_assert(child == waitpid(child, &status, 0));
+    if (status == ((SIGCONT << 8) | 0x7f)) {
+      break;
+    }
+    test_assert(status ==
+                ((PTRACE_EVENT_STOP << 16) | (SIGTRAP << 8) | 0x7f));
+    test_assert(0 == ptrace(PTRACE_CONT, child, NULL, 0));
+  }
+
+  test_assert(0 == ptrace(PTRACE_CONT, child, NULL, 0));
+  group_stop(child);
+
+  test_assert(0 == kill(child, SIGCONT));
+  test_assert(0 == kill(child, SIGTSTP));
+  /* Linux reports a PTRACE_EVENT_STOP for the SIGCONT before the SIGTSTP's
+     signal-delivery stop, but rr doesn't emulate that. */
+  do {
+    test_assert(0 == ptrace(PTRACE_CONT, child, NULL, 0));
+    test_assert(child == waitpid(child, &status, 0));
+  } while (status == ((PTRACE_EVENT_STOP << 16) | (SIGTRAP << 8) | 0x7f));
+  test_assert(status == ((SIGTSTP << 8) | 0x7f));
+
+  test_assert(0 == ptrace(PTRACE_CONT, child, NULL, 0));
+  test_assert(0 == ptrace(PTRACE_INTERRUPT, child, NULL, 0));
+  test_assert(child == waitpid(child, &status, 0));
+  test_assert(status == ((PTRACE_EVENT_STOP << 16) | (SIGTRAP << 8) | 0x7f));
+
+  test_assert(0 == kill(child, SIGKILL));
+  do {
+    test_assert(child == waitpid(child, &status, 0));
+  } while (!WIFSIGNALED(status));
+}
+
 int main(void) {
   pid_t child;
   char ch;
@@ -23,6 +93,7 @@ int main(void) {
     sleep(10000);
     return 77;
   }
+  test_assert(child > 0);
 
   test_assert(0 ==
               ptrace(PTRACE_SEIZE, child, NULL, (void*)PTRACE_O_TRACESYSGOOD));
@@ -62,7 +133,24 @@ int main(void) {
 
   test_assert(WIFSTOPPED(status));
 
+  /* SIGCONT ends the group stop. Linux reports a PTRACE_EVENT_STOP for it
+     before the signal-delivery stop, but rr doesn't emulate that. */
+  test_assert(0 == kill(child, SIGCONT));
+  do {
+    test_assert(0 == ptrace(PTRACE_CONT, child, NULL, 0));
+    test_assert(child == waitpid(child, &status, 0));
+  } while (status != ((SIGCONT << 8) | 0x7f));
+
+  /* Without a group stop, PTRACE_INTERRUPT stops have SIGTRAP. */
+  test_assert(0 == ptrace(PTRACE_CONT, child, NULL, 0));
+  sched_yield();
+  test_assert(0 == ptrace(PTRACE_INTERRUPT, child, NULL, 0));
+  test_assert(child == waitpid(child, &status, 0));
+  test_assert(status == ((PTRACE_EVENT_STOP << 16) | (SIGTRAP << 8) | 0x7f));
+
   test_assert(0 == kill(child, SIGKILL));
+
+  sigcont_sent();
 
   atomic_puts("EXIT-SUCCESS");
   return 0;
