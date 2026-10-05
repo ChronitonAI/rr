@@ -296,7 +296,10 @@ bool Scheduler::is_task_runnable(RecordTask* t, WaitAggregator& wait_aggregator,
   }
 
   if (t->waiting_for_reap) {
-    if (t->may_reap()) {
+    // Don't schedule the task before its exit notification is available,
+    // otherwise did_reach_zombie() can't reap it yet. If all tasks are
+    // blocked, the wait in get_next_thread() reaps it once it exits.
+    if (t->may_reap() && t->exit_status_available()) {
       LOGM(debug) << "  " << t->tid << " is waiting to be reaped, and can be reaped";
       return true;
     }

@@ -604,8 +604,16 @@ public:
   /**
    * Reaps a task-exit notification, thus detaching us from the tracee.
    * N.B.: If may_reap is false, this risks a deadlock.
+   * Returns false if the task has not exited yet, i.e. there was no
+   * exit notification to reap; the task is then not marked as reaped.
    */
-  void reap();
+  bool reap();
+
+  /**
+   * Returns true if the task's exit notification is available to be reaped
+   * (or the task is already gone). Does not consume the notification.
+   */
+  bool exit_status_available();
 
   bool waiting_for_pid_namespace_tasks_to_exit() const;
   int process_depth() const;

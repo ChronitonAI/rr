@@ -1262,6 +1262,7 @@ set(BASIC_TESTS
   pid_ns_kill_threads
   pid_ns_kill_threads_exit_wait
   pid_ns_reap
+  pid_ns_reap_before_exit
   pid_ns_segv
   pid_ns_shutdown
   pidfd

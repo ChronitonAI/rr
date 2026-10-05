@@ -876,9 +876,7 @@ void RecordTask::did_reach_zombie() {
   fds->erase_task(this);
 
   if (!was_reaped()) {
-    if (may_reap()) {
-      reap();
-    } else {
+    if (!may_reap() || !reap()) {
       waiting_for_reap = true;
     }
   }
@@ -2174,13 +2172,31 @@ bool RecordTask::may_reap() {
   return true;
 }
 
-void RecordTask::reap() {
+bool RecordTask::reap() {
   ASSERT(this, !was_reaped_);
   LOG(debug) << "Reaping " << tid;
   WaitOptions options(tid);
   options.block_seconds = 0;
-  WaitManager::wait_exit(options);
+  WaitResult result = WaitManager::wait_exit(options);
+  if (result.code == WAIT_NO_STATUS) {
+    // The task has not reached the zombie state yet. This happens e.g. for
+    // the last thread of a pid namespace's init, which stays in
+    // zap_pid_ns_processes until every other task in the namespace has been
+    // reaped. If we marked it as reaped now, nobody would ever reap the
+    // zombie and the pid namespace could never finish exiting.
+    LOG(debug) << "  " << tid << " has not exited yet";
+    return false;
+  }
+  // WAIT_OK: we reaped it. WAIT_NO_CHILD: it's already gone.
   was_reaped_ = true;
+  return true;
+}
+
+bool RecordTask::exit_status_available() {
+  WaitOptions options(tid);
+  options.block_seconds = 0;
+  options.consume = false;
+  return WaitManager::wait_exit(options).code != WAIT_NO_STATUS;
 }
 
 static uint64_t read_pid_ns(const RecordTask* t) {
