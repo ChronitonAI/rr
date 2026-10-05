@@ -5755,6 +5755,28 @@ void rec_abort_prepared_syscall(RecordTask* t) {
   t->syscall_state = nullptr;
 }
 
+template <typename Arch> static bool wait_reported_child_arch(RecordTask* t) {
+  const Registers& r = t->regs();
+  if (t->ev().Syscall().number != Arch::waitid) {
+    return r.syscall_result_signed() > 0;
+  }
+  remote_ptr<typename Arch::siginfo_t> sip = r.arg3();
+  if (r.syscall_result_signed() != 0 || sip.is_null()) {
+    return false;
+  }
+  bool ok = true;
+  auto si = t->read_mem(sip, &ok);
+  return ok && si._sifields._sigchld.si_pid_ != 0;
+}
+
+/**
+ * Return true if the wait syscall |t| is exiting from reported a child
+ * (a real one, since we didn't emulate it at the syscall entry).
+ */
+static bool wait_reported_child(RecordTask* t) {
+  RR_ARCH_FUNCTION(wait_reported_child_arch, t->ev().Syscall().arch(), t);
+}
+
 bool rec_return_normally_from_wait(RecordTask* t) {
   auto syscall_state = TaskSyscallState::maybe_get(t);
   if (!syscall_state) {
@@ -5762,6 +5784,12 @@ bool rec_return_normally_from_wait(RecordTask* t) {
   }
   if (syscall_state->emulate_wait_for_child) {
     return true;
+  }
+  if (t->in_wait_type != WAIT_TYPE_NONE && wait_reported_child(t)) {
+    // Keep what the kernel reported. Replacing it with an emulated stop
+    // would lose it: the kernel has reaped an exited child, for example.
+    // The next wait reports the emulated stop.
+    return false;
   }
   if (maybe_emulate_wait(t, *syscall_state)) {
     return true;
