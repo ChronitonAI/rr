@@ -1383,6 +1383,7 @@ set(BASIC_TESTS
   sigaltstack
   sigchld_interrupt_signal
   sigcont
+  sigcont_then_sigstop
   sigcont_threaded
   sigframe_grow_stack
   sighandler_bad_rsp_sigsegv
@@ -1826,6 +1827,7 @@ set(TESTS_WITHOUT_PROGRAM
   x86/sigreturn_checksum
   signal_stop
   signal_checkpoint
+  sigstop_blocked_thread_external
   simple_script
   simple_script_debug
   simple_winch
