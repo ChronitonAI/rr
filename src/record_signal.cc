@@ -369,6 +369,40 @@ bool handle_syscallbuf_breakpoint(RecordTask* t) {
   return true;
 }
 
+bool handle_syscallbuf_debug_trap(RecordTask* t) {
+  // A ptracer can set hardware breakpoints and watchpoints in its tracee's
+  // debug registers. The kernel's own accesses to user memory don't trigger
+  // them (ptrace breakpoints exclude the kernel), so e.g. a read() into a
+  // watched buffer doesn't trap. But when the syscall goes through the
+  // syscallbuf, the syscallbuf code copies the data into the buffer in user
+  // mode, and the watchpoint fires there. The tracee must not see that trap.
+  // On x86, a data breakpoint traps after the access and the kernel sets RF
+  // for an instruction breakpoint, so the tracee can just continue. (On
+  // aarch64, a watchpoint traps before the access.)
+  const siginfo_t& si = t->get_siginfo();
+  if (!is_x86ish(t->arch()) || si.si_signo != SIGTRAP ||
+      si.si_code != TRAP_HWBKPT || !t->is_in_syscallbuf()) {
+    return false;
+  }
+  // The syscall hooks run instructions of the application that the syscall
+  // patching displaced. A trap after one of those is real, so don't drop it.
+  remote_code_ptr ip = t->ip();
+  if (t->syscallbuf_code_layout.syscallbuf_hook_trampolines_start <= ip &&
+      ip < t->syscallbuf_code_layout.syscallbuf_hook_trampolines_end) {
+    return false;
+  }
+  LOG(debug) << "Dropping debug register SIGTRAP in syscallbuf code at " << ip;
+  // The kernel forces this SIGTRAP: if SIGTRAP was blocked (by the
+  // application, or by rr while it has stashed signals) or ignored, the
+  // kernel unblocked it and reset its handler to SIG_DFL. Undo that.
+  // restore_signal_state only re-blocks SIGTRAP if the application had it
+  // blocked: our cached sigmask is the application's, from before the trap.
+  SignalBlocked signal_was_blocked =
+      t->is_sig_blocked(SIGTRAP) ? SIG_BLOCKED : SIG_UNBLOCKED;
+  restore_signal_state(t, SIGTRAP, signal_was_blocked);
+  return true;
+}
+
 /**
  * Return the event needing to be processed after this desched of |t|.
  * The tracee's execution may be advanced, and if so |regs| is updated
@@ -552,6 +586,9 @@ static void handle_desched_event(RecordTask* t) {
       // We stopped at a breakpoint on an untraced may-block syscall.
       // This can't be relevant to us since sigprocmask isn't may-block.
       LOG(debug) << " disabling breakpoints on untraced syscalls";
+      continue;
+    }
+    if (SIGTRAP == sig && handle_syscallbuf_debug_trap(t)) {
       continue;
     }
     if (t->session().syscallbuf_desched_sig() == sig ||

@@ -517,6 +517,10 @@ struct rrcall_init_preload_params {
     };
   };
   PTR(void) syscallbuf_syscall_hook;
+  /* x86-64 only: the syscall hooks, which run instructions of the
+   * application that the syscall patching displaced. */
+  PTR(void) syscallbuf_hook_trampolines_start;
+  PTR(void) syscallbuf_hook_trampolines_end;
 };
 
 /**
