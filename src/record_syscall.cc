@@ -3457,13 +3457,23 @@ static void prepare_exit(RecordTask* t) {
   t->set_regs(r);
   // This exits the SYS_rt_sigprocmask.  Now the tracee is ready to do our
   // bidding.
-  t->exit_syscall(arch);
+  if (!t->exit_syscall(arch)) {
+    // The task was killed (e.g. by SIGKILL) and is at its PTRACE_EVENT_EXIT
+    // stop. Its buffers die with it.
+    t->destroy_buffers(nullptr, nullptr);
+    return;
+  }
   check_signals_while_exiting(t);
 
   // Do the actual buffer and fd cleanup.
   t->destroy_buffers();
 
   check_signals_while_exiting(t);
+  if (t->is_exiting()) {
+    // Killed while we were doing that. Don't resume it out of its
+    // PTRACE_EVENT_EXIT stop.
+    return;
+  }
 
   // Restore these regs to what they would have been just before
   // the tracee trapped at SYS_exit/SYS_exit_group.  When we've finished
@@ -3748,6 +3758,18 @@ static int ptrace_option_for_event(int ptrace_event) {
   }
 }
 
+/**
+ * Whether `tid` can be a task that `t` just created: one we're ptracing but
+ * don't know about yet.
+ */
+static bool is_new_tracee(RecordTask* t, pid_t tid) {
+  if (tid <= 0 || t->session().find_task(tid)) {
+    return false;
+  }
+  auto tracer = read_proc_status_fields(tid, "TracerPid");
+  return tracer.size() == 1 && atoi(tracer[0].c_str()) == getpid();
+}
+
 template <typename Arch>
 static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) {
   uintptr_t flags;
@@ -3780,7 +3802,12 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
 
   while (true) {
     if (!t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
-      // Tracee died unexpectedly during clone.
+      // Tracee died unexpectedly during clone, before reporting the event.
+      // A new thread (CLONE_THREAD) died with it before we heard about it,
+      // so it never ran and replay mustn't create it. A fork()/vfork() child
+      // survives; we never adopt it and it stays stopped. We don't handle
+      // that.
+      t->ev().Syscall().failed_during_preparation = true;
       return ALLOW_SWITCH;
     }
     // XXX handle stray signals?
@@ -3822,6 +3849,17 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
   ASSERT(t, t->ptrace_event() == ptrace_event);
 
   pid_t new_tid = t->get_ptrace_eventmsg_pid();
+  if (!is_new_tracee(t, new_tid)) {
+    // A SIGKILL took the task out of its PTRACE_EVENT_CLONE (etc) stop before
+    // we could read the new tid: PTRACE_GETEVENTMSG failed, or it reported
+    // the exit status of the PTRACE_EVENT_EXIT stop the task has moved on to.
+    // Handle this like the task dying before reporting the event (see
+    // above).
+    LOG(debug) << "Task " << t->tid << " killed before we got its new tid";
+    t->wait();
+    t->ev().Syscall().failed_during_preparation = true;
+    return ALLOW_SWITCH;
+  }
   RecordTask* new_task = static_cast<RecordTask*>(
       t->session().clone(t, clone_flags_to_task_flags(flags), params.stack,
                          params.tls, params.ctid, new_tid));
