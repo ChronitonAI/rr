@@ -2317,6 +2317,51 @@ static bool ignore_signal_for_detached_proxy(int sig) {
   }
 }
 
+/**
+ * This is purely for testing purposes. See killed_in_signal_stop and
+ * killed_injecting_signal. With RR_KILL_TASK_IN_SIGNAL_STOP=<signal number>,
+ * when a recorded task whose parent is also recorded reports a signal-stop
+ * for that signal, SIGKILL it and wait until it has reached its
+ * PTRACE_EVENT_EXIT stop (or exited) before we read the siginfo of the
+ * signal-stop.
+ */
+static void maybe_kill_task_in_signal_stop(Task* t, int sig) {
+  static const char* kill_sig = getenv("RR_KILL_TASK_IN_SIGNAL_STOP");
+  if (!kill_sig || atoi(kill_sig) != sig || !t->session().is_recording() ||
+      !t->session().find_task(static_cast<RecordTask*>(t)->get_parent_pid())) {
+    return;
+  }
+  LOG(debug) << "Killing " << t->tid << " in its signal-stop for "
+             << signal_name(sig);
+  // |t| may not be set up yet (e.g. if it's still in Task::clone()).
+  syscall(SYS_tkill, t->tid, SIGKILL);
+  WaitOptions options(t->tid);
+  options.consume = false;
+  WaitResult result;
+  do {
+    result = WaitManager::wait_stop_or_exit(options);
+  } while (result.code == WAIT_NO_STATUS);
+  ASSERT(t, result.code == WAIT_OK) << "Task disappeared";
+}
+
+/**
+ * PTRACE_GETSIGINFO in a signal-stop of |t| returned |si|. Return true if
+ * that's really the siginfo of |t|'s PTRACE_EVENT_EXIT stop, because a SIGKILL
+ * took |t| out of the signal-stop and on to that stop before we read it.
+ */
+static bool got_exit_stop_siginfo(Task* t, const siginfo_t& si) {
+  if (si.si_signo != SIGTRAP ||
+      si.si_code != (SIGTRAP | (PTRACE_EVENT_EXIT << 8))) {
+    return false;
+  }
+  // A program can send itself a SIGTRAP with that si_code. But if |t| left the
+  // signal-stop, its next stop is already waiting for us.
+  WaitOptions options(t->tid);
+  options.block_seconds = 0;
+  options.consume = false;
+  return WaitManager::wait_stop_or_exit(options).code == WAIT_OK;
+}
+
 bool Task::did_waitpid(WaitStatus status) {
   if (is_detached_proxy() &&
       ignore_signal_for_detached_proxy(status.stop_sig())) {
@@ -2379,9 +2424,18 @@ bool Task::did_waitpid(WaitStatus status) {
       // Don't try to inject signals into ptrace-interrupt stops
       in_injectable_signal_stop = false;
     } else if (status.stop_sig()) {
+      maybe_kill_task_in_signal_stop(this, status.stop_sig());
       if (!ptrace_if_stopped(PTRACE_GETSIGINFO, nullptr, &pending_siginfo)) {
         LOG(debug) << "Unexpected process death getting siginfo for " << tid;
         // Let's pretend this stop never happened.
+        set_stopped(false);
+        in_unexpected_exit = true;
+        return false;
+      }
+      if (got_exit_stop_siginfo(this, pending_siginfo)) {
+        LOG(debug) << "Task " << tid << " reached its PTRACE_EVENT_EXIT stop "
+                   << "before we got the siginfo of its signal-stop";
+        // As above. We'll get the PTRACE_EVENT_EXIT stop next.
         set_stopped(false);
         in_unexpected_exit = true;
         return false;
