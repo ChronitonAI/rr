@@ -168,6 +168,190 @@ _raw_syscall:
 #else
 #error unknown CPU architecture
 #endif /* __i386__/__x86_64__ */
+
+/* The syscallbuf code calls these functions to check that it can access
+ * tracee memory (see can_write() etc in syscallbuf.c). Each one touches every
+ * page of its range (or the bytes of a string up to its NUL) and returns 1.
+ * When one of their accesses faults, rr sets the ip to _memory_check_failed,
+ * which returns 0. They must not use the stack, so that its `ret` returns to
+ * the caller, and rr must not see a fault anywhere else in
+ * [_memory_checks_start, _memory_checks_end). But when replay wouldn't fault
+ * (a SIGBUS, or a protection key fault), rr skips the access instead, or
+ * aborts if it's in _memory_check_readable_str. So the instructions after an
+ * access must not depend on its effects. (rr recognizes the access and the
+ * instruction after it by their bytes; see
+ * skippable_memory_check_access_length.)
+ *
+ * long _memory_check_writable(void* addr, size_t len): with an atomic RMW
+ *   that doesn't change the memory
+ * long _memory_check_readable(const void* addr, size_t len)
+ * long _memory_check_readable_str(const char* str)
+ */
+        .text
+        .global _memory_check_failed
+        .hidden _memory_check_failed
+        .global _memory_checks_start
+        .hidden _memory_checks_start
+        .global _memory_check_writable
+        .hidden _memory_check_writable
+        .global _memory_check_readable
+        .hidden _memory_check_readable
+        .global _memory_check_readable_str
+        .hidden _memory_check_readable_str
+        .global _memory_checks_end
+        .hidden _memory_checks_end
+#if defined(__x86_64__)
+_memory_check_failed:
+        .cfi_startproc
+        xor %eax, %eax
+        ret
+        .cfi_endproc
+_memory_checks_start:
+_memory_check_writable:
+        .cfi_startproc
+        mov $1, %eax
+        test %rsi, %rsi
+        jz 2f
+        add %rdi, %rsi
+        jc 3f
+1:      lock orb $0, (%rdi)
+        and $-4096, %rdi
+        add $4096, %rdi
+        cmp %rsi, %rdi
+        jb 1b
+2:      ret
+3:      xor %eax, %eax
+        ret
+        .cfi_endproc
+_memory_check_readable:
+        .cfi_startproc
+        mov $1, %eax
+        test %rsi, %rsi
+        jz 2f
+        add %rdi, %rsi
+        jc 3f
+1:      cmpb $0, (%rdi)
+        and $-4096, %rdi
+        add $4096, %rdi
+        cmp %rsi, %rdi
+        jb 1b
+2:      ret
+3:      xor %eax, %eax
+        ret
+        .cfi_endproc
+_memory_check_readable_str:
+        .cfi_startproc
+        mov $1, %eax
+1:      cmpb $0, (%rdi)
+        je 2f
+        add $1, %rdi
+        jmp 1b
+2:      ret
+        .cfi_endproc
+_memory_checks_end:
+#elif defined(__i386__)
+_memory_check_failed:
+        .cfi_startproc
+        xor %eax, %eax
+        ret
+        .cfi_endproc
+_memory_checks_start:
+_memory_check_writable:
+        .cfi_startproc
+        mov 4(%esp), %ecx
+        mov 8(%esp), %edx
+        mov $1, %eax
+        test %edx, %edx
+        jz 2f
+        add %ecx, %edx
+        jc 3f
+1:      lock orb $0, (%ecx)
+        and $-4096, %ecx
+        add $4096, %ecx
+        cmp %edx, %ecx
+        jb 1b
+2:      ret
+3:      xor %eax, %eax
+        ret
+        .cfi_endproc
+_memory_check_readable:
+        .cfi_startproc
+        mov 4(%esp), %ecx
+        mov 8(%esp), %edx
+        mov $1, %eax
+        test %edx, %edx
+        jz 2f
+        add %ecx, %edx
+        jc 3f
+1:      cmpb $0, (%ecx)
+        and $-4096, %ecx
+        add $4096, %ecx
+        cmp %edx, %ecx
+        jb 1b
+2:      ret
+3:      xor %eax, %eax
+        ret
+        .cfi_endproc
+_memory_check_readable_str:
+        .cfi_startproc
+        mov 4(%esp), %ecx
+        mov $1, %eax
+1:      cmpb $0, (%ecx)
+        je 2f
+        add $1, %ecx
+        jmp 1b
+2:      ret
+        .cfi_endproc
+_memory_checks_end:
+#elif defined(__aarch64__)
+        /* rr requires LSE atomics on aarch64 */
+        .arch_extension lse
+_memory_check_failed:
+        .cfi_startproc
+        mov x0, #0
+        ret
+        .cfi_endproc
+_memory_checks_start:
+_memory_check_writable:
+        .cfi_startproc
+        cbz x1, 2f
+        adds x1, x0, x1
+        b.cs 3f
+1:      stclrb wzr, [x0]
+        and x0, x0, #~4095
+        add x0, x0, #4096
+        cmp x0, x1
+        b.lo 1b
+2:      mov x0, #1
+        ret
+3:      mov x0, #0
+        ret
+        .cfi_endproc
+_memory_check_readable:
+        .cfi_startproc
+        cbz x1, 2f
+        adds x1, x0, x1
+        b.cs 3f
+1:      ldrb wzr, [x0]
+        and x0, x0, #~4095
+        add x0, x0, #4096
+        cmp x0, x1
+        b.lo 1b
+2:      mov x0, #1
+        ret
+3:      mov x0, #0
+        ret
+        .cfi_endproc
+_memory_check_readable_str:
+        .cfi_startproc
+1:      ldrb w2, [x0], #1
+        cbnz w2, 1b
+        mov x0, #1
+        ret
+        .cfi_endproc
+_memory_checks_end:
+#endif
+
         .global _syscallbuf_code_end
         .hidden _syscallbuf_code_end
 _syscallbuf_code_end:
