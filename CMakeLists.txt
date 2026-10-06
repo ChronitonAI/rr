@@ -1382,6 +1382,7 @@ set(BASIC_TESTS
   sigaction_old
   sigaltstack
   sigchld_interrupt_signal
+  sigchld_nocldstop
   sigcont
   sigcont_threaded
   sigframe_grow_stack

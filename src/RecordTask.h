@@ -241,6 +241,11 @@ public:
    */
   bool has_pending_SIGCHLD();
   /**
+   * Return false if a stop or continue of a child or tracee doesn't send us
+   * a SIGCHLD, because SIGCHLD is ignored or its handler has SA_NOCLDSTOP.
+   */
+  bool wants_SIGCHLD_for_stop() const;
+  /**
    * Interrupt the waits of our threads that are waiting for |child|, as a
    * child or as a tracee.
    */
