@@ -2163,6 +2163,32 @@ bool Task::account_for_potential_ptrace_interrupt_stop(WaitStatus status) {
   return false;
 }
 
+/**
+ * This is purely for testing purposes. See killed_task_exit_order. With
+ * RR_KILL_TASK_AFTER_STOP=<signal number>, when wait() gets a signal-stop of
+ * a recorded task for that signal, SIGKILL the task before did_waitpid()
+ * looks at the stop, as if the SIGKILL had arrived just after waitid()
+ * returned.
+ */
+static void maybe_kill_task_after_stop(Task* t, WaitStatus status) {
+  static const char* kill_sig = getenv("RR_KILL_TASK_AFTER_STOP");
+  if (kill_sig && t->session().is_recording() &&
+      status.stop_sig() == atoi(kill_sig)) {
+    LOG(debug) << "Killing " << t->tid << " after its stop for "
+               << signal_name(status.stop_sig());
+    // We're usually bound to the same CPU as the tracees. Don't let the
+    // SIGKILL make them preempt us, so `t` doesn't get to its
+    // PTRACE_EVENT_EXIT stop before we've looked at this stop: we want to
+    // test the window between the two.
+    struct sched_param param;
+    memset(&param, 0, sizeof(param));
+    for (Task* tt : t->thread_group()->task_set()) {
+      sched_setscheduler(tt->tid, SCHED_IDLE, &param);
+    }
+    t->tgkill(SIGKILL);
+  }
+}
+
 bool Task::wait(double interrupt_after_elapsed) {
   LOG(debug) << "going into blocking wait for " << tid << " ...";
   ASSERT(this, session().is_recording() || interrupt_after_elapsed == -1);
@@ -2208,6 +2234,7 @@ bool Task::wait(double interrupt_after_elapsed) {
       LOG(warn) << "  PTRACE_INTERRUPT raced with another event " << result.status;
     }
   }
+  maybe_kill_task_after_stop(this, result.status);
   return did_waitpid(result.status);
 }
 

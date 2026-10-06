@@ -1,0 +1,10 @@
+source `dirname $0`/util.sh
+# Make rr SIGKILL the child when it stops for SIGBUS, before rr looks at
+# the stop.
+RR_KILL_TASK_AFTER_STOP=7 record $TESTNAME
+replay
+if ! grep -q "child was killed" record.out; then
+  failed ": the child wasn't killed"
+else
+  check EXIT-SUCCESS
+fi
