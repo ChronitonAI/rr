@@ -890,6 +890,12 @@ public:
    */
   bool account_for_potential_ptrace_interrupt_stop(WaitStatus status);
 
+  /**
+   * x86 only: returns true if, at this stop, the tracee or its ptracer has
+   * set the trap flag (TF) in EFLAGS.
+   */
+  bool tracee_set_trap_flag(WaitStatus status);
+
   /* Imagine that task A passes buffer |b| to the read()
    * syscall.  Imagine that, after A is switched out for task B,
    * task B then writes to |b|.  Then B is switched out for A.
@@ -1314,6 +1320,9 @@ protected:
   // Current hardware watchpoint state as programmed into debug registers
   HardwareWatchpoints current_hardware_watchpoints;
   ResumeRequest how_last_execution_resumed;
+  // x86: true if the registers had the trap flag set when we last resumed
+  // execution. Only the tracee's ptracer can have put it there.
+  bool trap_flag_at_last_execution_resume = false;
   // In certain circumstances, due to hardware bugs, we need to fudge the
   // cx register. If so, we record the original value here. See comments in
   // Task.cc

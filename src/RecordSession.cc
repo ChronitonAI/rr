@@ -1485,6 +1485,70 @@ static void setup_sigframe_siginfo(RecordTask* t, const siginfo_t& siginfo) {
   RR_ARCH_FUNCTION(setup_sigframe_siginfo_arch, t->arch(), t, siginfo);
 }
 
+template <typename Arch>
+static remote_ptr<typename Arch::sigcontext> x86_sigframe_sigcontext(
+    RecordTask* t, int sig) {
+  typedef typename Arch::unsigned_word word;
+  // The ucontext starts with uc_flags, uc_link and uc_stack.
+  size_t sigcontext_offset_in_ucontext =
+      2 * sizeof(typename Arch::unsigned_long) + sizeof(typename Arch::stack_t);
+  auto sp = t->regs().sp().cast<word>();
+  remote_ptr<void> uc;
+  switch (Arch::arch()) {
+    case x86:
+      if (!t->signal_handler_takes_siginfo(sig)) {
+        // struct sigframe_ia32: pretcode, sig, sc, ...
+        return (sp + 2).template cast<typename Arch::sigcontext>();
+      }
+      // struct rt_sigframe_ia32: pretcode, sig, pinfo, puc, ...
+      uc = remote_ptr<void>(t->read_mem(sp + 3));
+      break;
+    case x86_64:
+      // struct rt_sigframe: pretcode, uc, ...
+      uc = sp + 1;
+      break;
+    default:
+      DEBUG_ASSERT(0 && "x86 only");
+      break;
+  }
+  return (uc + sigcontext_offset_in_ucontext)
+      .template cast<typename Arch::sigcontext>();
+}
+
+/**
+ * We inject signals with PTRACE_SINGLESTEP. The kernel normally clears the
+ * trap flag (TF) that that sets before it saves the registers in the signal
+ * frame. But when the instruction at the ip sets TF itself (popf, iret), the
+ * kernel doesn't consider TF its own, so it saves it in the frame, and
+ * sigreturn would restore it. That TF isn't the task's: if the registers had
+ * TF set when we injected the signal (only a ptracer can have put it there),
+ * did_waitpid has ended the recording at the handler's entry already. So
+ * clear it in the frame.
+ */
+template <typename Arch>
+static void clear_sigframe_trap_flag_arch(RecordTask* t, int sig) {
+  auto flags_ptr =
+      REMOTE_PTR_FIELD(x86_sigframe_sigcontext<Arch>(t, sig), flags);
+  auto flags = t->read_mem(flags_ptr);
+  if (flags & X86_TF_FLAG) {
+    LOG(debug) << "Clearing TF in the signal frame";
+    t->write_mem(flags_ptr, decltype(flags)(flags & ~X86_TF_FLAG));
+  }
+}
+
+static void clear_sigframe_trap_flag(RecordTask* t, int sig) {
+  switch (t->arch()) {
+    case x86:
+      clear_sigframe_trap_flag_arch<X86Arch>(t, sig);
+      break;
+    case x86_64:
+      clear_sigframe_trap_flag_arch<X64Arch>(t, sig);
+      break;
+    default:
+      break;
+  }
+}
+
 /**
  * Get t into a state where resume_execution with a signal will actually work.
  */
@@ -1652,6 +1716,8 @@ static bool inject_handled_signal(RecordTask* t) {
       << t->ip()
       << "; actual signal mask=" << HEX(t->read_sigmask_from_process())
       << " (cached " << HEX(t->get_sigmask()) << ")";
+
+  clear_sigframe_trap_flag(t, sig);
 
   if (t->signal_handler_takes_siginfo(sig)) {
     // The kernel copied siginfo into userspace so it can pass a pointer to
