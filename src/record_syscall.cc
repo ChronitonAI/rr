@@ -6424,24 +6424,35 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
 
   check_privileged_exe(t);
 
-  KernelMapping rr_page_mapping =
-      t->vm()->mapping_of(AddressSpace::rr_page_start()).map;
-  auto mode = t->trace_writer().write_mapped_region(
-      t, rr_page_mapping, rr_page_mapping.fake_stat(),
-      rr_page_mapping.fsname(),
-      vector<TraceRemoteFd>(),
-      TraceWriter::RR_BUFFER_MAPPING);
-  ASSERT(t, mode == TraceWriter::DONT_RECORD_IN_TRACE);
+  // If the task has been killed (e.g. by a SIGKILL) in the meantime, we
+  // carry on as far as we can, so the trace still describes the exec for
+  // replay. The task never runs again, and the address space it got from the
+  // exec isn't shared with anyone, so nothing can observe that some of the
+  // changes we make below never happen. Replay ignores these two mappings,
+  // so it doesn't matter if the task died before we could create them.
+  TraceWriter::RecordInTrace mode;
+  if (t->vm()->has_mapping(AddressSpace::rr_page_start())) {
+    KernelMapping rr_page_mapping =
+        t->vm()->mapping_of(AddressSpace::rr_page_start()).map;
+    mode = t->trace_writer().write_mapped_region(
+        t, rr_page_mapping, rr_page_mapping.fake_stat(),
+        rr_page_mapping.fsname(),
+        vector<TraceRemoteFd>(),
+        TraceWriter::RR_BUFFER_MAPPING);
+    ASSERT(t, mode == TraceWriter::DONT_RECORD_IN_TRACE);
+  }
 
-  KernelMapping preload_thread_locals_mapping =
-      t->vm()->mapping_of(AddressSpace::preload_thread_locals_start()).map;
-  mode = t->trace_writer().write_mapped_region(
-      t, preload_thread_locals_mapping,
-      preload_thread_locals_mapping.fake_stat(),
-      preload_thread_locals_mapping.fsname(),
-      vector<TraceRemoteFd>(),
-      TraceWriter::RR_BUFFER_MAPPING);
-  ASSERT(t, mode == TraceWriter::DONT_RECORD_IN_TRACE);
+  if (t->vm()->has_mapping(AddressSpace::preload_thread_locals_start())) {
+    KernelMapping preload_thread_locals_mapping =
+        t->vm()->mapping_of(AddressSpace::preload_thread_locals_start()).map;
+    mode = t->trace_writer().write_mapped_region(
+        t, preload_thread_locals_mapping,
+        preload_thread_locals_mapping.fake_stat(),
+        preload_thread_locals_mapping.fsname(),
+        vector<TraceRemoteFd>(),
+        TraceWriter::RR_BUFFER_MAPPING);
+    ASSERT(t, mode == TraceWriter::DONT_RECORD_IN_TRACE);
+  }
 
   KernelMapping vvar;
   KernelMapping vvar_vclock;
@@ -6488,6 +6499,9 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
   {
     AutoRemoteSyscalls remote(t, AutoRemoteSyscalls::DISABLE_MEMORY_PARAMS);
 
+    // If the task has died, these munmaps don't happen, but we still drop
+    // the mappings from our AddressSpace so that we record the same mappings
+    // as when it's alive (see above).
     if (vvar.size()) {
       // We're not going to map [vvar] during replay --- that wouldn't
       // make sense, since it contains data from the kernel that isn't correct
@@ -6495,20 +6509,20 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
       // Unmapping it now makes recording look more like replay.
       // Also note that under 4.0.7-300.fc22.x86_64 (at least) /proc/<pid>/mem
       // can't read the contents of [vvar].
-      remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
-                                vvar.start(), vvar.size());
+      remote.infallible_syscall_if_alive(syscall_number_for_munmap(remote.arch()),
+                                         vvar.start(), vvar.size());
       t->vm()->unmap(t, vvar.start(), vvar.size());
     }
     if (vvar_vclock.size()) {
       // Give [vvar_vclock] the same treatment.
-      remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
-                                vvar_vclock.start(), vvar_vclock.size());
+      remote.infallible_syscall_if_alive(syscall_number_for_munmap(remote.arch()),
+                                         vvar_vclock.start(), vvar_vclock.size());
       t->vm()->unmap(t, vvar_vclock.start(), vvar_vclock.size());
     }
 
     if (t->session().unmap_vdso() && vdso.size()) {
-      remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
-                                vdso.start(), vdso.size());
+      remote.infallible_syscall_if_alive(syscall_number_for_munmap(remote.arch()),
+                                         vdso.start(), vdso.size());
       t->vm()->unmap(t, vdso.start(), vdso.size());
     }
 
@@ -6521,21 +6535,37 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
       t->trace_writer().write_raw(t->rec_tid, buf.data(), km.size(),
                                   km.start());
 
-      // Remove MAP_GROWSDOWN from stacks by remapping the memory and
-      // writing the contents back.
-      int flags = (km.flags() & ~MAP_GROWSDOWN) | MAP_ANONYMOUS;
-      remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
-                                km.start(), km.size());
+      // Remove MAP_GROWSDOWN from stacks by mapping new memory over them and
+      // writing the contents back. The MAP_FIXED mmap replaces the old
+      // mapping in one step. If the task dies (e.g. it's SIGKILLed) before
+      // the mmap, the old mapping still has these contents. If it dies
+      // after, it stops at PTRACE_EVENT_EXIT with its memory intact and the
+      // write still works. Before Linux 5.17
+      // (https://github.com/torvalds/linux/commit/b171f667f3787946a8ba9644305339e93ae799c9),
+      // a task SIGKILLed in a signal-delivery-stop (e.g. the SIGTRAP of a
+      // single-step) can exit without stopping at PTRACE_EVENT_EXIT.
+      int flags = (km.flags() & ~MAP_GROWSDOWN) | MAP_ANONYMOUS | MAP_FIXED;
+      remote.infallible_mmap_syscall_if_alive(km.start(), km.size(), km.prot(),
+                                              flags, -1, 0);
+      bool ok = true;
+      t->write_mem(km.start().cast<uint8_t>(), buf.data(), buf.size(), &ok);
+      // The write fails only if the task has died and its memory is already
+      // gone.
+      ASSERT(t, ok || t->is_exiting())
+          << "Failed to write back the contents of " << km;
       if (!t->vm()->has_mapping(km.start() - page_size())) {
-        // Unmap an extra page at the start; this seems to be necessary
-        // to properly wipe out the growsdown mapping. Doing it as a separate
-        // munmap call also seems to be necessary.
-        remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
-                                  km.start() - page_size(), page_size());
+        // Before Linux 4.12, the lowest page of a MAP_GROWSDOWN mapping is a
+        // guard page that /proc/<pid>/maps doesn't show, and touching it
+        // makes the kernel grow the mapping by a page. AddressSpace includes
+        // that page in the stack, so after we read the stack above, the
+        // mapping starts a page below km. The mmap leaves that page as a
+        // separate MAP_GROWSDOWN mapping, so unmap it. Since
+        // https://github.com/torvalds/linux/commit/1be7107fbe18eed3e319a6c3e83c78254b693acb
+        // the kernel keeps a gap below the stack instead, and nothing is
+        // mapped here.
+        remote.infallible_syscall_if_alive(syscall_number_for_munmap(remote.arch()),
+                                           km.start() - page_size(), page_size());
       }
-      remote.infallible_mmap_syscall_if_alive(km.start(), km.size(), km.prot(), flags,
-                                              -1, 0);
-      t->write_mem(km.start().cast<uint8_t>(), buf.data(), buf.size());
     }
   }
 
@@ -6588,8 +6618,11 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
   }
 
   // Patch LD_PRELOAD and VDSO after saving the mappings. Replay will apply
-  // patches to the saved mappings.
-  t->vm()->monkeypatcher().patch_after_exec(t);
+  // patches to the saved mappings. A task that has died never runs again,
+  // so it doesn't need them.
+  if (!t->is_exiting()) {
+    t->vm()->monkeypatcher().patch_after_exec(t);
+  }
 
   init_scratch_memory(t, FIXED_ADDRESS);
 }
