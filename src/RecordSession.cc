@@ -2076,11 +2076,17 @@ bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
       if (t->vm()->monkeypatcher().try_patch_syscall(t, true, should_retry)) {
         // Syscall was patched. Emit event and continue execution.
         t->record_event(Event::patch_syscall());
+        if (t->is_exiting()) {
+          // The task was killed while we patched it. Don't resume it out of
+          // its PTRACE_EVENT_EXIT stop.
+          step_state->continue_type = DONT_CONTINUE;
+        }
         return true;
       }
-      if (!t->is_stopped()) {
-        // task exited while we were trying to patch it.
-        // Make sure that this exit event gets processed
+      if (t->is_exiting()) {
+        // The task was killed while we were trying to patch it. It's not
+        // stopped, or it's in its PTRACE_EVENT_EXIT stop. Make sure that this
+        // exit event gets processed.
         step_state->continue_type = DONT_CONTINUE;
         return false;
       }

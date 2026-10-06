@@ -1636,6 +1636,7 @@ set(TESTS_WITH_PROGRAM
   overflow_branch_counter
   pack
   patch_page_end
+  patch_syscall_killed_task
   x86/patch_40_80_f6_81
   x86/patch_pc_rel
   prctl_tsc
@@ -1792,6 +1793,7 @@ set(TESTS_WITHOUT_PROGRAM
   pack_dir
   parent_no_break_child_bkpt
   parent_no_stop_child_crash
+  patch_syscall_killed_task_patching
   personality_chaos
   post_exec_fpu_regs
   proc_maps

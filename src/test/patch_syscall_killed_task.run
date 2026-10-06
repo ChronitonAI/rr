@@ -1,0 +1,17 @@
+source `dirname $0`/util.sh
+# rr only patches syscall instructions when the syscallbuf is enabled.
+skip_if_no_syscall_buf
+# 32-bit glibc makes its syscalls through __kernel_vsyscall, which earlier
+# syscalls have already patched (e.g. set_robust_list in fork()'s child), so
+# _exit()'s exit_group never gets to the patching code.
+skip_if_test_32_bit
+skip_if_rr_32_bit
+# Make rr SIGKILL the child when it's about to take it out of its
+# exit_group syscall to patch the syscall instruction.
+RR_KILL_TASK_AT_SYSCALL_PATCH=exit_group record $TESTNAME
+replay
+if ! grep -q "child was killed" record.out; then
+  failed ": the child wasn't killed"
+else
+  check EXIT-SUCCESS
+fi
