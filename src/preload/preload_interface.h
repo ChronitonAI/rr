@@ -517,6 +517,15 @@ struct rrcall_init_preload_params {
     };
   };
   PTR(void) syscallbuf_syscall_hook;
+  /* The functions that the syscallbuf code calls to check that it can access
+   * tracee memory (see raw_syscall.S) are in [memory_checks_start,
+   * memory_checks_end). When an access in one of them faults, rr moves the ip
+   * to memory_check_failed, which returns 0, unless replay wouldn't fault
+   * there (a SIGBUS, or a protection key fault). Then rr skips the access
+   * instead, or aborts if the function checks a string. */
+  PTR(void) memory_checks_start;
+  PTR(void) memory_checks_end;
+  PTR(void) memory_check_failed;
 };
 
 /**

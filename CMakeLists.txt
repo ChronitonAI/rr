@@ -1465,6 +1465,8 @@ set(BASIC_TESTS
   syscall_in_writable_mem
   syscall_restart_in_writable_mem
   syscallbuf_breakpoint_race
+  syscallbuf_efault
+  syscallbuf_efault_stashed_signal
   syscallbuf_signal_reset
   syscallbuf_signal_blocking
   syscallbuf_sigstop
