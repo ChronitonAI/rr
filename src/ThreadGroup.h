@@ -73,6 +73,11 @@ public:
   // thread doesn't. The emulated stops of the threads don't tell us this: we
   // use GROUP_STOP for some ptrace stops too.
   int stopping_signal;
+  // During recording: the stopping signal of a group-stop of this process
+  // that the real parent hasn't waited for yet, or 0. This is Linux's
+  // group_exit_code: it's set when a stop starts (not again while the
+  // process is stopped), and cleared by the real parent's wait or a SIGCONT.
+  int stop_report_signal;
 
 private:
   ThreadGroup(const ThreadGroup&) = delete;

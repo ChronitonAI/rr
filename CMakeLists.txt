@@ -1302,6 +1302,7 @@ set(BASIC_TESTS
   ptrace_exec
   x86/ptrace_exec32
   ptrace_group_stop
+  ptrace_group_stop_real_parent
   ptrace_interrupt_syscall
   ptrace_kill_grandtracee
   ptrace_resume_signal_ignored

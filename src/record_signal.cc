@@ -770,6 +770,7 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
     // or not the signal is delivered (a ptracer may suppress it, or the
     // process may ignore it). See prepare_signal() in kernel/signal.c.
     t->thread_group()->stopping_signal = 0;
+    t->thread_group()->stop_report_signal = 0;
   }
 
   if (t->emulate_ptrace_stop(WaitStatus::for_stop_sig(sig), si)) {
