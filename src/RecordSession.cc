@@ -1124,6 +1124,7 @@ static void maybe_trigger_emulated_ptrace_syscall_exit_stop(RecordTask* t) {
     // syscall.
     t->emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGTRAP), SIGNAL_DELIVERY_STOP, nullptr,
                            SI_KERNEL);
+    t->emulated_stop_holds_signal = true;
   }
 }
 

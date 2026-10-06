@@ -736,6 +736,11 @@ public:
   // true if this task needs to send a SIGCHLD to its parent for its
   // emulated stop
   bool emulated_SIGCHLD_pending;
+  // True if the emulated stop is a signal-delivery-stop for a signal that
+  // the task has dequeued (or Linux would have), which the ptracer may pass
+  // on or suppress. Other emulated stops that we label SIGNAL_DELIVERY_STOP
+  // (the group-stops of a tracee that wasn't seized) hold no signal.
+  bool emulated_stop_holds_signal;
   // tracer attached via PTRACE_SEIZE
   bool emulated_ptrace_seized;
   WaitType in_wait_type;

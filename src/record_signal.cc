@@ -774,6 +774,7 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
   }
 
   if (t->emulate_ptrace_stop(WaitStatus::for_stop_sig(sig), si)) {
+    t->emulated_stop_holds_signal = true;
     // Record an event so that replay progresses the tracee to the
     // current point before we notify the tracer.
     // If the signal is deterministic, record it as an EV_SIGNAL so that
