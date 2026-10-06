@@ -305,6 +305,17 @@ bool Scheduler::is_task_runnable(RecordTask* t, WaitAggregator& wait_aggregator,
   }
 
   LOGM(debug) << "Task event is " << t->ev();
+  if (t->ptrace_request_waiting_for != TaskUid()) {
+    RecordTask* tracee = session.find_task(t->ptrace_request_waiting_for);
+    if (tracee && t->must_wait_for_tracee_to_stop(tracee)) {
+      // We stop the tracee when we look at it (in the emulated stop case
+      // below).
+      LOGM(debug) << "  " << t->tid << " is waiting for " << tracee->tid
+                  << " to stop";
+      return false;
+    }
+    t->ptrace_request_waiting_for = TaskUid();
+  }
   if (!t->may_be_blocked() && (t->is_stopped() || t->was_reaped())) {
     LOGM(debug) << "  " << t->tid << " isn't blocked";
     if (t->schedule_frozen) {
@@ -346,13 +357,26 @@ bool Scheduler::is_task_runnable(RecordTask* t, WaitAggregator& wait_aggregator,
         LOGM(debug) << "  ... but it died";
         return true;
       }
+      if (t->emulated_ptracer && t->has_unprocessed_stop_in_syscall()) {
+        // We collected this stop earlier but didn't process it. Process it
+        // now, as below, so that the task's ptracer can use it (see
+        // RecordTask::must_wait_for_tracee_to_stop). We won't resume the
+        // task.
+        LOGM(debug) << "  but it has an unprocessed stop";
+        return true;
+      }
       if (t->is_stopped()) {
         return false;
       }
       // If we're not stopped, we need to get to the stop.
       // AFAIK we can only get here with group stops, which are eagerly applied
-      // to every task in the group. If I'm wrong, die here.
-      ASSERT(t, t->emulated_stop_type == GROUP_STOP);
+      // to every task in the group, and PTRACE_INTERRUPT stops. (For a
+      // tracee that wasn't seized, a group stop is a SIGNAL_DELIVERY_STOP.)
+      // If I'm wrong, die here.
+      ASSERT(t, t->emulated_stop_type == GROUP_STOP ||
+                    (t->emulated_stop_type == SIGNAL_DELIVERY_STOP &&
+                     !t->emulated_ptrace_seized))
+          << "Emulated stop type " << t->emulated_stop_type;
       LOGM(debug) << "  interrupting and waiting";
       t->do_ptrace_interrupt();
       // Wait on the task to get the kernel to kick it into the group stop.

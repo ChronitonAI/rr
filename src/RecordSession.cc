@@ -2086,6 +2086,27 @@ bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
       }
     }
 
+    if (RecordTask* tracee = t->ptrace_request_tracee_to_stop(syscall_arch)) {
+      // Don't let a ptrace request see a tracee that isn't really stopped
+      // yet; it would read its registers, for example. Back out of the
+      // syscall, so that |t| makes it again, and record that as we do for a
+      // syscall we patch. The scheduler doesn't run |t| until it has stopped
+      // the tracee.
+      LOG(debug) << "  waiting for " << tracee->tid << " to stop";
+      if (!t->exit_syscall_and_prepare_restart(syscall_arch)) {
+        step_state->continue_type = DONT_CONTINUE;
+        return false;
+      }
+      t->record_event(Event::patch_syscall());
+      t->ptrace_request_waiting_for = tracee->tuid();
+      // Make sure the scheduler looks at the tracee soon, whatever its
+      // priority.
+      scheduler().schedule_one_round_robin(t);
+      last_task_switchable = ALLOW_SWITCH;
+      step_state->continue_type = DONT_CONTINUE;
+      return true;
+    }
+
     t->push_event(SyscallEvent(t->regs().original_syscallno(), syscall_arch));
     t->ev().Syscall().should_retry_patch = should_retry;
   }

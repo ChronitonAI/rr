@@ -363,6 +363,23 @@ public:
    */
   bool may_be_blocked() const;
   /**
+   * Returns true if we've collected a stop of this task, which is blocked in
+   * a syscall, but haven't processed it yet: the syscall-exit stop of its
+   * syscall, or the stop after we interrupted it.
+   */
+  bool has_unprocessed_stop_in_syscall() const;
+  /**
+   * Returns true if a ptrace request of ours that needs |tracee| to be
+   * stopped has to wait: |tracee| is in an emulated stop, but we haven't
+   * stopped it yet (or haven't processed its stop yet).
+   */
+  bool must_wait_for_tracee_to_stop(RecordTask* tracee);
+  /**
+   * If we're entering a ptrace request that needs the tracee to be stopped,
+   * and it has to wait for that, return the tracee.
+   */
+  RecordTask* ptrace_request_tracee_to_stop(SupportedArch syscall_arch);
+  /**
    * Returns true if it looks like this task has been spinning on an atomic
    * access/lock.
    */
@@ -696,6 +713,9 @@ public:
   // Task for which we're emulating ptrace of this task, or null
   RecordTask* emulated_ptracer;
   std::set<RecordTask*> emulated_ptrace_tracees;
+  // The tracee that a ptrace request of ours waits for, to stop (see
+  // RecordSession::process_syscall_entry).
+  TaskUid ptrace_request_waiting_for;
   uintptr_t emulated_ptrace_event_msg;
   // Saved emulated-ptrace signals
   std::vector<siginfo_t> saved_ptrace_siginfos;

@@ -1697,6 +1697,52 @@ bool RecordTask::may_be_blocked() const {
          waiting_for_ptrace_exit;
 }
 
+bool RecordTask::has_unprocessed_stop_in_syscall() const {
+  // A ptrace event stop in the middle of a syscall (PTRACE_EVENT_EXIT, for
+  // example) is one that we hold the task at after processing it.
+  return is_stopped() && EV_SYSCALL == ev().type() &&
+         PROCESSING_SYSCALL == ev().Syscall().state &&
+         !emulated_stop_code.ptrace_event() &&
+         (status().is_syscall() || status().group_stop());
+}
+
+bool RecordTask::must_wait_for_tracee_to_stop(RecordTask* tracee) {
+  // A task in an emulated stop may still be running, or blocked in a
+  // syscall: we put every thread of a process in a group stop when one of
+  // them dequeues the stopping signal, and a PTRACE_INTERRUPT puts the
+  // tracee in a stop right away. The scheduler interrupts such a task when
+  // it next looks at it, and processes the stop that ends its syscall
+  // (Scheduler::is_task_runnable). It may have collected that stop earlier
+  // without processing it.
+  return tracee->emulated_ptracer == this &&
+         tracee->emulated_stop_type != NOT_STOPPED &&
+         (!tracee->is_stopped() || tracee->has_unprocessed_stop_in_syscall()) &&
+         !tracee->seen_ptrace_exit_event() && !tracee->was_reaped();
+}
+
+RecordTask* RecordTask::ptrace_request_tracee_to_stop(
+    SupportedArch syscall_arch) {
+  if (!is_ptrace_syscall(regs().original_syscallno(), syscall_arch)) {
+    return nullptr;
+  }
+  switch ((int)regs().arg1_signed()) {
+    case PTRACE_TRACEME:
+    case PTRACE_ATTACH:
+    case PTRACE_SEIZE:
+    case PTRACE_KILL:
+    case PTRACE_INTERRUPT:
+      // Linux doesn't need the tracee to be stopped for these.
+      return nullptr;
+    default:
+      break;
+  }
+  RecordTask* tracee = session().find_task((pid_t)regs().arg2_signed());
+  if (!tracee || !must_wait_for_tracee_to_stop(tracee)) {
+    return nullptr;
+  }
+  return tracee;
+}
+
 bool RecordTask::maybe_in_spinlock() {
   return time_at_start_of_last_timeslice == session().trace_writer().time() &&
          regs().matches(registers_at_start_of_last_timeslice);

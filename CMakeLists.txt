@@ -1304,6 +1304,8 @@ set(BASIC_TESTS
   ptrace_group_stop
   ptrace_kill_grandtracee
   x86/ptrace_tls
+  ptrace_regs_blocked_tracee
+  ptrace_regs_tracer_sigcont
   ptrace_seize
   ptrace_sigchld
   ptrace_sigchld_blocked
