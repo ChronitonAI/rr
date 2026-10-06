@@ -1145,6 +1145,7 @@ set(BASIC_TESTS
   x86/hle
   x86/hlt
   ignored_signal_restart_race
+  ignored_signals_eintr
   inotify
   int3
   intr_futex_wait_restart

@@ -1279,6 +1279,12 @@ void RecordSession::syscall_state_changed(RecordTask* t,
       int syscallno = t->ev().Syscall().number;
       intptr_t retval = t->regs().syscall_result_signed();
 
+      if (retval == -EINTR && rec_restart_after_spurious_EINTR(t)) {
+        retval = t->regs().syscall_result_signed();
+      }
+      t->had_emulated_ptracer_since_syscall_exit =
+          t->emulated_ptracer != nullptr;
+
       if (t->desched_rec()) {
         // If we enabled the desched event above, disable it.
         disarm_desched_event(t);

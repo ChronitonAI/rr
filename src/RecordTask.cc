@@ -20,6 +20,7 @@
 #include "kernel_metadata.h"
 #include "log.h"
 #include "record_signal.h"
+#include "record_syscall.h"
 #include "rr/rr.h"
 #include "util.h"
 
@@ -169,6 +170,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       stable_exit(false),
       detached_proxy(false),
       emulated_ptracer(nullptr),
+      had_emulated_ptracer_since_syscall_exit(false),
       emulated_ptrace_event_msg(0),
       emulated_ptrace_options(0),
       emulated_ptrace_cont_command(0),
@@ -829,6 +831,7 @@ void RecordTask::set_emulated_ptracer(RecordTask* tracer) {
     ASSERT(this, !emulated_ptracer);
     emulated_ptracer = tracer;
     emulated_ptracer->emulated_ptrace_tracees.insert(this);
+    had_emulated_ptracer_since_syscall_exit = true;
   } else {
     ASSERT(this, emulated_ptracer);
     ASSERT(this,
@@ -1157,6 +1160,7 @@ static pid_t get_ppid(pid_t pid) {
 
 void RecordTask::apply_group_stop(int sig) {
   if (emulated_stop_type == NOT_STOPPED) {
+    rec_note_stop(this);
     LOG(debug) << "setting " << tid << " to GROUP_STOP due to signal " << sig;
     WaitStatus status = WaitStatus::for_group_sig(sig, this);
     if (!emulate_ptrace_stop(status)) {
@@ -1210,6 +1214,68 @@ bool RecordTask::has_any_actionable_signal() {
   char* end3;
   uint64_t mask_blk = strtoull(sig_strs[2].c_str(), &end3, 16);
   return !*end1 && !*end2 && !*end3 && ((mask1 | mask2) & ~mask_blk);
+}
+
+bool RecordTask::only_spurious_signals_pending() {
+  if (has_stashed_sig()) {
+    // A signal that we've stashed isn't in SigPnd or ShdPnd, and natively it
+    // may still be pending. So we return false.
+    return false;
+  }
+  auto sig_strs = read_proc_status_fields(tid, "SigPnd", "ShdPnd", "SigBlk");
+  if (sig_strs.size() < 3) {
+    return false;
+  }
+  char* end1;
+  sig_set_t pending = strtoull(sig_strs[0].c_str(), &end1, 16);
+  char* end2;
+  sig_set_t shared_pending = strtoull(sig_strs[1].c_str(), &end2, 16);
+  char* end3;
+  sig_set_t blocked = strtoull(sig_strs[2].c_str(), &end3, 16);
+  if (*end1 || *end2 || *end3) {
+    return false;
+  }
+  pending &= ~blocked;
+  shared_pending &= ~blocked;
+  if (!pending && !shared_pending) {
+    // Something else woke us up: a stop, a PTRACE_INTERRUPT, the freezer, or
+    // a signal that another thread took. We can't tell which.
+    return false;
+  }
+  if (shared_pending && thread_group()->task_set().size() > 1) {
+    // Whether Linux would have discarded a signal sent to our process that we
+    // ignore depends on the mask of the thread that kill() names (the leader,
+    // for a process ID), which we can't tell.
+    return false;
+  }
+  for (int sig = 1; sig <= 64; ++sig) {
+    if (!((pending | shared_pending) & signal_bit(sig))) {
+      continue;
+    }
+    if (sig == PerfCounters::TIME_SLICE_SIGNAL ||
+        sig == session().syscallbuf_desched_sig()) {
+      continue;
+    }
+    // Linux discards a signal that we ignore when it's sent, unless we're
+    // traced (sig_ignored()). If we're a pid namespace's init, it also
+    // discards one whose handler is SIG_DFL, other than SIGKILL and SIGSTOP
+    // (sig_task_ignored()). A ptracer can send it and then exit, or detach
+    // at our syscall-entry stop, even before rr has processed the entry of
+    // the syscall that we're in. So we check whether we've had a ptracer
+    // since rr last processed the exit of one of our syscalls. But a SIGCONT
+    // discards pending stop signals, and natively one of those may have
+    // woken us up.
+    bool discarded_when_sent =
+        is_sig_ignored(sig) ||
+        (is_container_init() && sig != SIGKILL && sig != SIGSTOP &&
+         sig_disposition(sig) == SIGNAL_DEFAULT);
+    if (!had_emulated_ptracer_since_syscall_exit && sig != SIGCONT &&
+        discarded_when_sent) {
+      continue;
+    }
+    return false;
+  }
+  return true;
 }
 
 void RecordTask::emulate_SIGCONT() {

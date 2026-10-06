@@ -232,6 +232,19 @@ public:
    */
   bool has_any_actionable_signal();
   /**
+   * Return true if signals that we don't block are pending for this thread,
+   * or for its process if it has no other thread, and none of them would
+   * have woken the thread up natively: they're rr's own signals, or signals
+   * other than SIGCONT that we ignore (or, if we're a pid namespace's init,
+   * whose handler is SIG_DFL, other than SIGKILL and SIGSTOP), which Linux
+   * queues only because rr traces us (unless we've had a ptracer of our own
+   * since rr last processed the exit of one of our syscalls). Return false
+   * if no such signal is pending, if one is pending for the process and it
+   * has another thread, if one is any other signal, or if we've stashed a
+   * signal.
+   */
+  bool only_spurious_signals_pending();
+  /**
    * True if the task is in an emulated group stop that SIGCONT ends, i.e.
    * a group stop of a task that has no (emulated) ptracer. For a traced task,
    * a group stop is a ptrace stop, and SIGCONT doesn't end ptrace stops (see
@@ -785,6 +798,9 @@ public:
 
   // Task for which we're emulating ptrace of this task, or null
   RecordTask* emulated_ptracer;
+  // True if this task has had an emulated ptracer since we last processed
+  // the exit of one of its syscalls (or since it was created).
+  bool had_emulated_ptracer_since_syscall_exit;
   std::set<RecordTask*> emulated_ptrace_tracees;
   uintptr_t emulated_ptrace_event_msg;
   // Saved emulated-ptrace signals
