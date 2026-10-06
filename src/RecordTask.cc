@@ -33,7 +33,7 @@ namespace rr {
  * the |refcount|s while they still refer to this.
  */
 struct Sighandler {
-  Sighandler() : resethand(false), takes_siginfo(false) {}
+  Sighandler() : resethand(false), takes_siginfo(false), nocldstop(false) {}
 
   template <typename Arch>
   void init_arch(const typename Arch::kernel_sigaction& ksa) {
@@ -42,12 +42,19 @@ struct Sighandler {
     memcpy(sa.data(), &ksa, sizeof(ksa));
     resethand = (ksa.sa_flags & SA_RESETHAND) != 0;
     takes_siginfo = (ksa.sa_flags & SA_SIGINFO) != 0;
+    nocldstop = (ksa.sa_flags & SA_NOCLDSTOP) != 0;
   }
 
-  template <typename Arch> void reset_arch() {
+  /**
+   * Reset to SIG_DFL, or to SIG_IGN if |ignore|, with no flags.
+   */
+  template <typename Arch> void reset_arch(bool ignore) {
     typename Arch::kernel_sigaction ksa;
     memset(&ksa, 0, sizeof(ksa));
     DEBUG_ASSERT(uintptr_t(SIG_DFL) == 0);
+    if (ignore) {
+      ksa.k_sa_handler = remote_ptr<void>(uintptr_t(SIG_IGN));
+    }
     init_arch<Arch>(ksa);
   }
 
@@ -75,10 +82,12 @@ struct Sighandler {
   vector<uint8_t> sa;
   bool resethand;
   bool takes_siginfo;
+  bool nocldstop;
 };
 
-static void reset_handler(Sighandler* handler, SupportedArch arch) {
-  RR_ARCH_FUNCTION(handler->reset_arch, arch);
+static void reset_handler(Sighandler* handler, SupportedArch arch,
+                          bool ignore = false) {
+  RR_ARCH_FUNCTION(handler->reset_arch, arch, ignore);
 }
 
 struct Sighandlers {
@@ -123,23 +132,18 @@ struct Sighandlers {
 
   /**
    * For each signal in |table| such that is_user_handler() is
-   * true, reset the disposition of that signal to SIG_DFL, and
-   * clear the resethand flag if it's set.  SIG_IGN signals are
-   * not modified.
+   * true, reset the disposition of that signal to SIG_DFL. SIG_IGN
+   * signals stay ignored. Clear the flags of all signals.
    *
    * (After an exec() call copies the original sighandler table,
    * this is the operation required by POSIX to initialize that
-   * table copy.)
+   * table copy. Linux clears the flags too: see
+   * flush_signal_handlers().)
    */
   void reset_user_handlers(SupportedArch arch) {
     for (int i = 0; i < ssize_t(array_length(handlers)); ++i) {
       Sighandler& h = handlers[i];
-      // If the handler was a user handler, reset to
-      // default.  If it was SIG_IGN or SIG_DFL,
-      // leave it alone.
-      if (h.disposition() == SIGNAL_HANDLER) {
-        reset_handler(&h, arch);
-      }
+      reset_handler(&h, arch, h.disposition() == SIGNAL_IGNORE);
     }
   }
 
@@ -845,6 +849,14 @@ void RecordTask::force_emulate_ptrace_stop(WaitStatus status, EmulatedStopType s
   emulated_stop_type = stop_type;
   emulated_stop_code = status;
   emulated_stop_pending = true;
+  if (status.type() != WaitStatus::EXIT &&
+      status.type() != WaitStatus::FATAL_SIGNAL &&
+      !emulated_ptracer->wants_SIGCHLD_for_stop()) {
+    // Linux sends no SIGCHLD for a ptrace stop then either, but it still
+    // wakes the ptracer's waits (do_notify_parent_cldstop()).
+    emulated_ptracer->kick_out_of_wait_for(this);
+    return;
+  }
   emulated_ptrace_SIGCHLD_pending = true;
 
   emulated_ptracer->send_synthetic_SIGCHLD_if_necessary();
@@ -1093,6 +1105,11 @@ void RecordTask::kick_out_of_syscall() {
   ASSERT(this, ret == 0);
 }
 
+bool RecordTask::wants_SIGCHLD_for_stop() const {
+  const Sighandler& h = sighandlers->get(SIGCHLD);
+  return !h.nocldstop && h.disposition() != SIGNAL_IGNORE;
+}
+
 static bool is_synthetic_SIGCHLD(const siginfo_t& si) {
   return si.si_signo == SIGCHLD && si.si_value.sival_int == SIGCHLD_SYNTHETIC;
 }
@@ -1325,16 +1342,26 @@ void RecordTask::end_process_stop_for_SIGCONT() {
 
 void RecordTask::notify_parent_of_stop_or_continue(int code, int status) {
   RecordTask* parent = session().find_task(get_parent_pid());
-  if (parent) {
-    parent->send_child_stop_SIGCHLD(this, code, status);
+  if (!parent) {
+    return;
   }
+  if (!parent->wants_SIGCHLD_for_stop()) {
+    // Linux sends no SIGCHLD then, but it still wakes the parent's waits
+    // (do_notify_parent_cldstop()).
+    parent->kick_out_of_wait_for(this);
+    return;
+  }
+  parent->send_child_stop_SIGCHLD(this, code, status);
 }
 
 void RecordTask::signal_delivered(int sig) {
   bool needs_SIGCHLD = true;
   Sighandler& h = sighandlers->get(sig);
   if (h.resethand) {
+    // Linux only resets the handler, so SA_NOCLDSTOP stays.
+    bool nocldstop = h.nocldstop;
     reset_handler(&h, arch());
+    h.nocldstop = nocldstop;
   }
 
   if (is_sig_stopping(sig)) {
