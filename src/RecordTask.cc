@@ -1030,9 +1030,16 @@ void RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
     }
   }
 
-  from_task->set_siginfo_for_waited_task<NativeArch>(
-      reinterpret_cast<NativeArch::siginfo_t*>(si));
-  si->si_value.sival_int = 0;
+  // This overwrites the SIGCHLD_SYNTHETIC in si_value: si_status is at the
+  // same place.
+  auto native_si = reinterpret_cast<NativeArch::siginfo_t*>(si);
+  from_task->set_siginfo_for_waited_task<NativeArch>(native_si);
+  if (native_si->si_code == CLD_STOPPED || native_si->si_code == CLD_TRAPPED) {
+    // waitid() reports the whole stop code for a ptrace event or syscall
+    // stop, but a SIGCHLD has just the signal (do_notify_parent_cldstop()).
+    native_si->_sifields._sigchld.si_status_ =
+        from_task->emulated_stop_code.ptrace_signal();
+  }
 }
 
 bool RecordTask::is_waiting_for_ptrace(RecordTask* t) {
