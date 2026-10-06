@@ -1477,6 +1477,7 @@ set(BASIC_TESTS
   vdso_parts
   vdso_symbols
   vfork_done
+  vfork_exec_map_over_buffers
   vfork_flush
   vfork_setopts
   vfork_shared
