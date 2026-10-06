@@ -176,6 +176,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       held_at_emulated_ptrace_event(false),
       emulated_ptrace_SIGCHLD_pending(false),
       emulated_SIGCHLD_pending(false),
+      emulated_stop_holds_signal(false),
       emulated_ptrace_seized(false),
       in_wait_type(WAIT_TYPE_NONE),
       in_wait_pid(0),
@@ -839,6 +840,8 @@ void RecordTask::force_emulate_ptrace_stop(WaitStatus status, EmulatedStopType s
   emulated_stop_type = stop_type;
   emulated_stop_code = status;
   emulated_stop_pending = true;
+  // Callers that report a dequeued signal set this afterwards.
+  emulated_stop_holds_signal = false;
   emulated_ptrace_SIGCHLD_pending = true;
 
   emulated_ptracer->send_synthetic_SIGCHLD_if_necessary();
@@ -877,6 +880,14 @@ void RecordTask::detach_emulated_ptrace_tracees() {
     bool resume =
         t->held_at_emulated_ptrace_event && !t->seen_ptrace_exit_event();
     bool stop_again = t->should_stop_again_after_ptrace_detach();
+    // Linux delivers the signal of a signal-delivery-stop that the ptracer
+    // hasn't waited for (only its wait clears the signal).
+    int undelivered_sig = 0;
+    if (t->emulated_stop_type == SIGNAL_DELIVERY_STOP &&
+        t->emulated_stop_holds_signal && t->emulated_stop_pending &&
+        !t->seen_ptrace_exit_event()) {
+      undelivered_sig = t->emulated_stop_code.stop_sig();
+    }
     t->emulated_ptracer = nullptr;
     t->emulated_ptrace_seized = false;
     t->emulated_ptrace_options = 0;
@@ -887,6 +898,14 @@ void RecordTask::detach_emulated_ptrace_tracees() {
     }
     t->emulated_stop_pending = false;
     t->emulated_stop_type = NOT_STOPPED;
+    if (undelivered_sig) {
+      // As prepare_ptrace_cont does for a PTRACE_CONT with a signal.
+      siginfo_t si = t->take_ptrace_signal_siginfo(undelivered_sig);
+      t->push_event(Event(EV_SIGNAL,
+                          SignalEvent(si, NONDETERMINISTIC_SIG,
+                                      t->sig_resolved_disposition(
+                                          si.si_signo, NONDETERMINISTIC_SIG))));
+    }
     if (resume) {
       t->resume_execution(RESUME_SYSCALL, RESUME_NONBLOCKING, RESUME_NO_TICKS);
     }

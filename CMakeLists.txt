@@ -1328,6 +1328,7 @@ set(BASIC_TESTS
   ptracer_death_leader
   ptracer_death_multithread
   ptracer_death_multithread_peer
+  ptracer_death_signal
   ptracer_death_syscall_stop
   # pivot_root ... disabled because it fails when run as root and does nothing otherwise
   quotactl

@@ -3782,9 +3782,17 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
     new_task->emulated_ptrace_options = t->emulated_ptrace_options;
     t->emulated_ptrace_event_msg = new_task->rec_tid;
     t->emulate_ptrace_stop(WaitStatus::for_ptrace_event(ptrace_event));
-    // ptrace(2) man page says that SIGSTOP is used here, but it's really
-    // SIGTRAP (in 4.4.4-301.fc23.x86_64 anyway).
-    new_task->apply_group_stop(SIGTRAP);
+    if (new_task->emulated_ptrace_seized) {
+      // A seized child starts with a PTRACE_EVENT_STOP, which reports
+      // SIGTRAP.
+      new_task->apply_group_stop(SIGTRAP);
+    } else {
+      // Linux queues a SIGSTOP for any other child (ptrace_init_task()), so
+      // it starts with the signal-delivery-stop of that SIGSTOP.
+      new_task->emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGSTOP),
+                                    SIGNAL_DELIVERY_STOP, nullptr, SI_USER);
+      new_task->emulated_stop_holds_signal = true;
+    }
     switchable = ALLOW_SWITCH;
   }
 
