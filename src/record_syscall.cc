@@ -3555,10 +3555,89 @@ static void prepare_mmap_register_params(RecordTask* t) {
 }
 
 enum ScratchAddrType { FIXED_ADDRESS, DYNAMIC_ADDRESS };
-/* Pointer used when running RR in WINE. Memory below this address is
-   unmapped by WINE immediately after exec, so start the scratch buffer
-   here. */
-static const uintptr_t FIXED_SCRATCH_PTR = 0x68000000;
+
+/**
+ * Whether reading `t`'s /proc/<tid>/maps could deadlock because t or another
+ * task in its thread group is in execve.
+ */
+static bool maps_read_may_deadlock(Task* t) {
+  RecordTask* rt = static_cast<RecordTask*>(t);
+  return (rt->ev().is_syscall_event() && rt->ev().Syscall().is_exec()) ||
+         AddressSpace::thread_group_in_exec(t);
+}
+
+/**
+ * If a task dies during our remote mmap, the mapping may or may not have been
+ * created; when it was, we never got to see where the kernel put it. Look for
+ * a range of `size` bytes with protection `prot` that the kernel has an
+ * anonymous mapping for but our AddressSpace doesn't. Returns its start if
+ * there's exactly one such range, otherwise null (also if we can't read the
+ * maps).
+ */
+static remote_ptr<void> find_unrecorded_anonymous_mapping(RecordTask* t,
+                                                          size_t size,
+                                                          int prot) {
+  if (AddressSpace::thread_group_in_exec(t)) {
+    // Another thread's exec killed t. Reading t's maps now could deadlock,
+    // and the address space is about to be replaced anyway.
+    return nullptr;
+  }
+  // Read the maps through another task using the address space if we can.
+  // t's mm may already be gone: before Linux 5.17 (commit b171f667f378), a
+  // SIGKILL that arrives while a task is in a signal-delivery-stop (e.g. the
+  // SIGTRAP of a single-step) doesn't leave it in a PTRACE_EVENT_EXIT stop
+  // we can rely on, so it can get through exit_mm() before we look.
+  vector<Task*> readers;
+  for (Task* tt : t->vm()->task_set()) {
+    if (tt != t && !tt->is_exiting() && !tt->already_exited() &&
+        !maps_read_may_deadlock(tt)) {
+      readers.push_back(tt);
+    }
+  }
+  readers.push_back(t);
+  vector<KernelMapping> kernel_maps;
+  for (Task* reader : readers) {
+    bool ok;
+    for (KernelMapIterator it(reader, &ok); !it.at_end(); ++it) {
+      kernel_maps.push_back(it.current());
+    }
+    if (!kernel_maps.empty()) {
+      break;
+    }
+    // A task whose mm is gone has no mappings. Try the next one.
+  }
+
+  remote_ptr<void> found;
+  int found_count = 0;
+  for (const KernelMapping& km : kernel_maps) {
+    if (km.prot() != prot || !km.fsname().empty() || km.inode()) {
+      continue;
+    }
+    // Look at the parts of km our AddressSpace doesn't have. The kernel may
+    // have merged the new mapping with an adjacent one we know about, and
+    // a mapping of ours may span several of the kernel's.
+    remote_ptr<void> gap_start = km.start();
+    for (const auto& m : t->vm()->maps_containing_or_after(km.start())) {
+      if (m.map.start() >= km.end()) {
+        break;
+      }
+      if (m.map.start() > gap_start && m.map.start() - gap_start == (ssize_t)size) {
+        found = gap_start;
+        ++found_count;
+      }
+      gap_start = max(gap_start, m.map.end());
+    }
+    if (gap_start < km.end() && km.end() - gap_start == (ssize_t)size) {
+      found = gap_start;
+      ++found_count;
+    }
+  }
+  if (found_count != 1) {
+    LOG(debug) << "Found " << found_count << " candidate mappings";
+    return nullptr;
+  }
+  return found;
+}
 
 /**
  * This is purely for testing purposes. See RRCALL_KILL_BEFORE_CLONE_SCRATCH,
@@ -3590,26 +3669,40 @@ static void init_scratch_memory(RecordTask* t,
   // segment, we could remove this hack.
   int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
   int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+  remote_ptr<void> scratch_ptr;
   {
     /* initialize the scratchpad for blocking system calls */
     AutoRemoteSyscalls remote(t);
 
     if (addr_type == DYNAMIC_ADDRESS) {
       maybe_kill_task_at_scratch(t, RRCALL_KILL_BEFORE_CLONE_SCRATCH);
-      t->scratch_ptr = remote.infallible_mmap_syscall_if_alive(remote_ptr<void>(), sz,
-                                                               prot, flags, -1, 0);
+      scratch_ptr = remote.infallible_mmap_syscall_if_alive(remote_ptr<void>(), sz,
+                                                            prot, flags, -1, 0);
       if (maybe_kill_task_at_scratch(t, RRCALL_KILL_AFTER_CLONE_SCRATCH)) {
         // Act as if we hadn't seen the mmap's result.
-        t->scratch_ptr = nullptr;
+        scratch_ptr = nullptr;
+      }
+      if (scratch_ptr.is_null()) {
+        scratch_ptr = find_unrecorded_anonymous_mapping(t, sz, prot);
       }
     } else {
       maybe_kill_task_at_scratch(t, RRCALL_KILL_BEFORE_EXEC_SCRATCH);
-      t->scratch_ptr =
-          remote.infallible_mmap_syscall_if_alive(remote_ptr<void>(FIXED_SCRATCH_PTR),
-                                                  sz, prot, flags | MAP_FIXED, -1, 0);
+      scratch_ptr = remote.infallible_mmap_syscall_if_alive(
+          AddressSpace::exec_scratch_start(), sz, prot, flags | MAP_FIXED, -1, 0);
     }
-    t->scratch_size = scratch_size;
   }
+  if (scratch_ptr.is_null()) {
+    // The task was killed (e.g. by a SIGKILL, or because its pid namespace
+    // is being torn down) before the mmap took effect, so there's no scratch
+    // memory. Don't put a mapping that doesn't exist into our address space
+    // or the trace; replay sees that the trace has no scratch mapping here
+    // and doesn't create one either. (If the mmap did take effect, we
+    // record the mapping as usual, even though the task is dead.)
+    LOG(debug) << "Task " << t->tid << " died before we could map its scratch memory";
+    return;
+  }
+  t->scratch_ptr = scratch_ptr;
+  t->scratch_size = scratch_size;
 
   t->setup_preload_thread_locals();
 
