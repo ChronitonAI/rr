@@ -215,6 +215,16 @@ public:
    */
   bool has_any_actionable_signal();
   /**
+   * Return true if signals that we don't block are pending for this thread,
+   * or for its process if it has no other thread (if it has, any such signal
+   * pending for the process makes this return false), and none of them would
+   * have woken the thread up natively: they're rr's own signals, or signals
+   * other than SIGCONT that we ignore, which Linux queues only because rr
+   * traces us (when we have no ptracer of our own). Return false if we're in
+   * an emulated stop.
+   */
+  bool only_spurious_signals_pending();
+  /**
    * Get all threads out of an emulated GROUP_STOP
    */
   void emulate_SIGCONT();

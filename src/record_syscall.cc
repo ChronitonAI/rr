@@ -573,13 +573,18 @@ struct TaskSyscallState : TaskSyscallStateBase {
   /** Miscellaneous saved data that can be used by particular syscalls */
   vector<uint8_t> saved_data;
 
+  /** True if an emulated group stop has started while the task was in this
+   *  syscall. */
+  bool group_stop_during_syscall;
+
   TaskSyscallState()
       : t(nullptr),
         emulate_wait_for_child(nullptr),
         expect_errno(0),
         should_emulate_result(false),
         preparation_done(false),
-        scratch_enabled(false) {}
+        scratch_enabled(false),
+        group_stop_during_syscall(false) {}
 };
 
 template <typename Arch>
@@ -5749,6 +5754,94 @@ bool rec_return_normally_from_wait(RecordTask* t) {
     return true;
   }
   return false;
+}
+
+/**
+ * Returns true if Linux fails the syscall with EINTR, rather than restarting
+ * it, when any signal that the task doesn't block wakes it up, even one
+ * without a handler, and making the kernel restart it instead changes
+ * nothing else. That's not so with a timeout: Linux doesn't restart these
+ * syscalls itself, so a restart would wait for all of it again, and a stream
+ * of such signals could keep it from ever timing out. Nor with a signal mask
+ * (epoll_pwait, epoll_pwait2): the kernel would restore the task's own mask
+ * before it restarted the syscall, and could deliver a signal that only the
+ * syscall's mask blocks.
+ */
+template <typename Arch>
+static bool can_restart_after_EINTR_arch(int syscallno, const Registers& regs) {
+  switch (syscallno) {
+    case Arch::rt_sigtimedwait:
+    case Arch::rt_sigtimedwait_time64:
+      return !regs.arg3();
+    case Arch::epoll_wait:
+      return (int)regs.arg4_signed() < 0;
+    case Arch::epoll_pwait:
+      return (int)regs.arg4_signed() < 0 && !regs.arg5();
+    case Arch::epoll_pwait2:
+      return !regs.arg4() && !regs.arg5();
+    case Arch::semop:
+      return true;
+    case Arch::semtimedop:
+    case Arch::semtimedop_time64:
+      return !regs.arg4();
+    case Arch::ipc:
+      switch ((int)regs.arg1_signed()) {
+        case SEMOP:
+          return true;
+        case SEMTIMEDOP:
+          return !regs.arg6();
+        default:
+          return false;
+      }
+    default:
+      return false;
+  }
+}
+
+static bool can_restart_after_EINTR(SupportedArch arch, int syscallno,
+                                    const Registers& regs) {
+  RR_ARCH_FUNCTION(can_restart_after_EINTR_arch, arch, syscallno, regs);
+}
+
+bool rec_restart_after_spurious_EINTR(RecordTask* t) {
+  if (t->regs().original_syscallno() == SECCOMP_MAGIC_SKIP_ORIGINAL_SYSCALLNO ||
+      t->ev().Syscall().failed_during_preparation) {
+    // The syscall didn't run, e.g. the program's seccomp filter vetoed it.
+    return false;
+  }
+  auto syscall_state = TaskSyscallState::maybe_get(t);
+  if (!syscall_state) {
+    return false;
+  }
+  if (syscall_state->group_stop_during_syscall) {
+    // Natively, the stop would have woken the task up, even if it has ended
+    // by now.
+    return false;
+  }
+  if (!can_restart_after_EINTR(t->ev().Syscall().arch(),
+                               t->ev().Syscall().number,
+                               syscall_state->syscall_entry_registers) ||
+      !t->only_spurious_signals_pending()) {
+    return false;
+  }
+  // Natively, none of the signals pending now would have woken the task up
+  // (see RecordTask::only_spurious_signals_pending). So instead of EINTR,
+  // make the kernel restart the syscall, as it does for other syscalls, once
+  // we've dealt with those signals.
+  LOG(debug) << "  restarting "
+             << syscall_name(t->ev().Syscall().number, t->ev().Syscall().arch())
+             << ", which signals interrupted that wouldn't natively";
+  Registers r = t->regs();
+  r.set_syscall_result(-ERESTARTNOHAND);
+  t->set_regs(r);
+  return true;
+}
+
+void rec_note_group_stop(RecordTask* t) {
+  auto syscall_state = TaskSyscallState::maybe_get(t);
+  if (syscall_state) {
+    syscall_state->group_stop_during_syscall = true;
+  }
 }
 
 static void aarch64_kernel_bug_workaround(RecordTask *t,
