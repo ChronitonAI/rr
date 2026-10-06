@@ -628,6 +628,7 @@ static RecordTask* find_waited_task(RecordSession& session, pid_t tid, WaitStatu
     waited = session.find_detached_proxy_task(tid);
     if (!waited) {
       LOGM(debug) << "    ... but it's dead";
+      session.note_unknown_tracee_status(tid, status);
       if (status.ptrace_event() == PTRACE_EVENT_EXIT) {
         // A task we never heard about, e.g. one created by a clone() whose
         // caller was killed before it could report PTRACE_EVENT_CLONE. It

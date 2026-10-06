@@ -1592,6 +1592,7 @@ set(TESTS_WITH_PROGRAM
   exit_status
   x86/explicit_checkpoints
   fd_limit
+  fork_child_of_killed_parent
   fork_stress
   fork_syscalls
   function_calls

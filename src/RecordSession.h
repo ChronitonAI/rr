@@ -3,6 +3,7 @@
 #ifndef RR_RECORD_SESSION_H_
 #define RR_RECORD_SESSION_H_
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -185,6 +186,18 @@ public:
   RecordTask* find_task(const TaskUid& tuid) const;
   RecordTask* find_detached_proxy_task(pid_t proxy_tid) const;
 
+  /**
+   * We got `status` for `tid`, which isn't a task we know. Remember the tids
+   * of such tracees whose stops we dropped, until they're reaped.
+   */
+  void note_unknown_tracee_status(pid_t tid, WaitStatus status);
+  /**
+   * Whether we dropped a stop of the unknown tracee `tid`.
+   */
+  bool dropped_stop_of_unknown_tracee(pid_t tid) const {
+    return unknown_tracees_with_dropped_stops.count(tid) > 0;
+  }
+
   void on_proxy_detach(RecordTask *t, pid_t new_tid);
 
   /**
@@ -285,6 +298,10 @@ private:
    * Keeps track of detached tasks.
    */
   std::map<pid_t, RecordTask*> detached_task_map;
+  /**
+   * See note_unknown_tracee_status().
+   */
+  std::set<pid_t> unknown_tracees_with_dropped_stops;
 
   std::string output_trace_dir;
 

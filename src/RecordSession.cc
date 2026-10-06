@@ -2836,6 +2836,14 @@ RecordTask* RecordSession::find_detached_proxy_task(pid_t proxy_tid) const {
   return detached_task_map.end() != it ? it->second : nullptr;
 }
 
+void RecordSession::note_unknown_tracee_status(pid_t tid, WaitStatus status) {
+  if (status.reaped()) {
+    unknown_tracees_with_dropped_stops.erase(tid);
+  } else {
+    unknown_tracees_with_dropped_stops.insert(tid);
+  }
+}
+
 void RecordSession::on_proxy_detach(RecordTask *t, pid_t new_tid) {
   Session::on_destroy(t);
   task_map[new_tid] = t;

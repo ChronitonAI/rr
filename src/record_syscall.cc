@@ -95,6 +95,7 @@
 #include "SysCpuMonitor.h"
 #include "TraceStream.h"
 #include "VirtualPerfCounterMonitor.h"
+#include "WaitManager.h"
 #include "cpp_supplement.h"
 #include "ftrace.h"
 #include "kernel_abi.h"
@@ -3763,11 +3764,124 @@ static int ptrace_option_for_event(int ptrace_event) {
  * don't know about yet.
  */
 static bool is_new_tracee(RecordTask* t, pid_t tid) {
-  if (tid <= 0 || t->session().find_task(tid)) {
+  if (tid <= 0 || t->session().find_task(tid) ||
+      t->session().find_detached_proxy_task(tid) ||
+      t->session().dropped_stop_of_unknown_tracee(tid)) {
     return false;
   }
   auto tracer = read_proc_status_fields(tid, "TracerPid");
   return tracer.size() == 1 && atoi(tracer[0].c_str()) == getpid();
+}
+
+/**
+ * Whether `tid`, a tracee we don't know yet, can be a task that was just
+ * created: it's on its way to its first stop, or that stop is still pending
+ * in the kernel. If we've already collected a stop of it (and stashed it,
+ * see WaitManager::poll_stops(), or dropped it, see
+ * RecordSession::note_unknown_tracee_status()), it's an older tracee: we
+ * collect those stops only while scheduling, so not since the clone() that
+ * created the new task.
+ */
+static bool first_stop_is_pending(pid_t tid) {
+  // Look at the state before looking for a stop to collect, so that we can't
+  // miss a stop that happens in between.
+  auto state = read_proc_status_fields(tid, "State");
+  if (state.empty() || state[0].empty()) {
+    return false;
+  }
+  switch (state[0][0]) {
+    case 'Z':
+    case 'X':
+      return false;
+    case 't':
+    case 'T': {
+      WaitOptions stashed(tid);
+      stashed.can_perform_syscall = false;
+      stashed.consume = false;
+      if (WaitManager::wait_stop(stashed).code == WAIT_OK) {
+        return false;
+      }
+      WaitOptions options(tid);
+      options.block_seconds = 0;
+      options.consume = false;
+      return WaitManager::wait_stop(options).code == WAIT_OK;
+    }
+    default:
+      return true;
+  }
+}
+
+/**
+ * `t` was killed in clone()/fork()/vfork() before we could learn what it
+ * created: the kernel doesn't stop for PTRACE_EVENT_CLONE (etc) while a
+ * SIGKILL is pending, and a SIGKILL can also take `t` out of that stop before
+ * we read the new tid. A new thread dies with `t`. A child process survives,
+ * in the first stop of a new tracee, waiting for us. Returns its tid, or -1
+ * if there isn't exactly one such child.
+ * Until `t` finishes exiting, the child is in `t`'s list of children, unless
+ * it was created with CLONE_PARENT (or CLONE_THREAD). We don't look for those.
+ */
+static pid_t find_child_of_killed_task(RecordTask* t, uintptr_t clone_flags) {
+  if (clone_flags & (CLONE_THREAD | CLONE_PARENT)) {
+    return -1;
+  }
+  char path[PATH_MAX];
+  sprintf(path, "/proc/%d/task/%d/children", t->tid, t->tid);
+  ScopedFd fd(path, O_RDONLY);
+  if (!fd.is_open()) {
+    // The kernel was built without CONFIG_PROC_CHILDREN, or `t` is gone.
+    LOG(debug) << "Can't open " << path;
+    return -1;
+  }
+  string children;
+  while (true) {
+    char buf[4096];
+    ssize_t len = read(fd, buf, sizeof(buf));
+    if (len < 0 && errno == EINTR) {
+      continue;
+    }
+    if (len < 0) {
+      return -1;
+    }
+    if (len == 0) {
+      break;
+    }
+    children.append(buf, len);
+  }
+  pid_t found = -1;
+  const char* p = children.c_str();
+  while (*p) {
+    char* end;
+    long child = strtol(p, &end, 10);
+    if (end == p) {
+      break;
+    }
+    // Rule out tracees whose first stop we've already collected (stashed or
+    // dropped), e.g. a CLONE_PARENT child that an earlier killed clone() left
+    // behind: they're older than this clone().
+    if (is_new_tracee(t, child) && first_stop_is_pending(child)) {
+      if (found >= 0) {
+        LOG(debug) << "More than one new child of " << t->tid;
+        return -1;
+      }
+      found = child;
+    }
+    p = end;
+  }
+  return found;
+}
+
+/**
+ * This is purely for testing purposes. See fork_child_of_killed_parent. With
+ * RR_KILL_TASK_AT_CLONE_EVENT set, prepare_clone() SIGKILLs a task whose
+ * parent we're also recording when it stops for PTRACE_EVENT_CLONE/FORK/VFORK,
+ * before reading the new tid.
+ */
+static void maybe_kill_task_at_clone_event(RecordTask* t) {
+  static bool kill_task = getenv("RR_KILL_TASK_AT_CLONE_EVENT") != nullptr;
+  if (kill_task && t->session().find_task(t->get_parent_pid())) {
+    t->tgkill(SIGKILL);
+  }
 }
 
 template <typename Arch>
@@ -3800,15 +3914,17 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
     flags = SIGCHLD;
   }
 
+  bool killed = false;
   while (true) {
     if (!t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
       // Tracee died unexpectedly during clone, before reporting the event.
-      // A new thread (CLONE_THREAD) died with it before we heard about it,
-      // so it never ran and replay mustn't create it. A fork()/vfork() child
-      // survives; we never adopt it and it stays stopped. We don't handle
-      // that.
-      t->ev().Syscall().failed_during_preparation = true;
-      return ALLOW_SWITCH;
+      if (!t->is_stopped()) {
+        // A SIGKILL took it out of a stop before we could look at it. Get
+        // its PTRACE_EVENT_EXIT stop.
+        t->wait();
+      }
+      killed = true;
+      break;
     }
     // XXX handle stray signals?
     if (t->ptrace_event()) {
@@ -3846,19 +3962,35 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
     t->enter_syscall(Arch::arch());
   }
 
-  ASSERT(t, t->ptrace_event() == ptrace_event);
-
-  pid_t new_tid = t->get_ptrace_eventmsg_pid();
-  if (!is_new_tracee(t, new_tid)) {
-    // A SIGKILL took the task out of its PTRACE_EVENT_CLONE (etc) stop before
-    // we could read the new tid: PTRACE_GETEVENTMSG failed, or it reported
-    // the exit status of the PTRACE_EVENT_EXIT stop the task has moved on to.
-    // Handle this like the task dying before reporting the event (see
-    // above).
-    LOG(debug) << "Task " << t->tid << " killed before we got its new tid";
-    t->wait();
-    t->ev().Syscall().failed_during_preparation = true;
-    return ALLOW_SWITCH;
+  pid_t new_tid = -1;
+  if (!killed) {
+    ASSERT(t, t->ptrace_event() == ptrace_event);
+    maybe_kill_task_at_clone_event(t);
+    new_tid = t->get_ptrace_eventmsg_pid();
+    if (!is_new_tracee(t, new_tid)) {
+      // A SIGKILL took the task out of its PTRACE_EVENT_CLONE (etc) stop
+      // before we could read the new tid: PTRACE_GETEVENTMSG failed, or it
+      // reported the exit status of the PTRACE_EVENT_EXIT stop the task has
+      // moved on to.
+      LOG(debug) << "Task " << t->tid << " killed before we got its new tid";
+      t->wait();
+      killed = true;
+    }
+  }
+  if (killed) {
+    // A new thread (CLONE_THREAD) died with the task before we heard about
+    // it, so it never ran and replay mustn't create it. But a new child
+    // process survives; adopt it as if the task had reported the event. The
+    // task must be in its PTRACE_EVENT_EXIT stop, so it can't finish exiting
+    // (and lose its children) while we set up the child.
+    new_tid = t->is_stopped() && t->seen_ptrace_exit_event() ?
+        find_child_of_killed_task(t, flags) : -1;
+    if (new_tid < 0) {
+      t->ev().Syscall().failed_during_preparation = true;
+      return ALLOW_SWITCH;
+    }
+    LOG(debug) << "Task " << t->tid << " was killed after creating "
+               << new_tid;
   }
   RecordTask* new_task = static_cast<RecordTask*>(
       t->session().clone(t, clone_flags_to_task_flags(flags), params.stack,
@@ -3908,8 +4040,11 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
     new_task->set_emulated_ptracer(t->emulated_ptracer);
     new_task->emulated_ptrace_seized = t->emulated_ptrace_seized;
     new_task->emulated_ptrace_options = t->emulated_ptrace_options;
-    t->emulated_ptrace_event_msg = new_task->rec_tid;
-    t->emulate_ptrace_stop(WaitStatus::for_ptrace_event(ptrace_event));
+    if (!killed) {
+      // The kernel wouldn't have reported the event for a killed task.
+      t->emulated_ptrace_event_msg = new_task->rec_tid;
+      t->emulate_ptrace_stop(WaitStatus::for_ptrace_event(ptrace_event));
+    }
     // ptrace(2) man page says that SIGSTOP is used here, but it's really
     // SIGTRAP (in 4.4.4-301.fc23.x86_64 anyway).
     new_task->apply_group_stop(SIGTRAP);
