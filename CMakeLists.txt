@@ -1311,6 +1311,7 @@ set(BASIC_TESTS
   ptrace_event_stop_sigcont
   ptrace_exec
   x86/ptrace_exec32
+  ptrace_exitkill
   ptrace_group_stop
   ptrace_group_stop_real_parent
   ptrace_interrupt_syscall
