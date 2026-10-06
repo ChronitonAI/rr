@@ -869,9 +869,94 @@ void RecordTask::do_ptrace_exit_stop(WaitStatus exit_status) {
   }
 }
 
+/**
+ * Return true if the kernel drops a SIGKILL sent to a task at its
+ * PTRACE_EVENT_EXIT for the exit_group() of a single-threaded process. Linux
+ * does since 6.1, which marks the process as exiting (SIGNAL_GROUP_EXIT) as
+ * soon as an exit_group() starts, or the exit() of its last thread that isn't
+ * exiting yet (do_group_exit(), synchronize_group_exit()), and then drops
+ * signals (prepare_signal()). Some older distribution kernels have that too,
+ * so try it.
+ */
+static bool kernel_drops_SIGKILL_at_exit_event() {
+  static int result = -1;
+  if (result < 0) {
+    LOG(debug) << "Testing whether a SIGKILL at PTRACE_EVENT_EXIT is dropped";
+    pid_t helper = fork();
+    if (helper == 0) {
+      // Trace a child that calls exit_group(77), and send it SIGKILL at its
+      // PTRACE_EVENT_EXIT.
+      pid_t child = fork();
+      if (child == 0) {
+        // Since we're traced, any signal, even an ignored one (say, a
+        // SIGWINCH for our process group), would stop us. Block them all.
+        sigset_t all;
+        sigfillset(&all);
+        sigprocmask(SIG_SETMASK, &all, nullptr);
+        if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr)) {
+          _exit(1);
+        }
+        raise(SIGSTOP);
+        syscall(SYS_exit_group, 77);
+        _exit(1);
+      }
+      int status;
+      if (child < 0 || waitpid(child, &status, 0) != child ||
+          !WIFSTOPPED(status) || WSTOPSIG(status) != SIGSTOP ||
+          ptrace(PTRACE_SETOPTIONS, child, nullptr,
+                 (void*)PTRACE_O_TRACEEXIT) ||
+          ptrace(PTRACE_CONT, child, nullptr, nullptr) ||
+          waitpid(child, &status, 0) != child ||
+          status >> 8 != (SIGTRAP | (PTRACE_EVENT_EXIT << 8))) {
+        _exit(2);
+      }
+      kill(child, SIGKILL);
+      // If the SIGKILL was dropped, the child is still at the event.
+      ptrace(PTRACE_CONT, child, nullptr, nullptr);
+      if (waitpid(child, &status, 0) != child) {
+        _exit(2);
+      }
+      _exit(WIFEXITED(status) && WEXITSTATUS(status) == 77 ? 1 : 0);
+    }
+    if (helper < 0) {
+      result = 0;
+    } else {
+      WaitResult wait_result = WaitManager::wait_exit(WaitOptions(helper));
+      result =
+          wait_result.code == WAIT_OK && wait_result.status.exit_code() == 1;
+    }
+    LOG(debug) << "  ... " << (result ? "it is" : "it isn't");
+  }
+  return result;
+}
+
+/**
+ * Return true if |t|, which we hold at an emulated ptrace event if
+ * |held|, is at the PTRACE_EVENT_EXIT of an exit of its whole process: an
+ * exit_group(), or an exit() when all other threads are exiting too.
+ */
+static bool is_at_exit_of_process(RecordTask* t, bool held) {
+  if (!held || t->emulated_stop_code.ptrace_event() != PTRACE_EVENT_EXIT ||
+      !kernel_drops_SIGKILL_at_exit_event()) {
+    return false;
+  }
+  if (is_exit_group_syscall(t->ev().Syscall().number,
+                            t->ev().Syscall().arch())) {
+    return true;
+  }
+  for (Task* other : t->thread_group()->task_set()) {
+    auto rt = static_cast<RecordTask*>(other);
+    // stable_exit: |rt| has entered its exit() or exit_group() (it may be
+    // held at its emulated PTRACE_EVENT_EXIT, or resumed from there).
+    if (rt != t && !rt->is_exiting() && !rt->stable_exit) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void RecordTask::detach_emulated_ptrace_tracees() {
   for (RecordTask* t : emulated_ptrace_tracees) {
-    // XXX emulate PTRACE_O_EXITKILL
     ASSERT(this, t->emulated_ptracer == this);
     // If we're holding |t| in the middle of its syscall, at a ptrace event
     // that we reported to its ptracer, resume it from there, as
@@ -880,6 +965,17 @@ void RecordTask::detach_emulated_ptrace_tracees() {
     bool resume =
         t->held_at_emulated_ptrace_event && !t->seen_ptrace_exit_event();
     bool stop_again = t->should_stop_again_after_ptrace_detach();
+    // Linux sends SIGKILL to a PTRACE_O_EXITKILL tracee before it detaches
+    // it, but drops it if the process is already exiting (see
+    // is_at_exit_of_process).
+    bool exit_kill = (t->emulated_ptrace_options & PTRACE_O_EXITKILL) &&
+                     !is_at_exit_of_process(t, resume);
+    if (exit_kill && !t->seen_ptrace_exit_event()) {
+      t->kill_if_alive();
+      // The SIGKILL ends any stop of the process.
+      t->thread_group()->stopping_signal = 0;
+      t->thread_group()->stop_report_signal = 0;
+    }
     // Linux delivers the signal of a signal-delivery-stop that the ptracer
     // hasn't waited for (only its wait clears the signal).
     int undelivered_sig = 0;
@@ -892,6 +988,12 @@ void RecordTask::detach_emulated_ptrace_tracees() {
     t->emulated_ptrace_seized = false;
     t->emulated_ptrace_options = 0;
     t->emulated_ptrace_cont_command = 0;
+    if (exit_kill) {
+      // Leave any emulated stop as it is, as PTRACE_KILL does. The scheduler
+      // notices when |t| has exited.
+      t->emulated_stop_pending = false;
+      continue;
+    }
     if (stop_again) {
       t->stop_again_after_ptrace_detach();
       continue;
