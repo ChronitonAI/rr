@@ -3217,12 +3217,20 @@ static Switchable prepare_ptrace(RecordTask* t,
     case PTRACE_DETACH: {
       RecordTask* tracee = verify_ptrace_target(t, syscall_state, tid);
       if (tracee) {
+        // If the tracee's process is stopped, Linux puts the tracee back into
+        // the group-stop (see stop_again_after_ptrace_detach). We don't
+        // deliver the signal passed with PTRACE_DETACH then.
+        bool stop_again = tracee->should_stop_again_after_ptrace_detach();
         tracee->set_syscallbuf_locked(0);
         tracee->emulated_ptrace_options = 0;
         tracee->emulated_ptrace_cont_command = 0;
         tracee->emulated_stop_pending = false;
-        prepare_ptrace_cont(tracee, t->regs().arg4(), 0);
+        prepare_ptrace_cont(tracee, stop_again ? 0 : t->regs().arg4(), 0);
         tracee->set_emulated_ptracer(nullptr);
+        tracee->emulated_ptrace_seized = false;
+        if (stop_again) {
+          tracee->stop_again_after_ptrace_detach();
+        }
         syscall_state.emulate_result(0);
       }
       break;

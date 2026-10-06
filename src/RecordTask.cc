@@ -876,10 +876,15 @@ void RecordTask::detach_emulated_ptrace_tracees() {
     // stops.
     bool resume =
         t->held_at_emulated_ptrace_event && !t->seen_ptrace_exit_event();
+    bool stop_again = t->should_stop_again_after_ptrace_detach();
     t->emulated_ptracer = nullptr;
     t->emulated_ptrace_seized = false;
     t->emulated_ptrace_options = 0;
     t->emulated_ptrace_cont_command = 0;
+    if (stop_again) {
+      t->stop_again_after_ptrace_detach();
+      continue;
+    }
     t->emulated_stop_pending = false;
     t->emulated_stop_type = NOT_STOPPED;
     if (resume) {
@@ -887,6 +892,32 @@ void RecordTask::detach_emulated_ptrace_tracees() {
     }
   }
   emulated_ptrace_tracees.clear();
+}
+
+bool RecordTask::should_stop_again_after_ptrace_detach() {
+  // A signal has stopped our process, so Linux puts us into the group-stop
+  // until a SIGCONT (__ptrace_unlink sets JOBCTL_STOP_PENDING), whatever stop
+  // we were in, or even if our ptracer had resumed us. But if we're in the
+  // middle of a syscall, Linux finishes the syscall first (or skips it, after
+  // a PTRACE_SYSEMU stop). We can't stop a task that we hold at a ptrace
+  // event in the middle of its syscall, or at a syscall-entry stop that we
+  // haven't processed yet (the scheduler would resume it from there on a
+  // SIGCONT, running the syscall behind our back). We let those go on.
+  return thread_group()->stopping_signal && !seen_ptrace_exit_event() &&
+         !held_at_emulated_ptrace_event &&
+         !(ev().is_syscall_event() &&
+           ev().Syscall().state == ENTERING_SYSCALL_PTRACE);
+}
+
+void RecordTask::stop_again_after_ptrace_detach() {
+  // If we're running, the scheduler interrupts us, as for a
+  // PTRACE_INTERRUPT. Whether the real parent can still wait for the stop
+  // is up to ThreadGroup::stop_report_signal.
+  LOG(debug) << "Stopping " << tid << " again after ptrace detach";
+  emulated_stop_type = GROUP_STOP;
+  emulated_stop_code =
+      WaitStatus::for_group_sig(thread_group()->stopping_signal, this);
+  emulated_stop_pending = false;
 }
 
 void RecordTask::did_reach_zombie() {

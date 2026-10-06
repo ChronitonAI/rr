@@ -139,6 +139,17 @@ public:
    * as Linux does.
    */
   void detach_emulated_ptrace_tracees();
+  /**
+   * Return true if, when our emulated ptracer detaches from us, we should go
+   * back into the group-stop, because our process is stopped.
+   */
+  bool should_stop_again_after_ptrace_detach();
+  /**
+   * Our emulated ptracer has just detached from us, and
+   * should_stop_again_after_ptrace_detach() said so: put us back into the
+   * group-stop.
+   */
+  void stop_again_after_ptrace_detach();
 
   void record_exit_trace_event(WaitStatus exit_status);
   /**
