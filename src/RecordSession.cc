@@ -889,8 +889,16 @@ void RecordSession::task_continue(const StepState& step_state) {
 
     bool singlestep = is_ptrace_any_singlestep(t->arch(),
       t->emulated_ptrace_cont_command);
-    if (singlestep && is_at_syscall_instruction(t, t->ip())) {
-      // We're about to singlestep into a syscall instruction.
+    // On x86, the kernel restarts an interrupted syscall only if the
+    // registers still say so. A ptracer can prevent that at the signal stop,
+    // e.g. by setting orig_ax to -1 (gdb does that whenever it writes the
+    // pc). (On aarch64, the kernel has already moved the pc back to the
+    // syscall instruction by then.)
+    bool will_restart = may_restart && t->regs().syscall_may_restart() &&
+                        t->regs().original_syscallno() >= 0;
+    if (singlestep && (is_at_syscall_instruction(t, t->ip()) || will_restart)) {
+      // We're about to singlestep into a syscall instruction, or the kernel
+      // is about to restart an interrupted syscall.
       // Act like we're NOT singlestepping since doing a PTRACE_SINGLESTEP would
       // skip over the system call.
       LOG(debug)
