@@ -134,6 +134,11 @@ public:
    * If necessary, signal the ptracer that this task has exited.
    */
   void do_ptrace_exit_stop(WaitStatus exit_status);
+  /**
+   * This task, a ptracer, has exited. Detach its emulated ptrace tracees,
+   * as Linux does.
+   */
+  void detach_emulated_ptrace_tracees();
 
   void record_exit_trace_event(WaitStatus exit_status);
   /**
