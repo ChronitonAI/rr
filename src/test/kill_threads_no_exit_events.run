@@ -1,0 +1,14 @@
+source `dirname $0`/util.sh
+# Record without PTRACE_EVENT_EXIT stops. Print rr's warnings about tasks,
+# without --fatal-errors, and check that we didn't warn about failing to
+# open a mem fd. Then drop rr's warnings from record.err, so that unrelated
+# ones (e.g. about missing kernel features) don't fail the test.
+RECORD_OPTIONS="${GLOBAL_OPTIONS/--fatal-errors/} --disable-ptrace-exit-events"
+RR_LOG=Task:warn GLOBAL_OPTIONS="$RECORD_OPTIONS" record $TESTNAME
+if grep "Can't retrieve mem fd" record.err; then
+  failed ": warned about the mem fd of a dead task"
+else
+  sed -i '/^\[WARN /d' record.err
+  replay
+  check EXIT-SUCCESS
+fi
