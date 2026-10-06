@@ -1451,6 +1451,7 @@ set(BASIC_TESTS
   sysinfo
   syslog
   arm/tagged_addr_ctrl
+  arm/tagged_addr_syscalls
   arm/sve_vl
   tgkill
   thread_yield
@@ -1458,6 +1459,7 @@ set(BASIC_TESTS
   timerfd
   times
   x86/tpause
+  traced_syscall_efault
   truncate_temp
   tty_tostop
   tun
