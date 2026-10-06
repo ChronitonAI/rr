@@ -1904,6 +1904,9 @@ AddressSpace::AddressSpace(Session* session, const AddressSpace& o,
     // all local mappings.
     m.second.local_addr = nullptr;
   }
+  // A checkpoint may be taken between an exec and the unmapping of the
+  // buffers that it left behind.
+  regions_pending_unmap = o.regions_pending_unmap;
 
   for (auto& it : o.breakpoints) {
     breakpoints.insert(make_pair(it.first, it.second));

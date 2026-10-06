@@ -2170,6 +2170,11 @@ ReplayResult ReplaySession::replay_step(const StepConstraints& constraints) {
 
     debug_memory(t);
     check_intel_pt_if_enabled(t);
+    // The recording unmaps these when it handles a stop of a task in this
+    // address space, before it lets that task run. It doesn't when it only
+    // records a task's exit (handle_ptrace_exit_event), so replay can unmap
+    // them earlier there. Nothing in this event depends on them.
+    t->unmap_dead_syscallbufs_if_required();
 
     check_for_watchpoint_changes(t, result.break_status);
     check_approaching_ticks_target(t, constraints, result.break_status);
