@@ -1467,6 +1467,7 @@ set(BASIC_TESTS
   syscallbuf_breakpoint_race
   syscallbuf_efault
   syscallbuf_efault_stashed_signal
+  syscallbuf_efault_syscalls
   syscallbuf_signal_reset
   syscallbuf_signal_blocking
   syscallbuf_sigstop
