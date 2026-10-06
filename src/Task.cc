@@ -435,6 +435,11 @@ const siginfo_t& Task::get_siginfo() {
  * Must be idempotent.
  */
 void Task::destroy_buffers(Task *as_task, Task *fd_task) {
+  // If we exec'd but didn't reach the exec's syscall exit (e.g. we were killed
+  // at the exec event), the buffers that we left behind still need to be
+  // unmapped. (Replay unmaps them here, below, since it hasn't processed the
+  // exec.)
+  queue_exec_dead_buffers();
   auto saved_syscallbuf_child = syscallbuf_child;
   // Clear syscallbuf_child now so nothing tries to use it while tearing
   // down buffers.
@@ -1087,17 +1092,17 @@ static bool is_long_mode_segment(uint32_t segment) {
 #endif
 
 void Task::post_exec(const string& exe_file) {
-  // If the address space of this process which just exec'd is shared with another process
-  // (via vfork(2) or CLONE_VM perhaps), we will be leaving behind the syscallbuf mappings
-  // for this pid in the shared address space. Make a note of this, so that the next time
-  // we run a task in tihs address space, we unmap these buffers. (n.b. we can't clean up
-  // those buffers *before* the exec completes, because it might fail in which case we
-  // souldn't have cleaned them up.)
+  // If the address space of this process which just exec'd is shared with
+  // another process (via vfork(2) or CLONE_VM perhaps), we will be leaving
+  // behind the syscallbuf mappings for this pid in the shared address space.
+  // Remember them, so that post_exec_syscall can arrange to unmap them.
+  exec_old_vm = as;
+  exec_dead_buffers.clear();
   if (scratch_ptr) {
-    as->regions_pending_unmap.push_back(MemoryRange(scratch_ptr, scratch_size));
+    exec_dead_buffers.push_back(MemoryRange(scratch_ptr, scratch_size));
   }
   if (!syscallbuf_child.is_null()) {
-    as->regions_pending_unmap.push_back(MemoryRange(syscallbuf_child, syscallbuf_size));
+    exec_dead_buffers.push_back(MemoryRange(syscallbuf_child, syscallbuf_size));
   }
 
   session().post_exec();
@@ -1134,7 +1139,25 @@ static string prname_from_exe_image(const string& e) {
   return e.substr(last_slash == e.npos ? 0 : last_slash + 1);
 }
 
+void Task::queue_exec_dead_buffers() {
+  if (auto old_vm = exec_old_vm.lock()) {
+    old_vm->regions_pending_unmap.insert(old_vm->regions_pending_unmap.end(),
+                                         exec_dead_buffers.begin(),
+                                         exec_dead_buffers.end());
+  }
+  exec_old_vm.reset();
+  exec_dead_buffers.clear();
+}
+
 void Task::post_exec_syscall(const std::string& original_exe_file) {
+  // Now that the exec has completed, make a note of the buffers that we left
+  // behind, so that the next time we run a task in the old address space, we
+  // unmap them. (n.b. we can't clean up those buffers *before* the exec
+  // completes, because it might fail in which case we shouldn't have cleaned
+  // them up.) We do this at the exec's syscall exit, where replay processes
+  // the exec.
+  queue_exec_dead_buffers();
+
   canonicalize_regs(arch());
   as->post_exec_syscall(this);
 

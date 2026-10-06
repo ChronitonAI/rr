@@ -1145,11 +1145,21 @@ public:
   bool last_syscall_entry_recorded;
 
   /*
-   * Called before the scheduler resumes a task to check if the task's address
-   * space has any leftover syscallbufs from dead processes which shared the
-   * address space
+   * Called before the scheduler resumes a task during recording, and after an
+   * event of the task during replay, to check if the task's address space has
+   * any leftover syscallbufs from dead processes which shared the address
+   * space
    */
   void unmap_dead_syscallbufs_if_required();
+
+  /*
+   * When this task execs, the address space it had and the buffers it left
+   * behind there, between post_exec and post_exec_syscall.
+   */
+  std::weak_ptr<AddressSpace> exec_old_vm;
+  std::vector<MemoryRange> exec_dead_buffers;
+  // Make a note of them in the old address space, so that they get unmapped.
+  void queue_exec_dead_buffers();
 
 protected:
   Task(Session& session, pid_t tid, pid_t rec_tid, uint32_t serial,
