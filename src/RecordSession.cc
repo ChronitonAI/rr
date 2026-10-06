@@ -1149,8 +1149,10 @@ static void maybe_trigger_emulated_ptrace_syscall_exit_stop(RecordTask* t) {
   } else if (is_ptrace_any_singlestep(t->arch(), t->emulated_ptrace_cont_command)) {
     // Deliver the singlestep trap now that we've finished executing the
     // syscall.
-    t->emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGTRAP), SIGNAL_DELIVERY_STOP, nullptr,
-                           SI_KERNEL);
+    if (t->emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGTRAP),
+                               SIGNAL_DELIVERY_STOP, nullptr, SI_KERNEL)) {
+      t->emulated_stop_holds_signal = true;
+    }
   }
 }
 
