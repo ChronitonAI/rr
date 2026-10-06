@@ -623,7 +623,7 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
     int prot = regs.arg4_signed();
     Task* t = session().find_task(tid);
     ASSERT(this, t);
-    return t->vm()->protect(t, addr, num_bytes, prot);
+    return t->vm()->protect(t, untagged_addr(t->arch(), addr), num_bytes, prot);
   }
 
   // mprotect can change the protection status of some mapped regions before
@@ -646,22 +646,23 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
       return;
     }
 
+    // The kernel ignores the tags of these addresses.
     case Arch::pkey_mprotect:
     case Arch::mprotect: {
-      remote_ptr<void> addr = regs.orig_arg1();
+      remote_ptr<void> addr = untagged_addr(Arch::arch(), regs.orig_arg1());
       size_t num_bytes = regs.arg2();
       int prot = regs.arg3_signed();
       return vm()->protect(this, addr, num_bytes, prot);
     }
     case Arch::munmap: {
-      remote_ptr<void> addr = regs.orig_arg1();
+      remote_ptr<void> addr = untagged_addr(Arch::arch(), regs.orig_arg1());
       size_t num_bytes = regs.arg2();
       return vm()->unmap(this, addr, num_bytes);
     }
     case Arch::shmdt:
       return process_shmdt(this, regs.orig_arg1());
     case Arch::madvise: {
-      remote_ptr<void> addr = regs.orig_arg1();
+      remote_ptr<void> addr = untagged_addr(Arch::arch(), regs.orig_arg1());
       size_t num_bytes = regs.arg2();
       int advice = regs.arg3();
       return vm()->advise(this, addr, num_bytes, advice);
