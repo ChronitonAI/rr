@@ -45,6 +45,18 @@ void rec_did_sigreturn(RecordTask* t);
  */
 bool rec_return_normally_from_wait(RecordTask* t);
 
+/**
+ * |t|'s syscall has failed with EINTR. If Linux wouldn't have woken it up
+ * natively, make the kernel restart it instead, and return true.
+ */
+bool rec_restart_after_spurious_EINTR(RecordTask* t);
+
+/**
+ * An emulated group stop has started for |t|. Note that, if |t| is in a
+ * syscall.
+ */
+void rec_note_group_stop(RecordTask* t);
+
 } // namespace rr
 
 #endif /* RR_PROCESS_SYSCALL_H_ */
