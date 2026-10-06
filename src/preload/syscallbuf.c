@@ -783,6 +783,9 @@ static void __attribute__((constructor)) init_process(void) {
   extern char _syscallbuf_final_exit_instruction;
   extern char _syscallbuf_code_start;
   extern char _syscallbuf_code_end;
+  extern char _memory_checks_start;
+  extern char _memory_checks_end;
+  extern char _memory_check_failed;
   extern char do_breakpoint_fault_addr;
 
 #if defined(__i386__)
@@ -1125,6 +1128,9 @@ static void __attribute__((constructor)) init_process(void) {
 #endif
   params.syscallbuf_code_start = &_syscallbuf_code_start;
   params.syscallbuf_code_end = &_syscallbuf_code_end;
+  params.memory_checks_start = &_memory_checks_start;
+  params.memory_checks_end = &_memory_checks_end;
+  params.memory_check_failed = &_memory_check_failed;
   params.syscallbuf_final_exit_instruction =
       &_syscallbuf_final_exit_instruction;
   params.syscall_patch_hook_count =
@@ -1304,6 +1310,56 @@ static int fd_write_blocks(int fd) {
       return WONT_BLOCK;
   }
   fatal("Unknown or corrupted fd class");
+}
+
+/**
+ * Return nonzero if a record ending at |record_end| is small enough for
+ * start_commit_buffered_syscall() to accept it.
+ */
+static int record_fits(void* record_end) {
+  void* record_start;
+  void* stored_end;
+
+  if (!thread_locals->buffer) {
+    return 0;
+  }
+  record_start = buffer_last();
+  stored_end = record_start + stored_record_size(record_end - record_start);
+  return stored_end >= record_start + sizeof(struct syscallbuf_record) &&
+         stored_end <= (void*)buffer_end() - sizeof(struct syscallbuf_record);
+}
+
+extern RR_HIDDEN long _memory_check_writable(void* addr, size_t len);
+
+/**
+ * The syscallbuf code reads some syscall arguments itself, and copies the
+ * results of syscalls into the tracee's memory. Without rr, only the kernel
+ * accesses that memory, and the syscall fails with EFAULT when it can't. Here
+ * the access would fault instead, and rr can't deliver a signal in the
+ * syscallbuf code. So before we buffer a syscall, we check that we can access
+ * that memory, and make a traced syscall when we can't. The checks touch every
+ * page of the memory; when one of those accesses faults, rr makes the check
+ * return 0 (see raw_syscall.S).
+ */
+static int bail_out_of_record(void) {
+  /* prep_syscall() may have locked the buffer. We won't commit a record. */
+  buffer_hdr()->locked &= ~SYSCALLBUF_LOCKED_TRACEE;
+  return 0;
+}
+
+/**
+ * Return nonzero if we can write (or read and write) |len| bytes at |addr|.
+ * |record_end| is what the caller passes to start_commit_buffered_syscall():
+ * if the record doesn't fit, the syscall won't be buffered, and we don't
+ * touch the (maybe huge) range. A null |addr| means that there's no such
+ * memory: callers pass null to the kernel and don't copy anything then.
+ */
+static int can_write(void* record_end, void* addr, size_t len) {
+  if (!addr || !len || !record_fits(record_end) ||
+      _memory_check_writable(addr, len)) {
+    return 1;
+  }
+  return bail_out_of_record();
 }
 
 static int start_commit_buffered_syscall(int syscallno, void* record_end,
@@ -2965,7 +3021,10 @@ static long sys_read(struct syscall_info* call) {
    */
   if (buf && count >= CLONE_SIZE_THRESHOLD &&
       thread_locals->cloned_file_data_fd >= 0 && is_bufferable_fd(fd) &&
-      sizeof(void*) == 8 && !(count & 4095)) {
+      sizeof(void*) == 8 && !(count & 4095) &&
+      /* We may copy the data from scratch memory (see below). */
+      (count > thread_locals->usable_scratch_size ||
+       _memory_check_writable(buf, count))) {
     struct syscall_info lseek_call = { SYS_lseek,
                                        { fd, 0, SEEK_CUR, 0, 0, 0 } };
     off_t lseek_ret = privileged_sys_generic_nonblocking_fd(&lseek_call);
@@ -3035,7 +3094,8 @@ static long sys_read(struct syscall_info* call) {
     buf2 = ptr;
     ptr += count;
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
+  if (!can_write(ptr, buf, count) ||
+      !start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
