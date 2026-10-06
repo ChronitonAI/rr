@@ -1055,6 +1055,7 @@ set(BASIC_TESTS
   clone_parent
   clone_untraced
   clone_vfork_pidfd
+  clone_vm_exec_map_over_buffers
   cloned_sigmask
   close_range
   constructor
