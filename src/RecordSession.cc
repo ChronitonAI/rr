@@ -1113,10 +1113,73 @@ static void copy_syscall_arg_regs(Registers* to, const Registers& from) {
   to->set_arg6(from.arg6());
 }
 
-static void maybe_trigger_emulated_ptrace_syscall_exit_stop(RecordTask* t) {
+template <typename Arch>
+static bool pselect6_has_sigmask_arch(RecordTask* t, remote_ptr<void> arg6) {
+  if (arg6.is_null()) {
+    return false;
+  }
+  bool ok = true;
+  auto argpack = t->read_mem(arg6.cast<typename Arch::pselect6_arg6>(), &ok);
+  return ok && !argpack.ss.rptr().is_null();
+}
+
+static bool pselect6_has_sigmask(RecordTask* t, SupportedArch arch,
+                                 remote_ptr<void> arg6) {
+  RR_ARCH_FUNCTION(pselect6_has_sigmask_arch, arch, t, arg6);
+}
+
+/**
+ * Returns true if the syscall |syscallno| with the entry registers |regs|
+ * installed a temporary signal mask, which the kernel replaces by the saved
+ * one the next time it returns to user space, whether or not it delivers a
+ * signal then (TIF_RESTORE_SIGMASK). It doesn't when it was called without a
+ * mask, e.g. glibc's select() calls pselect6 without one.
+ */
+static bool installed_temporary_sigmask(RecordTask* t, int syscallno,
+                                        SupportedArch arch,
+                                        const Registers& regs) {
+  if (is_rt_sigsuspend_syscall(syscallno, arch) ||
+      is_sigsuspend_syscall(syscallno, arch)) {
+    return true;
+  }
+  if (is_ppoll_syscall(syscallno, arch) ||
+      is_ppoll_time64_syscall(syscallno, arch)) {
+    return regs.arg4() != 0;
+  }
+  if (is_epoll_pwait_syscall(syscallno, arch) ||
+      is_epoll_pwait2_syscall(syscallno, arch)) {
+    return regs.arg5() != 0;
+  }
+  if (is_pselect6_syscall(syscallno, arch) ||
+      is_pselect6_time64_syscall(syscallno, arch)) {
+    return pselect6_has_sigmask(t, arch, regs.arg6());
+  }
+  return false;
+}
+
+/**
+ * |temporary_sigmask| is true if a signal interrupted the syscall while it
+ * had a temporary signal mask installed, which the kernel still has to
+ * replace by the saved one.
+ */
+static void maybe_trigger_emulated_ptrace_syscall_exit_stop(
+    RecordTask* t, bool temporary_sigmask = false) {
   if (t->emulated_ptrace_cont_command == PTRACE_SYSCALL) {
     t->emulate_ptrace_stop(WaitStatus::for_syscall(t), SYSCALL_EXIT_STOP);
   } else if (is_ptrace_any_singlestep(t->arch(), t->emulated_ptrace_cont_command)) {
+    // Natively, the kernel reports the step over the syscall with a SIGTRAP
+    // that it forces (for PTRACE_SYSEMU_SINGLESTEP on x86, the step after
+    // the syscall, which we report here already). Emulate its effects,
+    // except when the syscall still has a temporary signal mask to replace:
+    // changing the mask with PTRACE_SETSIGMASK (which we'd also do if a
+    // remote syscall stashed the pending signal) would make the kernel
+    // forget the saved mask. Natively, the step's SIGTRAP only unblocks
+    // SIGTRAP in the temporary mask then, which doesn't last. But if SIGTRAP
+    // is blocked there or ignored, it also resets SIGTRAP's handler to
+    // SIG_DFL for good. XXX we don't emulate that reset there.
+    if (!temporary_sigmask) {
+      emulate_forced_signal(t, SIGTRAP);
+    }
     // Deliver the singlestep trap now that we've finished executing the
     // syscall.
     t->emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGTRAP), SIGNAL_DELIVERY_STOP, nullptr,
@@ -1247,6 +1310,11 @@ void RecordSession::syscall_state_changed(RecordTask* t,
       SupportedArch syscall_arch = t->ev().Syscall().arch();
       int syscallno = t->ev().Syscall().number;
       intptr_t retval = t->regs().syscall_result_signed();
+      // Check the syscall's arguments in its entry registers.
+      bool interrupted_with_temporary_sigmask =
+          (retval == -EINTR || t->regs().syscall_may_restart()) &&
+          installed_temporary_sigmask(t, syscallno, syscall_arch,
+                                      t->ev().Syscall().regs);
 
       if (t->desched_rec()) {
         // If we enabled the desched event above, disable it.
@@ -1382,7 +1450,8 @@ void RecordSession::syscall_state_changed(RecordTask* t,
       step_state->continue_type = DONT_CONTINUE;
 
       if (!is_in_privileged_syscall(t)) {
-        maybe_trigger_emulated_ptrace_syscall_exit_stop(t);
+        maybe_trigger_emulated_ptrace_syscall_exit_stop(
+            t, interrupted_with_temporary_sigmask);
       }
       return;
     }
@@ -1972,6 +2041,19 @@ bool RecordSession::handle_signal_event(RecordTask* t, StepState* step_state) {
         break;
     }
     return false;
+  }
+  if (sig == SIGTRAP && (signal_was_blocked || t->is_sig_ignored(sig)) &&
+      t->compute_trap_reasons().singlestep) {
+    // A single-step that the tracee's ptracer requested trapped. The kernel
+    // forces the SIGTRAP of a single-step, so it unblocked SIGTRAP and reset
+    // its handler to SIG_DFL, as it does natively. (It does that even when
+    // it drops this SIGTRAP because another one is pending already. On x86,
+    // compute_trap_reasons() sees the step in DR6 then, too. XXX on
+    // aarch64, it only checks for si_code TRAP_TRACE, so we miss that case
+    // there.) Update our signal handler state to match, as handle_signal
+    // does for deterministic signals. Invalidating the sigmask below takes
+    // care of the mask.
+    t->did_set_sig_handler_default(sig);
   }
   // Conservatively invalidate the sigmask in case just accepting a signal has
   // sigmask effects.

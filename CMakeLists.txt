@@ -1253,6 +1253,7 @@ set(BASIC_TESTS
   x86/patch_syscall_restart
   pause
   perf_event
+  perf_event_sigtrap_ignored
   perf_event_ioctl
   perf_event_mmap
   personality
@@ -1309,6 +1310,7 @@ set(BASIC_TESTS
   ptrace_sigchld_blocked
   ptrace_signals
   ptrace_singlestep
+  ptrace_singlestep_forced_sigtrap
   ptrace_syscall
   ptrace_syscall_clone_untraced
   x86/ptrace_sysemu
