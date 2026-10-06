@@ -419,6 +419,24 @@ void RecordSession::handle_seccomp_traced_syscall(RecordTask* t,
     return;
   }
 
+  if (syscall_seccomp_ordering_ == PTRACE_SYSCALL_BEFORE_SECCOMP &&
+      t->ev().is_syscall_event() &&
+      t->ev().Syscall().state == PROCESSING_SYSCALL) {
+    // We did PTRACE_SYSCALL and already saw a syscall trap. Just ignore this.
+    // That's so even if the syscall number is negative now, e.g. because a
+    // ptracer skips the syscall: the kernel skips it after this stop. (This
+    // is the stop that our own seccomp filter gives.)
+    LOG(debug) << "Ignoring SECCOMP syscall trap since we already got a "
+                  "PTRACE_SYSCALL trap";
+    // The next continue needs to be a PTRACE_SYSCALL to observe
+    // the exit-syscall event.
+    step_state->continue_type = RecordSession::CONTINUE_SYSCALL;
+    // Need to restore last_task_switchable since it will have been
+    // reset to PREVENT_SWITCH
+    last_task_switchable = t->ev().Syscall().switchable;
+    return;
+  }
+
   int syscallno = t->regs().original_syscallno();
   if (syscallno < 0) {
     // negative syscall numbers after a SECCOMP event
@@ -465,29 +483,16 @@ void RecordSession::handle_seccomp_traced_syscall(RecordTask* t,
     step_state->continue_type = RecordSession::CONTINUE_SYSCALL;
   } else {
     ASSERT(t, syscall_seccomp_ordering_ == PTRACE_SYSCALL_BEFORE_SECCOMP);
-    if (t->ev().is_syscall_event() &&
-        t->ev().Syscall().state == PROCESSING_SYSCALL) {
-      // We did PTRACE_SYSCALL and already saw a syscall trap. Just ignore this.
-      LOG(debug) << "Ignoring SECCOMP syscall trap since we already got a "
-                    "PTRACE_SYSCALL trap";
-      // The next continue needs to be a PTRACE_SYSCALL to observe
-      // the exit-syscall event.
-      step_state->continue_type = RecordSession::CONTINUE_SYSCALL;
-      // Need to restore last_task_switchable since it will have been
-      // reset to PREVENT_SWITCH
-      last_task_switchable = t->ev().Syscall().switchable;
-    } else {
-      // We've already passed the PTRACE_SYSCALL trap for syscall entry, so
-      // we need to handle that now.
-      SupportedArch syscall_arch = t->detect_syscall_arch();
-      t->canonicalize_regs(syscall_arch);
-      if (!process_syscall_entry(t, step_state, result, syscall_arch)) {
-        last_task_switchable = ALLOW_SWITCH;
-        step_state->continue_type = RecordSession::DONT_CONTINUE;
-        return;
-      }
-      *did_enter_syscall = true;
+    // We've already passed the PTRACE_SYSCALL trap for syscall entry, so
+    // we need to handle that now.
+    SupportedArch syscall_arch = t->detect_syscall_arch();
+    t->canonicalize_regs(syscall_arch);
+    if (!process_syscall_entry(t, step_state, result, syscall_arch)) {
+      last_task_switchable = ALLOW_SWITCH;
+      step_state->continue_type = RecordSession::DONT_CONTINUE;
+      return;
     }
+    *did_enter_syscall = true;
   }
 }
 
@@ -1216,7 +1221,18 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         t->set_regs(r);
         // If this fails because of premature exit, don't mess with the
         // task anymore.
-        if (t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
+        bool ok = t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT,
+                                      RESUME_NO_TICKS);
+        if (ok && t->is_ptrace_seccomp_event()) {
+          // We had the task at the syscall-entry stop that PTRACE_SYSCALL
+          // gives, which comes before the seccomp stop (e.g. of a syscall that
+          // the task may restart; see task_continue). Linux skips the
+          // syscall after the seccomp stop too, since the syscall number is
+          // invalid.
+          ok = t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT,
+                                   RESUME_NO_TICKS);
+        }
+        if (ok) {
           ASSERT(t, t->ip() == r.ip());
           t->set_regs(orig_regs);
           maybe_trigger_emulated_ptrace_syscall_exit_stop(t,
