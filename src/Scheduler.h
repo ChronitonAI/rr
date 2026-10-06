@@ -11,6 +11,7 @@
 #include <set>
 #include <vector>
 
+#include "TaskishUid.h"
 #include "Ticks.h"
 #include "TraceFrame.h"
 #include "core.h"
@@ -290,6 +291,12 @@ private:
    * threads is currently in an execve.
    */
   pid_t in_exec_tgid;
+
+  /**
+   * The tasks of the in_exec_tgid threadgroup that were already stopped at
+   * a PTRACE_EVENT_EXIT we hadn't handled when the execve started.
+   */
+  std::set<TaskUid> exit_stops_before_exec;
 
   /**
    * The number of tasks that have is_stopped_ set.

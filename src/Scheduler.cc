@@ -93,6 +93,11 @@ static double high_priority_only_duration_step_factor = 2;
 static double high_priority_only_fraction = 0.2;
 static double start_high_priority_only_immediately_probability = 0.25;
 
+static bool is_at_unhandled_exit_stop(Task* t) {
+  return t->is_stopped() && t->ptrace_event() == PTRACE_EVENT_EXIT &&
+         !t->handled_ptrace_exit_event();
+}
+
 Scheduler::Scheduler(RecordSession& session)
     : reschedule_count(0),
       session(session),
@@ -925,6 +930,32 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
     break;
   }
 
+  if (in_exec_tgid) {
+    // As below when all tasks are blocked, we can't service the round-robin
+    // queue in order now.
+    while (RecordTask* t = get_round_robin_task()) {
+      maybe_pop_round_robin_task(t);
+    }
+    // The exec can't complete until the other threads of its thread group
+    // have exited. If a SIGKILL (normally the exec's) stopped one of them at
+    // its PTRACE_EVENT_EXIT and we've already collected that stop without
+    // handling it (e.g. an internal wait ran into it), it won't produce a new
+    // status, so run that task now.
+    // Leave alone tasks that were already at such a stop when the exec
+    // started: the exec's SIGKILL ends those stops, after which a non-leader
+    // produces a new status and the leader's tid goes to the thread that
+    // exec'd. Running them here could race with that.
+    if (ThreadGroup* tg = session.find_thread_group(in_exec_tgid)) {
+      for (Task* t : tg->task_set()) {
+        if (is_at_unhandled_exit_stop(t) &&
+            !exit_stops_before_exec.count(t->tuid())) {
+          next = static_cast<RecordTask*>(t);
+          break;
+        }
+      }
+    }
+  }
+
   if (next) {
     LOGM(debug) << "  selecting task " << next->tid;
   } else {
@@ -1071,6 +1102,7 @@ void Scheduler::on_destroy(RecordTask* t) {
   if (t->tgid() == in_exec_tgid &&
       t->thread_group()->task_set().size() == 1) {
     in_exec_tgid = 0;
+    exit_stops_before_exec.clear();
   }
 
   if (t->in_round_robin_queue) {
@@ -1160,12 +1192,19 @@ void Scheduler::did_enter_execve(RecordTask* t) {
   ASSERT(t, !in_exec_tgid) <<
     "Entering execve while another execve is already happening in tgid " << in_exec_tgid;
   in_exec_tgid = t->tgid();
+  exit_stops_before_exec.clear();
+  for (Task* tt : t->thread_group()->task_set()) {
+    if (is_at_unhandled_exit_stop(tt)) {
+      exit_stops_before_exec.insert(tt->tuid());
+    }
+  }
 }
 
 void Scheduler::did_exit_execve(RecordTask* t) {
   ASSERT(t, in_exec_tgid == t->tgid()) <<
     "Exiting an execve we didn't know about";
   in_exec_tgid = 0;
+  exit_stops_before_exec.clear();
 }
 
 } // namespace rr
