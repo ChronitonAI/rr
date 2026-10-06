@@ -995,18 +995,43 @@ static bool is_synthetic_SIGCHLD(const siginfo_t& si) {
   return si.si_signo == SIGCHLD && si.si_value.sival_int == SIGCHLD_SYNTHETIC;
 }
 
-void RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
+void RecordTask::maybe_drop_pending_SIGCHLD_notifications() {
+  for (Task* t : thread_group()->task_set()) {
+    auto rt = static_cast<RecordTask*>(t);
+    if (rt->is_signal_pending(SIGCHLD) || rt->has_stashed_sig(SIGCHLD)) {
+      return;
+    }
+  }
+  for (Task* t : thread_group()->task_set()) {
+    for (RecordTask* tracee :
+         static_cast<RecordTask*>(t)->emulated_ptrace_tracees) {
+      tracee->emulated_ptrace_SIGCHLD_pending = false;
+    }
+  }
+  for (ThreadGroup* child_tg : thread_group()->children()) {
+    for (Task* child : child_tg->task_set()) {
+      static_cast<RecordTask*>(child)->emulated_SIGCHLD_pending = false;
+    }
+  }
+}
+
+bool RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
   if (!is_synthetic_SIGCHLD(*si)) {
-    return;
+    return false;
   }
 
+  // The SIGCHLD is for our process, and any thread can take it, not just
+  // the ptracer.
   RecordTask* from_task = nullptr;
-  for (RecordTask* tracee : emulated_ptrace_tracees) {
-    if (tracee->emulated_ptrace_SIGCHLD_pending) {
-      if (!from_task) {
-        from_task = tracee;
+  for (Task* t : thread_group()->task_set()) {
+    for (RecordTask* tracee :
+         static_cast<RecordTask*>(t)->emulated_ptrace_tracees) {
+      if (tracee->emulated_ptrace_SIGCHLD_pending) {
+        if (!from_task) {
+          from_task = tracee;
+        }
+        tracee->emulated_ptrace_SIGCHLD_pending = false;
       }
-      tracee->emulated_ptrace_SIGCHLD_pending = false;
     }
   }
 
@@ -1026,7 +1051,7 @@ void RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
     if (!from_task) {
       // Maybe the task died after the synthetic SIGCHLD was sent
       LOG(warn) << "Can't find traced task that send synthetic SIGCHLD";
-      return;
+      return false;
     }
   }
 
@@ -1040,6 +1065,7 @@ void RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
     native_si->_sifields._sigchld.si_status_ =
         from_task->emulated_stop_code.ptrace_signal();
   }
+  return true;
 }
 
 bool RecordTask::is_waiting_for_ptrace(RecordTask* t) {

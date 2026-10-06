@@ -45,6 +45,7 @@
 #include "ReplaySession.h"
 #include "ReplayTask.h"
 #include "ScopedFd.h"
+#include "SignalfdMonitor.h"
 #include "StdioMonitor.h"
 #include "StringVectorToCharArray.h"
 #include "TraceeAttentionSet.h"
@@ -925,6 +926,16 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
         case Arch::PTRACE_POKEUSR: {
           ptrace_syscall_exit_legacy_arch<Arch>(this, tracee, regs);
         }
+      }
+      return;
+    }
+    case Arch::signalfd:
+    case Arch::signalfd4: {
+      // A signalfd() with an existing signalfd as its first argument just
+      // changes its mask.
+      if ((int)regs.orig_arg1() == -1) {
+        fd_table()->add_monitor(this, regs.syscall_result(),
+                                new SignalfdMonitor());
       }
       return;
     }

@@ -111,6 +111,7 @@ std::string file_monitor_type_name(FileMonitor::Type t) {
     CASE(ODirect);
     CASE(BpfMap);
     CASE(PidFd);
+    CASE(Signalfd);
     default:
       FATAL() << "Unknown type " << (int)t;
       return "";
