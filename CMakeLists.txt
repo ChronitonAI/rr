@@ -1401,6 +1401,7 @@ set(BASIC_TESTS
   sigaction_old
   sigaltstack
   sigchld_interrupt_signal
+  sigchld_nocldstop
   sigcont
   sigcont_then_sigstop
   sigcont_threaded
