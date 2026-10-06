@@ -1050,9 +1050,22 @@ void RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
     }
   }
 
-  from_task->set_siginfo_for_waited_task<NativeArch>(
-      reinterpret_cast<NativeArch::siginfo_t*>(si));
-  si->si_value.sival_int = 0;
+  if (from_task->emulated_ptracer &&
+      from_task->emulated_ptracer->thread_group() != thread_group()) {
+    // This SIGCHLD is for the real parent, about a group-stop of the
+    // process, which its ptracer sees as a ptrace stop (see
+    // signal_delivered).
+    auto native_si = reinterpret_cast<NativeArch::siginfo_t*>(si);
+    native_si->si_code = CLD_STOPPED;
+    native_si->_sifields._sigchld.si_pid_ = from_task->tgid();
+    native_si->_sifields._sigchld.si_uid_ = getuid();
+    native_si->_sifields._sigchld.si_status_ =
+        from_task->thread_group()->stopping_signal;
+  } else {
+    from_task->set_siginfo_for_waited_task<NativeArch>(
+        reinterpret_cast<NativeArch::siginfo_t*>(si));
+    si->si_value.sival_int = 0;
+  }
 }
 
 bool RecordTask::is_waiting_for_ptrace(RecordTask* t) {
@@ -1200,6 +1213,7 @@ bool RecordTask::has_any_actionable_signal() {
 
 void RecordTask::emulate_SIGCONT() {
   thread_group()->stopping_signal = 0;
+  thread_group()->stop_report_signal = 0;
   // All threads in the process are resumed.
   for (Task* t : thread_group()->task_set()) {
     auto rt = static_cast<RecordTask*>(t);
@@ -1218,14 +1232,36 @@ void RecordTask::signal_delivered(int sig) {
   }
 
   if (is_sig_stopping(sig)) {
+    bool new_stop = !thread_group()->stopping_signal;
     thread_group()->stopping_signal = sig;
+    if (new_stop) {
+      thread_group()->stop_report_signal = sig;
+    }
     // All threads in the process are stopped.
+    bool all_traced = true;
+    bool traced_by_other_than_parent = false;
     for (Task* t : thread_group()->task_set()) {
       auto rt = static_cast<RecordTask*>(t);
       rt->apply_group_stop(sig);
+      if (!rt->emulated_ptracer) {
+        all_traced = false;
+      } else if (rt->emulated_ptracer->thread_group().get() !=
+                 thread_group()->parent()) {
+        traced_by_other_than_parent = true;
+      }
     }
     // apply_group_stop calls send_synthetic_SIGCHLD_if_necessary(). Don't
-    // do it again.
+    // do it again. But for a thread that is traced, it notifies only the
+    // ptracer. Linux also notifies the real parent, unless that's the
+    // ptracer's process. (If some thread isn't traced, apply_group_stop
+    // already did.)
+    if (new_stop && all_traced && traced_by_other_than_parent) {
+      emulated_SIGCHLD_pending = true;
+      RecordTask* parent = session().find_task(get_parent_pid());
+      if (parent) {
+        parent->send_synthetic_SIGCHLD_if_necessary();
+      }
+    }
     needs_SIGCHLD = false;
   } else if (sig == SIGCONT && !is_sig_ignored(sig)) {
     emulate_SIGCONT();

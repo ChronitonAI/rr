@@ -535,6 +535,9 @@ struct TaskSyscallState : TaskSyscallStateBase {
   std::unique_ptr<TraceTaskEvent> exec_saved_event;
 
   RecordTask* emulate_wait_for_child;
+  /** When emulate_wait_for_child is set, report the group-stop of its
+   *  process (ThreadGroup::stop_report_signal) */
+  bool emulate_wait_group_stop;
 
   /** Saved syscall-entry registers, used by code paths that modify the
    *  registers temporarily.
@@ -576,6 +579,7 @@ struct TaskSyscallState : TaskSyscallStateBase {
   TaskSyscallState()
       : t(nullptr),
         emulate_wait_for_child(nullptr),
+        emulate_wait_group_stop(false),
         expect_errno(0),
         should_emulate_result(false),
         preparation_done(false),
@@ -2384,16 +2388,42 @@ static bool maybe_emulate_wait(RecordTask* t, TaskSyscallState& syscall_state) {
   for (ThreadGroup* child_process : t->thread_group()->children()) {
     for (Task* child : child_process->task_set()) {
       auto rchild = static_cast<RecordTask*>(child);
-      if (rchild->emulated_stop_type == NOT_STOPPED) {
-        continue;
-      }
-      if (!(t->in_wait_options & WUNTRACED) && rchild->emulated_stop_type != CHILD_STOP) {
+      // Group-stops are reported for the whole process, below. The emulated
+      // stop of a traced child is for its ptracer, above.
+      if (rchild->emulated_stop_type != CHILD_STOP ||
+          rchild->emulated_ptracer) {
         continue;
       }
       if (!rchild->emulated_stop_pending || !t->is_waiting_for(rchild)) {
         continue;
       }
       syscall_state.emulate_wait_for_child = rchild;
+      return true;
+    }
+  }
+
+  if (t->in_wait_options & WUNTRACED) {
+    for (ThreadGroup* child_process : t->thread_group()->children()) {
+      if (!child_process->stop_report_signal) {
+        continue;
+      }
+      RecordTask* rchild = nullptr;
+      for (Task* child : child_process->task_set()) {
+        auto rc = static_cast<RecordTask*>(child);
+        if (!rchild || rc->tid == child_process->tgid) {
+          rchild = rc;
+        }
+      }
+      // Linux looks only at the child's main thread here: if our process
+      // traces it, Linux reports its ptrace stops to us instead
+      // (wait_consider_task()).
+      if (!rchild || !t->is_waiting_for(rchild) ||
+          (rchild->emulated_ptracer &&
+           rchild->emulated_ptracer->thread_group() == t->thread_group())) {
+        continue;
+      }
+      syscall_state.emulate_wait_for_child = rchild;
+      syscall_state.emulate_wait_group_stop = true;
       return true;
     }
   }
@@ -7482,8 +7512,11 @@ static void rec_process_syscall_arch(RecordTask* t,
       RecordTask* tracee = syscall_state.emulate_wait_for_child;
       if (tracee) {
         // Finish emulation of ptrace result or stop-signal
+        bool group_stop = syscall_state.emulate_wait_group_stop;
+        ThreadGroup* tg = tracee->thread_group().get();
         Registers r = t->regs();
-        r.set_syscall_result(syscallno == Arch::waitid ? 0 : tracee->tid);
+        pid_t pid = group_stop ? tg->tgid : tracee->tid;
+        r.set_syscall_result(syscallno == Arch::waitid ? 0 : pid);
         t->set_regs(r);
         if (syscallno == Arch::waitid) {
           remote_ptr<typename Arch::siginfo_t> sip = r.arg3();
@@ -7491,19 +7524,39 @@ static void rec_process_syscall_arch(RecordTask* t,
             typename Arch::siginfo_t si;
             memset(&si, 0, sizeof(si));
             si.si_signo = SIGCHLD;
-            tracee->set_siginfo_for_waited_task<Arch>(&si);
+            if (group_stop) {
+              si.si_code = CLD_STOPPED;
+              si._sifields._sigchld.si_pid_ = tg->tgid;
+              si._sifields._sigchld.si_uid_ = getuid();
+              si._sifields._sigchld.si_status_ = tg->stop_report_signal;
+            } else {
+              tracee->set_siginfo_for_waited_task<Arch>(&si);
+            }
             t->write_mem(sip, si);
           }
         } else {
           remote_ptr<int> statusp = r.arg2();
           if (!statusp.is_null()) {
-            t->write_mem(statusp, tracee->emulated_stop_code.get());
+            WaitStatus status =
+                group_stop ? WaitStatus::for_stop_sig(tg->stop_report_signal)
+                           : tracee->emulated_stop_code;
+            t->write_mem(statusp, status.get());
           }
         }
         if (syscallno == Arch::waitid && (r.arg4() & WNOWAIT)) {
           // Leave the child in a waitable state
         } else {
-          if (tracee->emulated_ptracer == t) {
+          if (group_stop) {
+            // The real parent waited for the process's group-stop.
+            tg->stop_report_signal = 0;
+            for (Task* thread : tg->task_set()) {
+              auto rt = static_cast<RecordTask*>(thread);
+              if (!rt->emulated_ptracer &&
+                  rt->emulated_stop_type == GROUP_STOP) {
+                rt->emulated_stop_pending = false;
+              }
+            }
+          } else if (tracee->emulated_ptracer == t) {
             tracee->emulated_stop_pending = false;
           } else {
             for (Task* thread : tracee->thread_group()->task_set()) {
