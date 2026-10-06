@@ -2977,8 +2977,24 @@ bool Task::open_mem_fd() {
   as->set_mem_fd(ScopedFd());
 
   if (!is_stopped_) {
-    LOG(warn) << "Can't retrieve mem fd for " << tid <<
-      "; process not stopped, racing with exec?";
+    // A task without an address space (no VmSize) has exited, maybe without
+    // a PTRACE_EVENT_EXIT stop that we've seen (the kernel skips that stop
+    // when a SIGKILL is pending). We get here when a SIGKILL takes out all the
+    // tasks in an address space and we still try to access it through one of
+    // them. There's nothing to open a mem fd for.
+    auto fields = read_proc_status_fields(tid, "State", "VmSize");
+    if (is_exiting() || fields.size() == 1) {
+      LOG(debug) << "Can't retrieve mem fd for " << tid
+                 << "; it has exited";
+    } else if (fields.empty()) {
+      // Its tid is gone: it exited and was reaped, or it exec'd and isn't
+      // its thread group's leader.
+      LOG(warn) << "Can't retrieve mem fd for " << tid <<
+        "; it's gone, racing with exit or exec?";
+    } else {
+      LOG(warn) << "Can't retrieve mem fd for " << tid <<
+        "; process not stopped, racing with exec?";
+    }
     return false;
   }
 

@@ -1612,6 +1612,7 @@ set(TESTS_WITH_PROGRAM
   invalid_interpreter
   invalid_jump
   jit_proc_mem
+  kill_threads_no_exit_events
   link
   madvise_dontfork
   madvise_fracture_flags
