@@ -1347,6 +1347,7 @@ set(BASIC_TESTS
   redzone_integrity
   rename
   rlimit
+  robust_futex_clone
   rseq_cpu_id_reset
   rusage
   samask

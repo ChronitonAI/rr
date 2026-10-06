@@ -374,11 +374,8 @@ void RecordTask::post_wait_clone(Task* cloned_from, int flags) {
   priority = rt->priority;
   syscallbuf_code_layout = rt->syscallbuf_code_layout;
   prctl_seccomp_status = rt->prctl_seccomp_status;
-  robust_futex_list = rt->robust_futex_list;
-  robust_futex_list_len = rt->robust_futex_list_len;
   // The kernel doesn't pass robust lists on to new tasks (copy_process() ->
-  // futex_init_task()). glibc registers the x86-64 list again in new threads
-  // and processes, but nothing does that for an i386 list, so don't copy it.
+  // futex_init_task()).
   tsc_mode = rt->tsc_mode;
   cpuid_mode = rt->cpuid_mode;
   if (CLONE_SHARE_SIGHANDLERS & flags) {
