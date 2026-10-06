@@ -1321,6 +1321,9 @@ set(BASIC_TESTS
   ptrace_traceme_thread
   ptrace_waiter_thread
   ptracer_death
+  ptracer_death_event_stop
+  ptracer_death_interrupt
+  ptracer_death_leader
   ptracer_death_multithread
   ptracer_death_multithread_peer
   # pivot_root ... disabled because it fails when run as root and does nothing otherwise

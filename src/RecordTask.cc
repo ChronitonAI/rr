@@ -229,14 +229,8 @@ RecordTask::~RecordTask() {
           << "PTRACE_O_TRACEEXIT only supported for stable exits for now";
     }
   }
-  for (RecordTask* t : emulated_ptrace_tracees) {
-    // XXX emulate PTRACE_O_EXITKILL
-    ASSERT(this, t->emulated_ptracer == this);
-    t->emulated_ptracer = nullptr;
-    t->emulated_ptrace_options = 0;
-    t->emulated_stop_pending = false;
-    t->emulated_stop_type = NOT_STOPPED;
-  }
+  // Normally we did this when we processed our exit.
+  detach_emulated_ptrace_tracees();
 
   // We expect tasks to usually exit by a call to exit() or
   // exit_group(), so it's not helpful to warn about that.
@@ -870,6 +864,29 @@ void RecordTask::do_ptrace_exit_stop(WaitStatus exit_status) {
     // This is a bit wrong; this is an exit stop, not a signal/ptrace stop.
     emulate_ptrace_stop(exit_status);
   }
+}
+
+void RecordTask::detach_emulated_ptrace_tracees() {
+  for (RecordTask* t : emulated_ptrace_tracees) {
+    // XXX emulate PTRACE_O_EXITKILL
+    ASSERT(this, t->emulated_ptracer == this);
+    // If we're holding |t| in the middle of its syscall, at a ptrace event
+    // that we reported to its ptracer, resume it from there, as
+    // prepare_ptrace_cont does. The scheduler deals with other emulated
+    // stops.
+    bool resume =
+        t->held_at_emulated_ptrace_event && !t->seen_ptrace_exit_event();
+    t->emulated_ptracer = nullptr;
+    t->emulated_ptrace_seized = false;
+    t->emulated_ptrace_options = 0;
+    t->emulated_ptrace_cont_command = 0;
+    t->emulated_stop_pending = false;
+    t->emulated_stop_type = NOT_STOPPED;
+    if (resume) {
+      t->resume_execution(RESUME_SYSCALL, RESUME_NONBLOCKING, RESUME_NO_TICKS);
+    }
+  }
+  emulated_ptrace_tracees.clear();
 }
 
 void RecordTask::did_reach_zombie() {
