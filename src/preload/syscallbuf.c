@@ -1330,6 +1330,8 @@ static int record_fits(void* record_end) {
 }
 
 extern RR_HIDDEN long _memory_check_writable(void* addr, size_t len);
+extern RR_HIDDEN long _memory_check_readable(const void* addr, size_t len);
+extern RR_HIDDEN long _memory_check_readable_str(const char* str);
 
 /**
  * The syscallbuf code reads some syscall arguments itself, and copies the
@@ -1357,6 +1359,32 @@ static int bail_out_of_record(void) {
 static int can_write(void* record_end, void* addr, size_t len) {
   if (!addr || !len || !record_fits(record_end) ||
       _memory_check_writable(addr, len)) {
+    return 1;
+  }
+  return bail_out_of_record();
+}
+
+static int can_read(void* record_end, const void* addr, size_t len) {
+  if (!addr || !len || !record_fits(record_end) ||
+      _memory_check_readable(addr, len)) {
+    return 1;
+  }
+  return bail_out_of_record();
+}
+
+/**
+ * For memory we read before we know whether we'll buffer the syscall, such as
+ * a struct that tells us how big the record will be.
+ */
+static int can_read_now(const void* addr, size_t len) {
+  if (!addr || !len || _memory_check_readable(addr, len)) {
+    return 1;
+  }
+  return bail_out_of_record();
+}
+
+static int can_read_str_now(const char* str) {
+  if (!str || _memory_check_readable_str(str)) {
     return 1;
   }
   return bail_out_of_record();
@@ -1826,7 +1854,8 @@ static long sys_clock_gettime(struct syscall_info* call) {
     tp2 = ptr;
     ptr += sizeof(*tp2);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, tp, sizeof(*tp)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   ret = untraced_syscall2(syscallno, clk_id, tp2);
@@ -1860,7 +1889,8 @@ static long sys_clock_gettime64(struct syscall_info* call) {
     tp2 = ptr;
     ptr += sizeof(*tp2);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, tp, sizeof(*tp)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   ret = untraced_syscall2(syscallno, clk_id, tp2);
@@ -1925,14 +1955,18 @@ static int sys_fcntl64_own_ex(struct syscall_info* call) {
     owner2 = ptr;
     ptr += sizeof(*owner2);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  /* F_SETOWN_EX only reads the struct. */
+  if (!(cmd == F_GETOWN_EX ? can_write(ptr, owner, sizeof(*owner))
+                           : can_read(ptr, owner, sizeof(*owner))) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   if (owner2) {
     memcpy_input_parameter(owner2, owner, sizeof(*owner2));
   }
   ret = untraced_syscall3(syscallno, fd, cmd, owner2);
-  if (owner2 && ret >= 0 && !buffer_hdr()->failed_during_preparation) {
+  if (owner2 && cmd == F_GETOWN_EX && ret >= 0 &&
+      !buffer_hdr()->failed_during_preparation) {
     local_memcpy(owner, owner2, sizeof(*owner));
   }
   return commit_raw_syscall(syscallno, ptr, ret);
@@ -1959,16 +1993,15 @@ static int sys_fcntl64_setlk64(struct syscall_info* call) {
     lock2 = ptr;
     ptr += sizeof(*lock2);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  /* F_SETLK only reads the struct. */
+  if (!can_read(ptr, lock, sizeof(*lock)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   if (lock2) {
     memcpy_input_parameter(lock2, lock, sizeof(*lock2));
   }
   ret = untraced_syscall3(syscallno, fd, cmd, lock2);
-  if (lock2 && ret >= 0 && !buffer_hdr()->failed_during_preparation) {
-    local_memcpy(lock, lock2, sizeof(*lock));
-  }
   return commit_raw_syscall(syscallno, ptr, ret);
 }
 
@@ -2075,7 +2108,8 @@ static long sys_flistxattr(struct syscall_info* call) {
     buf2 = ptr;
     ptr += size;
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, buf, size) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -2111,7 +2145,8 @@ static long sys_ioctl_fionread(struct syscall_info* call) {
     buf = ptr;
     ptr += sizeof(*value);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, value, sizeof(*value)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   ret = untraced_syscall3(syscallno, fd, FIONREAD, buf);
@@ -2182,6 +2217,12 @@ static long sys_futex(struct syscall_info* call) {
   uint32_t* uaddr2 = (uint32_t*)call->args[4];
   uint32_t val3 = call->args[5];
 
+  /* We copy the futex words below. The kernel doesn't touch a null uaddr for
+     some ops. */
+  if (!uaddr || ((FUTEX_USES_UADDR2 & flags) && !uaddr2)) {
+    return traced_raw_syscall(call);
+  }
+
   void* ptr = prep_syscall();
   uint32_t* saved_uaddr;
   uint32_t* saved_uaddr2 = NULL;
@@ -2202,7 +2243,9 @@ static long sys_futex(struct syscall_info* call) {
   }
   /* See above; it's not worth buffering may-block futex
    * calls. */
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, uaddr, sizeof(*uaddr)) ||
+      !can_write(ptr, saved_uaddr2 ? uaddr2 : NULL, sizeof(*uaddr2)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -2236,7 +2279,9 @@ static long sys_getrandom(struct syscall_info* call) {
     buf2 = ptr;
     ptr += buf_len;
   }
-  if (!start_commit_buffered_syscall(call->no, ptr, (flags & GRND_NONBLOCK) ? WONT_BLOCK : MAY_BLOCK)) {
+  if (!can_write(ptr, buf, buf_len) ||
+      !start_commit_buffered_syscall(
+          call->no, ptr, (flags & GRND_NONBLOCK) ? WONT_BLOCK : MAY_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -2258,7 +2303,8 @@ static long sys_generic_getdents(struct syscall_info* call) {
     buf2 = ptr;
     ptr += count;
   }
-  if (!start_commit_buffered_syscall(call->no, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, buf, count) ||
+      !start_commit_buffered_syscall(call->no, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -2300,7 +2346,8 @@ static long sys_gettimeofday(struct syscall_info* call) {
     tzp2 = ptr;
     ptr += sizeof(*tzp2);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, tp, sizeof(*tp)) || !can_write(ptr, tzp, sizeof(*tzp)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   ret = untraced_syscall2(syscallno, tp2, tzp2);
@@ -2333,7 +2380,8 @@ static long sys_generic_getxattr(struct syscall_info* call) {
     value2 = ptr;
     ptr += size;
   }
-  if (!start_commit_buffered_syscall(call->no, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, value, size) ||
+      !start_commit_buffered_syscall(call->no, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -2364,7 +2412,8 @@ static long sys_fgetxattr(struct syscall_info* call) {
     value2 = ptr;
     ptr += size;
   }
-  if (!start_commit_buffered_syscall(call->no, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, value, size) ||
+      !start_commit_buffered_syscall(call->no, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -2386,7 +2435,8 @@ static long sys_generic_listxattr(struct syscall_info* call) {
     buf2 = ptr;
     ptr += size;
   }
-  if (!start_commit_buffered_syscall(call->no, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, buf, size) ||
+      !start_commit_buffered_syscall(call->no, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -2422,7 +2472,8 @@ static long sys__llseek(struct syscall_info* call) {
     result2 = ptr;
     ptr += sizeof(*result2);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, result, sizeof(*result)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -2539,9 +2590,8 @@ static long sys_mprotect(struct syscall_info* call) {
 }
 
 static int supported_open(const char* file_name, int flags) {
-  if (!file_name) {
-    /* XXXkhuey what about other bogus but non-null pointers?
-       We're going to crash below. */
+  if (!file_name || !can_read_str_now(file_name)) {
+    /* We'd read it below. */
     return 0;
   }
 
@@ -2696,7 +2746,8 @@ static long sys_openat2(struct syscall_info* call) {
 
   assert(syscallno == call->no);
 
-  if (!supported_open(pathname, how->flags)) {
+  if (!how || !can_read_now(how, sizeof(*how)) ||
+      !supported_open(pathname, how->flags)) {
     return traced_raw_syscall(call);
   }
 
@@ -2740,7 +2791,8 @@ static long sys_poll(struct syscall_info* call) {
     fds2 = ptr;
     ptr += nfds * sizeof(*fds2);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, fds, nfds * sizeof(*fds)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   if (fds2) {
@@ -2804,7 +2856,9 @@ static long sys_ppoll(struct syscall_info* call) {
     fds2 = ptr;
     ptr += nfds * sizeof(*fds2);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, fds, nfds * sizeof(*fds)) ||
+      !can_read(ptr, tmo_p, sizeof(*tmo_p)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   if (fds2) {
@@ -2865,7 +2919,8 @@ static long sys_epoll_wait(struct syscall_info* call) {
     events2 = ptr;
     ptr += max_events * sizeof(*events2);
   }
-  if (!start_commit_buffered_syscall(call->no, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, events2 ? events : NULL, max_events * sizeof(*events)) ||
+      !start_commit_buffered_syscall(call->no, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -2934,7 +2989,9 @@ static long sys_epoll_pwait2(struct syscall_info* call) {
     events2 = ptr;
     ptr += max_events * sizeof(*events2);
   }
-  if (!start_commit_buffered_syscall(call->no, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, events2 ? events : NULL, max_events * sizeof(*events)) ||
+      !can_read(ptr, timeout, sizeof(*timeout)) ||
+      !start_commit_buffered_syscall(call->no, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -3127,7 +3184,8 @@ static long sys_pread64(struct syscall_info* call) {
     buf2 = ptr;
     ptr += count;
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
+  if (!can_write(ptr, buf, count) ||
+      !start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -3154,7 +3212,8 @@ static long sys_readlink(struct syscall_info* call) {
     buf2 = ptr;
     ptr += bufsiz;
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, buf2 ? buf : NULL, bufsiz) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -3181,7 +3240,8 @@ static long sys_readlinkat(struct syscall_info* call, int privileged) {
     buf2 = ptr;
     ptr += bufsiz;
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, buf2 ? buf : NULL, bufsiz) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     if (privileged) {
       return privileged_traced_raw_syscall(call);
     }
@@ -3206,6 +3266,9 @@ static long sys_socketcall_recv(struct syscall_info* call) {
 
   const int syscallno = SYS_socketcall;
   long* args = (long*)call->args[1];
+  if (!args || !can_read_now(args, 4 * sizeof(*args))) {
+    return traced_raw_syscall(call);
+  }
   int sockfd = args[0];
   void* buf = (void*)args[1];
   size_t len = args[2];
@@ -3222,7 +3285,8 @@ static long sys_socketcall_recv(struct syscall_info* call) {
     buf2 = ptr;
     ptr += len;
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
+  if (!can_write(ptr, buf, len) ||
+      !start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -3265,6 +3329,12 @@ static long sys_recvfrom(struct syscall_info* call) {
   void* src_addr = (void*)call->args[4];
   socklen_t* addrlen = (socklen_t*)call->args[5];
 
+  /* The kernel fails the syscall with EFAULT if addrlen is NULL but src_addr
+   * isn't. */
+  if ((src_addr && !addrlen) || !can_read_now(addrlen, sizeof(*addrlen))) {
+    return traced_raw_syscall(call);
+  }
+
   void* ptr = prep_syscall_for_fd(sockfd);
   void* buf2 = NULL;
   struct sockaddr* src_addr2 = NULL;
@@ -3272,8 +3342,6 @@ static long sys_recvfrom(struct syscall_info* call) {
   long ret;
 
   assert(syscallno == call->no);
-  /* If addrlen is NULL then src_addr must also be null */
-  assert(addrlen || !src_addr);
 
   if (src_addr) {
     src_addr2 = ptr;
@@ -3287,7 +3355,9 @@ static long sys_recvfrom(struct syscall_info* call) {
     buf2 = ptr;
     ptr += len;
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
+  if (!can_write(ptr, src_addr, src_addr ? *addrlen : 0) ||
+      !can_write(ptr, addrlen, sizeof(*addrlen)) || !can_write(ptr, buf, len) ||
+      !start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
     return traced_raw_syscall(call);
   }
   if (addrlen) {
@@ -3335,6 +3405,24 @@ static long sys_recvmsg(struct syscall_info* call) {
   int sockfd = call->args[0];
   struct msghdr* msg = (struct msghdr*)call->args[1];
   int flags = call->args[2];
+  rr_iovlen_t i;
+
+  /* We read *msg and the iovecs to compute the size of the record. The kernel
+   * fails the syscall with EMSGSIZE if there are more than UIO_MAXIOV (1024)
+   * iovecs. We copy the data to the iovecs' buffers, so leave null ones to
+   * the kernel too. */
+  if (!msg || !can_read_now(msg, sizeof(*msg)) || msg->msg_iovlen > 1024 ||
+      (msg->msg_iovlen > 0 &&
+       (!msg->msg_iov ||
+        !can_read_now(msg->msg_iov,
+                      msg->msg_iovlen * sizeof(*msg->msg_iov))))) {
+    return traced_raw_syscall(call);
+  }
+  for (i = 0; i < msg->msg_iovlen; ++i) {
+    if (!msg->msg_iov[i].iov_base && msg->msg_iov[i].iov_len) {
+      return traced_raw_syscall(call);
+    }
+  }
 
   void* ptr = prep_syscall_for_fd(sockfd);
   long ret;
@@ -3343,7 +3431,6 @@ static long sys_recvmsg(struct syscall_info* call) {
   void* ptr_overwritten_end;
   void* ptr_bytes_start;
   void* ptr_end;
-  rr_iovlen_t i;
 
   assert(syscallno == call->no);
 
@@ -3361,6 +3448,18 @@ static long sys_recvmsg(struct syscall_info* call) {
   }
   for (i = 0; i < msg->msg_iovlen; ++i) {
     ptr += msg->msg_iov[i].iov_len;
+  }
+  /* We write the lengths and flags in *msg, the name, the control data and the
+   * data. */
+  if (!can_write(ptr, msg, sizeof(*msg)) ||
+      !can_write(ptr, msg->msg_name, msg->msg_namelen) ||
+      !can_write(ptr, msg->msg_control, msg->msg_controllen)) {
+    return traced_raw_syscall(call);
+  }
+  for (i = 0; i < msg->msg_iovlen; ++i) {
+    if (!can_write(ptr, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len)) {
+      return traced_raw_syscall(call);
+    }
   }
   if (!start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
     return traced_raw_syscall(call);
@@ -3544,7 +3643,7 @@ static long sys_getsockopt(struct syscall_info* call) {
   socklen_t* optlen2;
   void* optval2;
 
-  if (!optlen || !optval) {
+  if (!optlen || !optval || !can_read_now(optlen, sizeof(*optlen))) {
     return traced_raw_syscall(call);
   }
 
@@ -3558,7 +3657,9 @@ static long sys_getsockopt(struct syscall_info* call) {
 
   assert(syscallno == call->no);
 
-  if (!start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
+  if (!can_write(ptr, optlen, sizeof(*optlen)) ||
+      !can_write(ptr, optval, *optlen) ||
+      !start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -3594,6 +3695,10 @@ static long sys_getsockname(struct syscall_info* call) {
   socklen_t* addrlen2;
   struct sockaddr* addr2 = NULL;
 
+  if (!addrlen || !can_read_now(addrlen, sizeof(*addrlen))) {
+    return traced_raw_syscall(call);
+  }
+
   void* ptr = prep_syscall_for_fd(sockfd);
   long ret;
 
@@ -3606,6 +3711,10 @@ static long sys_getsockname(struct syscall_info* call) {
 
   assert(syscallno == call->no);
 
+  if (!can_write(ptr, addrlen, sizeof(*addrlen)) ||
+      !can_write(ptr, addr, *addrlen)) {
+    return traced_raw_syscall(call);
+  }
   if (addrlen2) {
     memcpy_input_parameter(addrlen2, addrlen, sizeof(*addrlen2));
   }
@@ -3637,6 +3746,10 @@ static long sys_socketpair(struct syscall_info* call) {
   int protocol = call->args[2];
   two_ints* sv = (two_ints*)call->args[3];
 
+  if (!sv) {
+    return traced_raw_syscall(call);
+  }
+
   void* ptr = prep_syscall();
   struct timezone* sv2 = NULL;
   long ret;
@@ -3645,7 +3758,8 @@ static long sys_socketpair(struct syscall_info* call) {
 
   sv2 = ptr;
   ptr += sizeof(*sv2);
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, sv, sizeof(*sv)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   ret = untraced_syscall4(syscallno, domain, type, protocol, sv2);
@@ -3660,6 +3774,10 @@ static long sys_uname(struct syscall_info* call) {
   const int syscallno = SYS_uname;
   void* buf = (void*)call->args[0];
 
+  if (!buf) {
+    return traced_raw_syscall(call);
+  }
+
   void* ptr = prep_syscall();
   void* buf2;
   long ret;
@@ -3669,7 +3787,8 @@ static long sys_uname(struct syscall_info* call) {
 
   buf2 = ptr;
   ptr += bufsize;
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, buf, bufsize) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   ret = untraced_syscall1(syscallno, buf2);
@@ -3690,7 +3809,8 @@ static long sys_time(struct syscall_info* call) {
 
   assert(syscallno == call->no);
 
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, tp, sizeof(*tp)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   ret = untraced_syscall1(syscallno, NULL);
@@ -3725,7 +3845,8 @@ static long sys_xstat64(struct syscall_info* call) {
     buf2 = ptr;
     ptr += sizeof(*buf2);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, buf, sizeof(*buf)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   ret = untraced_syscall2(syscallno, what, buf2);
@@ -3749,7 +3870,8 @@ static long sys_statx(struct syscall_info* call) {
     buf2 = ptr;
     ptr += sizeof(*buf2);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, buf, sizeof(*buf)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   ret = untraced_syscall5(syscallno,
@@ -3778,7 +3900,8 @@ static long sys_fstatat(struct syscall_info* call) {
     ptr += sizeof(*buf2);
   }
 
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, buf, sizeof(*buf)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   ret = untraced_syscall4(syscallno,
@@ -3808,7 +3931,8 @@ static long sys_quotactl(struct syscall_info* call) {
     buf2 = ptr;
     ptr += sizeof(*buf2);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, addr, sizeof(*buf2)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   ret = untraced_syscall4(syscallno, cmd, special, id, buf2);
@@ -3836,7 +3960,8 @@ static long sys_statfs(struct syscall_info* call) {
     buf2 = ptr;
     ptr += sizeof(*buf2);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, buf, sizeof(*buf)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   ret = untraced_syscall2(syscallno, what, buf2);
@@ -3990,7 +4115,7 @@ static long sys_rseq(struct syscall_info* call) {
 
   assert(syscallno == call->no);
 
-  if (flags || ((uintptr_t)rseq & 31) || rseq_len != sizeof(*rseq) ||
+  if (!rseq || flags || ((uintptr_t)rseq & 31) || rseq_len != sizeof(*rseq) ||
       thread_locals->rseq_called || globals.cpu_binding < 0) {
     return traced_raw_syscall(call);
   }
@@ -3998,7 +4123,8 @@ static long sys_rseq(struct syscall_info* call) {
   void* ptr = prep_syscall();
   /* Allow buffering only for the simplest case: setting up the
      initial rseq, all parameters OK and CPU binding in place. */
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, rseq, sizeof(*rseq)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -4045,7 +4171,8 @@ static long sys_ptrace(struct syscall_info* call) {
   data2 = ptr;
   ptr += sizeof(long);
 
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, data, sizeof(long)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -4077,7 +4204,8 @@ static long sys_getrusage(struct syscall_info* call) {
     buf2 = ptr;
     ptr += sizeof(struct rusage);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, buf, sizeof(*buf)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -4109,7 +4237,9 @@ static long sys_rt_sigprocmask(struct syscall_info* call) {
   oldset2 = ptr;
   ptr += sizeof(kernel_sigset_t);
 
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_read(ptr, set, sizeof(*set)) ||
+      !can_write(ptr, oldset, sizeof(*oldset)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
 
@@ -4179,7 +4309,8 @@ static long sys_sigaltstack(struct syscall_info* call) {
     old_ss2 = ptr;
     ptr += sizeof(*old_ss2);
   }
-  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+  if (!can_write(ptr, old_ss, sizeof(*old_ss)) ||
+      !start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
   }
   ret = untraced_syscall2(syscallno, ss, old_ss2);
