@@ -152,8 +152,18 @@ public:
    * ptraced task has had its SIGCHLD sent.
    * Note that we can't set the correct siginfo when we send the signal, because
    * it requires us to set information only the kernel has permission to set.
+   * Returns true if we filled in |si|.
    */
-  void set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si);
+  bool set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si);
+  /**
+   * This process has taken a SIGCHLD some other way than in a handler (see
+   * signal_delivered), so we won't send it another one for the stops of its
+   * tracees and children that we still owe it SIGCHLDs for. Linux would
+   * have merged those into the SIGCHLD it took, so forget them, unless a
+   * SIGCHLD is still pending for the process (or stashed by us), which can
+   * carry them.
+   */
+  void maybe_drop_pending_SIGCHLD_notifications();
   /**
    * Sets up |si| as if we're delivering a SIGCHLD/waitid for this waited task.
    */

@@ -41,6 +41,7 @@ public:
     ODirect,
     BpfMap,
     PidFd,
+    Signalfd,
   };
 
   virtual Type type() { return Base; }
