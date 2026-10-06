@@ -1384,6 +1384,9 @@ protected:
   // A counter for the number of stops for which the stop may have been caused
   // by PTRACE_INTERRUPT. See description in do_waitpid
   int expecting_ptrace_interrupt_stop;
+  // True if the last stop that did_waitpid() got was a group stop
+  // (PTRACE_EVENT_STOP), even if we took it for our own PTRACE_INTERRUPT's.
+  bool waited_for_group_stop;
 
   bool was_reaped_;
   // Let this Task object be destroyed with no consequences.

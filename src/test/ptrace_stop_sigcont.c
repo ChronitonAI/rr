@@ -119,12 +119,13 @@ static void group_stop(void) {
   test_assert(0 == kill(child, SIGCONT));
   yield_a_lot();
   ptrace_getregs(child, &regs);
-  /* Linux reports a PTRACE_EVENT_STOP for the SIGCONT first, but rr doesn't
-     emulate that. */
-  do {
-    test_assert(0 == ptrace(PTRACE_CONT, child, NULL, NULL));
-    test_assert(child == waitpid(child, &status, 0));
-  } while (status != ((SIGCONT << 8) | 0x7f));
+  /* Linux reports a PTRACE_EVENT_STOP for the SIGCONT first. */
+  test_assert(0 == ptrace(PTRACE_CONT, child, NULL, NULL));
+  test_assert(child == waitpid(child, &status, 0));
+  test_assert(status == ((PTRACE_EVENT_STOP << 16) | (SIGTRAP << 8) | 0x7f));
+  test_assert(0 == ptrace(PTRACE_CONT, child, NULL, NULL));
+  test_assert(child == waitpid(child, &status, 0));
+  test_assert(status == ((SIGCONT << 8) | 0x7f));
   kill_child(child);
 }
 

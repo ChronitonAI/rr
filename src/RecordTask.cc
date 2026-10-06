@@ -173,6 +173,9 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       emulated_ptrace_options(0),
       emulated_ptrace_cont_command(0),
       emulated_stop_pending(false),
+      forwarded_ptrace_interrupt_stops(0),
+      report_ptrace_event_stop(false),
+      sigcont_notify_pending(false),
       emulated_ptrace_SIGCHLD_pending(false),
       emulated_SIGCHLD_pending(false),
       emulated_ptrace_seized(false),
@@ -760,6 +763,25 @@ vector<remote_code_ptr> RecordTask::syscallbuf_syscall_entry_breakpoints() {
 }
 
 void RecordTask::did_wait() {
+  // The first ptrace stop that the task enters after we forwarded a
+  // PTRACE_INTERRUPT is that PTRACE_INTERRUPT's stop if it's a
+  // PTRACE_EVENT_STOP (see forwarded_ptrace_interrupt_stops). We reported it
+  // to the ptracer already. Our own PTRACE_INTERRUPT stops are
+  // TIME_SLICE_SIGNAL stops by now. Otherwise, a PTRACE_EVENT_STOP of a
+  // seized tracee after a SIGCONT is the one that Linux reports to its
+  // ptracer for the SIGCONT (see sigcont_notify_pending). Any of these traps
+  // takes care of the SIGCONT's notification too.
+  bool is_forwarded_interrupt_stop = forwarded_ptrace_interrupt_stops == 1;
+  if (forwarded_ptrace_interrupt_stops > 0) {
+    --forwarded_ptrace_interrupt_stops;
+  }
+  report_ptrace_event_stop = status().group_stop() && sigcont_notify_pending &&
+                             !is_forwarded_interrupt_stop && emulated_ptracer &&
+                             emulated_ptrace_seized;
+  if (waited_for_group_stop) {
+    sigcont_notify_pending = false;
+  }
+
   for (auto p : syscallbuf_syscall_entry_breakpoints()) {
     vm()->remove_breakpoint(p, BKPT_INTERNAL);
   }
@@ -800,6 +822,9 @@ void RecordTask::did_wait() {
 }
 
 void RecordTask::set_emulated_ptracer(RecordTask* tracer) {
+  // A detach discards the trap of a SIGCONT notification (__ptrace_unlink()
+  // in kernel/ptrace.c).
+  sigcont_notify_pending = false;
   if (tracer) {
     ASSERT(this, !emulated_ptracer);
     emulated_ptracer = tracer;
@@ -1132,6 +1157,21 @@ static pid_t get_ppid(pid_t pid) {
   char* end;
   int actual_ppid = strtol(ppid_str[0].c_str(), &end, 10);
   return *end ? -1 : actual_ppid;
+}
+
+long RecordTask::forward_ptrace_interrupt() {
+  WaitOptions options(tid);
+  options.block_seconds = 0;
+  options.consume = false;
+  bool at_uncollected_stop = WaitManager::wait_stop(options).code == WAIT_OK;
+  LOG(debug) << "Interrupting " << tid;
+  errno = 0;
+  fallible_ptrace(PTRACE_INTERRUPT, nullptr, nullptr);
+  long result = -errno;
+  if (!result) {
+    forwarded_ptrace_interrupt_stops = at_uncollected_stop ? 2 : 1;
+  }
+  return result;
 }
 
 void RecordTask::apply_group_stop(int sig) {

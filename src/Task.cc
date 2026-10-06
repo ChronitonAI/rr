@@ -105,6 +105,7 @@ Task::Task(Session& session, pid_t _tid, pid_t _rec_tid, uint32_t serial,
       seen_ptrace_exit_event_(false),
       handled_ptrace_exit_event_(false),
       expecting_ptrace_interrupt_stop(0),
+      waited_for_group_stop(false),
       was_reaped_(false),
       forgotten(false) {
   memset(&thread_locals, 0, sizeof(thread_locals));
@@ -2368,6 +2369,7 @@ bool Task::did_waitpid(WaitStatus status) {
     // When we issue PTRACE_INTERRUPT, we this set this counter to 2, and here
     // we decrement it on every stop such that while this counter is positive,
     // any group-stop could be one induced by PTRACE_INTERRUPT
+    waited_for_group_stop = status.group_stop();
     if (account_for_potential_ptrace_interrupt_stop(status)) {
       // Assume this was PTRACE_INTERRUPT and thus treat this as
       // TIME_SLICE_SIGNAL instead.

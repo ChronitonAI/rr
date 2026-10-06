@@ -3194,10 +3194,7 @@ static Switchable prepare_ptrace(RecordTask* t,
         if (!tracee->is_stopped()) {
           // Running in a blocked syscall. Forward the PTRACE_INTERRUPT.
           // Regular syscall exit handling will take over from here.
-          LOG(debug) << "Interrupting " << tracee->tid;
-          errno = 0;
-          tracee->fallible_ptrace(PTRACE_INTERRUPT, nullptr, nullptr);
-          result = -errno;
+          result = tracee->forward_ptrace_interrupt();
           // Technically PTRACE_INTERRUPT stops are distinct from group stops,
           // but not in any way we currently care about.
           // NB: Despite the ptrace man page claiming the kernel sends SIGTRAP
@@ -7480,6 +7477,47 @@ static void rec_process_syscall_arch(RecordTask* t,
               : (int)r.arg2();
       if (sig == SIGCONT && !t->regs().syscall_failed()) {
         emulate_SIGCONT_sent_by_tracee(t);
+        // Find the processes that got the SIGCONT.
+        std::set<ThreadGroup*> targets;
+        RecordTask* target = nullptr;
+        if (syscallno == Arch::kill) {
+          pid_t pid = (pid_t)r.arg1_signed();
+          if (pid > 0) {
+            target = t->session().find_task(pid);
+          } else {
+            // A process group, or with -1, all processes we may signal.
+            pid_t pgrp = pid == 0 ? getpgid(t->tgid()) : -pid;
+            for (auto& p : t->session().tasks()) {
+              ThreadGroup* tg = p.second->thread_group().get();
+              if (pid == -1 ? tg != t->thread_group().get()
+                            : getpgid(tg->tgid) == pgrp) {
+                targets.insert(tg);
+              }
+            }
+          }
+        } else if (syscallno == Arch::tkill ||
+                   syscallno == Arch::rt_sigqueueinfo) {
+          target = t->session().find_task((pid_t)r.arg1_signed());
+        } else if (syscallno == Arch::tgkill ||
+                   syscallno == Arch::rt_tgsigqueueinfo) {
+          target = t->session().find_task((pid_t)r.arg2_signed());
+        } else {
+          target = t->session().find_task(t->pid_of_pidfd((int)r.arg1()));
+        }
+        if (target) {
+          targets.insert(target->thread_group().get());
+        }
+        for (ThreadGroup* tg : targets) {
+          for (Task* tt : tg->task_set()) {
+            // Linux notifies the ptracers of all seized threads, also for a
+            // SIGCONT sent to one thread (see prepare_signal() in
+            // kernel/signal.c).
+            auto rt = static_cast<RecordTask*>(tt);
+            if (rt->emulated_ptracer && rt->emulated_ptrace_seized) {
+              rt->sigcont_notify_pending = true;
+            }
+          }
+        }
       }
       break;
     }

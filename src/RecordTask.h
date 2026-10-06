@@ -202,6 +202,11 @@ public:
    */
   void apply_group_stop(int sig);
   /**
+   * Forward a PTRACE_INTERRUPT from the emulated ptracer to the task. Returns
+   * 0, or -errno if ptrace failed.
+   */
+  long forward_ptrace_interrupt();
+  /**
    * Call this after |sig| is delivered to this task.  Emulate
    * sighandler updates induced by the signal delivery.
    */
@@ -732,6 +737,24 @@ public:
   int emulated_ptrace_cont_command;
   // true when a ptracer/waiter wait() can return |emulated_stop_code|.
   bool emulated_stop_pending;
+  // If we forwarded a PTRACE_INTERRUPT from the ptracer to the task, the
+  // number of ptrace stops the task reaches up to the one that may be that
+  // PTRACE_INTERRUPT's stop, counting that one; otherwise 0. The kernel
+  // clears a pending PTRACE_INTERRUPT trap at any ptrace stop it enters, so
+  // that's 1, unless the task was at a stop we hadn't collected yet when we
+  // forwarded the PTRACE_INTERRUPT. Then the trap happens after that stop.
+  int forwarded_ptrace_interrupt_stops;
+  // true when the task is at a real PTRACE_EVENT_STOP that we should report
+  // to the ptracer, i.e. one that Linux reports to the ptracer of a seized
+  // tracee after a SIGCONT. Set in did_wait().
+  bool report_ptrace_event_stop;
+  // true if a tracee sent a SIGCONT to this task's process while the task's
+  // emulated ptracer had seized it, and the task hasn't trapped
+  // (PTRACE_EVENT_STOP) since. Linux notifies the ptracer of such a SIGCONT
+  // with that trap (JOBCTL_TRAP_NOTIFY in kernel/signal.c). We seize all
+  // tasks, so the kernel makes the task trap for every SIGCONT, but we
+  // report the trap to the ptracer only when we know it should get it.
+  bool sigcont_notify_pending;
   // true if this task needs to send a SIGCHLD to its ptracer for its
   // emulated ptrace stop
   bool emulated_ptrace_SIGCHLD_pending;

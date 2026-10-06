@@ -654,6 +654,14 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
 
   RecordTask* t = *t_ptr;
   if (t->status().group_stop() || t->has_stashed_group_stop()) {
+    if (t->status().group_stop() && t->report_ptrace_event_stop &&
+        t->emulated_ptracer && t->emulated_ptrace_seized) {
+      // Pass the stop on to the ptracer, with SIGTRAP: SIGCONT ended any
+      // group stop. apply_group_stop does nothing if the task is in an
+      // emulated stop already, e.g. because a new group stop started.
+      t->apply_group_stop(SIGTRAP);
+    }
+    t->report_ptrace_event_stop = false;
     t->clear_stashed_group_stop();
     last_task_switchable = ALLOW_SWITCH;
     step_state->continue_type = DONT_CONTINUE;
