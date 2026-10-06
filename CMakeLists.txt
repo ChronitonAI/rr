@@ -1436,6 +1436,7 @@ set(BASIC_TESTS
   symlink
   sync
   sync_file_range
+  syscall_args_efault
   syscall_bp
   syscall_in_writable_mem
   syscallbuf_efault

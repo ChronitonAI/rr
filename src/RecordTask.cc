@@ -597,13 +597,32 @@ template <typename Arch>
 void RecordTask::on_syscall_exit_arch(int syscallno, const Registers& regs) {
   switch (syscallno) {
     // These syscalls affect the sigmask even if they fail.
+    // (rt_)sigprocmask sets the new mask before it stores the old one, which
+    // can fail.
     case Arch::epoll_pwait:
     case Arch::epoll_pwait2:
     case Arch::pselect6:
     case Arch::pselect6_time64:
     case Arch::ppoll:
     case Arch::ppoll_time64:
+    case Arch::sigprocmask:
+    case Arch::rt_sigprocmask:
       invalidate_sigmask();
+      break;
+    case Arch::sigaction:
+    case Arch::rt_sigaction:
+      // The kernel sets the new action before it stores the old one. If that
+      // fails, the new action is still set.
+      if (regs.syscall_result_signed() == -EFAULT && regs.arg2() &&
+          regs.arg3()) {
+        size_t size = sizeof(typename Arch::kernel_sigaction);
+        if (syscall_accessible_prefix(regs.arg2(), size, PROT_READ) == size &&
+            syscall_accessible_prefix(regs.arg3(), size, PROT_WRITE) < size) {
+          Registers r = regs;
+          r.set_syscall_result(0);
+          update_sigaction(r);
+        }
+      }
       break;
   }
 
