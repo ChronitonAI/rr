@@ -1362,6 +1362,7 @@ set(BASIC_TESTS
   seccomp_cloning
   seccomp_clone_fail
   seccomp_desched
+  seccomp_kill_clone
   seccomp_kill_exit
   seccomp_madvise
   seccomp_null
@@ -1570,6 +1571,7 @@ set(TESTS_WITH_PROGRAM
   # clone_share_vm
   clone_syscallbuf_cleanup_blocked
   clone_syscallbuf_cleanup_cpu
+  clone_thread_killed_at_clone_event
   clone_vfork
   concurrent_signals
   conditional_breakpoint_calls
