@@ -494,7 +494,8 @@ void checksum_process_memory(RecordTask* t, FrameTime global_time) {
     AddressSpace::Mapping m = *it;
     string raw_map_line = m.map.str();
 
-    if (!checksum_segment_filter(m)) {
+    if (!checksum_segment_filter(m) ||
+        (m.map.is_stack() && as.stack_contents_not_reproduced())) {
       fprintf(checksums_file, "(%x) %s\n", ignored_checksum,
               raw_map_line.c_str());
       continue;

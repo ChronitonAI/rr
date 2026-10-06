@@ -866,7 +866,11 @@ remote_ptr<void> AutoRemoteSyscalls::infallible_mmap_syscall_if_alive(
       if (!t->vm()->has_mapping(addr)) {
         KernelMapping km = t->vm()->read_kernel_mapping(t, addr);
         if (km.size()) {
-          ASSERT(t, km.start() == addr && km.size() == ceil_page_size(length));
+          // The kernel may have merged the new mapping with an adjacent one
+          // (e.g. the rr page with the page before it, which maps the same
+          // file).
+          ASSERT(t, km.start() <= addr &&
+                        addr + ceil_page_size(length) <= km.end());
           // The mapping was created. Pretend this call succeeded.
           ret = addr;
         }
