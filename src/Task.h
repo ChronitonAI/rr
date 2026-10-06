@@ -970,6 +970,12 @@ public:
   size_t usable_scratch_size() {
     return std::max<ssize_t>(0, scratch_size - page_size());
   }
+  /**
+   * Return the size of the longest prefix of [addr, addr + len) that this
+   * task's syscalls can access with |prot|, according to our model of its
+   * memory.
+   */
+  size_t syscall_accessible_prefix(remote_ptr<void> addr, size_t len, int prot);
   remote_ptr<void> syscallbuf_alt_stack() {
     return scratch_ptr.is_null() ? remote_ptr<void>()
                                  : scratch_ptr + scratch_size;
@@ -1011,6 +1017,7 @@ public:
     // on aarch64, tls_register is used
     uintptr_t tls_register;
     std::vector<X86Arch::user_desc> thread_areas;
+    bool tagged_addr_abi;
   };
 
   /**
@@ -1342,6 +1349,10 @@ protected:
    * in the first system call issued by the initial tracee (after it returns
    * from kill(SIGSTOP) to synchronize with the tracer). */
   bool seccomp_bpf_enabled;
+  /* True when this thread has enabled aarch64's tagged address ABI with
+   * prctl(PR_SET_TAGGED_ADDR_CTRL), so that the kernel ignores the tags of the
+   * pointers that its syscalls access. */
+  bool tagged_addr_abi;
   // True when 'registers' has changes that haven't been flushed back to the
   // task yet.
   bool registers_dirty;
