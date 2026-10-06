@@ -1488,6 +1488,10 @@ set(BASIC_TESTS
   vsyscall_timeslice
   x86/x87env
   wait
+  wait_continued
+  wait_continued_traced
+  wait_continued_two_waiters
+  wait_sigchld_blocked_thread
   wait_sigstop
   wait_stop_and_exit
   write_race
