@@ -1554,6 +1554,7 @@ set(TESTS_WITH_PROGRAM
   check_lost_interrupts
   clone_file_range
   clone_interruption
+  clone_killed_before_scratch
   # Disabled because it fails
   # clone_share_vm
   clone_syscallbuf_cleanup_blocked
@@ -1580,6 +1581,7 @@ set(TESTS_WITH_PROGRAM
   elapsed_time
   exclusion_region
   exec_failed
+  exec_killed_before_scratch
   exec_many
   exec_shared_as
   execve_loop
@@ -1762,6 +1764,7 @@ set(TESTS_WITHOUT_PROGRAM
   checkpoint_simple
   checksum_block_open
   checksum_sanity_noclone
+  clone_killed_after_scratch
   comm
   cont_signal
   copy_all

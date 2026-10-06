@@ -2656,6 +2656,11 @@ Task* Task::clone(CloneReason reason, int flags, remote_ptr<void> stack,
   // wait() before trying to do anything that might need to
   // use ptrace to access memory
   bool ok = t->wait();
+  if (!ok) {
+    // A SIGKILL took the new task out of its initial stop before we could
+    // look at it. It's on its way to its PTRACE_EVENT_EXIT stop; use that.
+    ok = t->wait();
+  }
   ASSERT(t, ok) << "Task " << t->tid << " killed unexpectedly; not sure how to handle this";
 
   t->post_wait_clone(this, flags);

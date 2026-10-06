@@ -1,0 +1,7 @@
+source `dirname $0`/util.sh
+# Make rr SIGKILL every task that exec'd (other than the initial exec)
+# just before mapping its scratch memory.
+RR_KILL_TASK_AT_SCRATCH=exec record $TESTNAME
+replay
+check EXIT-SUCCESS
+grep -q "child was killed" record.out || failed ": the child wasn't killed"
