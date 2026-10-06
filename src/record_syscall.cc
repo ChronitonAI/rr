@@ -57,6 +57,7 @@
 #include <sys/sysinfo.h>
 #include <sys/time.h>
 #include <sys/times.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/utsname.h>
 #include <sys/vfs.h>
@@ -220,7 +221,10 @@ struct ParamSize {
    */
   template <typename T>
   static ParamSize from_initialized_mem(RecordTask* t, remote_ptr<T> p) {
-    ParamSize r(p.is_null() ? size_t(0) : size_t(t->read_mem(p)));
+    // If we can't read *p, the syscall can't either, and fails.
+    bool ok = true;
+    T size = p.is_null() ? T(0) : t->read_mem(p, &ok);
+    ParamSize r(ok ? size_t(size) : size_t(0));
     r.mem_ptr = p;
     r.read_size = sizeof(T);
     return r;
@@ -298,16 +302,24 @@ size_t ParamSize::eval(RecordTask* t, size_t already_consumed) const {
   size_t s = incoming_size;
   if (!mem_ptr.is_null()) {
     size_t mem_size;
+    bool ok = true;
     switch (read_size) {
       case 4:
-        mem_size = t->read_mem(mem_ptr.cast<uint32_t>());
+        mem_size = t->read_mem(mem_ptr.cast<uint32_t>(), &ok);
         break;
       case 8:
-        mem_size = t->read_mem(mem_ptr.cast<uint64_t>());
+        mem_size = t->read_mem(mem_ptr.cast<uint64_t>(), &ok);
         break;
       default:
         ASSERT(t, false) << "Unknown read_size";
         return 0;
+    }
+    if (!ok) {
+      // The syscall couldn't store the size there either. It may still have
+      // written data before it tried (recvmmsg() stores msg_len last), but
+      // then a parameter is inaccessible, and process_syscall_results
+      // records the parameter in full.
+      return 0;
     }
     ASSERT(t, already_consumed <= mem_size);
     s = min(s, mem_size - already_consumed);
@@ -606,14 +618,15 @@ static void set_remote_ptr(RecordTask* t, remote_ptr<void> addr,
 
 template <typename Arch>
 static remote_ptr<void> get_remote_ptr_arch(RecordTask* t,
-                                            remote_ptr<void> addr) {
+                                            remote_ptr<void> addr, bool* ok) {
   auto typed_addr = addr.cast<typename Arch::unsigned_word>();
-  auto old = t->read_mem(typed_addr);
+  auto old = t->read_mem(typed_addr, ok);
   return remote_ptr<void>(old);
 }
 
-static remote_ptr<void> get_remote_ptr(RecordTask* t, remote_ptr<void> addr) {
-  RR_ARCH_FUNCTION(get_remote_ptr_arch, t->arch(), t, addr);
+static remote_ptr<void> get_remote_ptr(RecordTask* t, remote_ptr<void> addr,
+                                       bool* ok = nullptr) {
+  RR_ARCH_FUNCTION(get_remote_ptr_arch, t->arch(), t, addr, ok);
 }
 
 static void align_scratch(remote_ptr<void>* scratch, uintptr_t amount = 8) {
@@ -654,8 +667,10 @@ remote_ptr<void> TaskSyscallState::mem_ptr_parameter(
   }
 
   MemoryParam param;
-  param.dest = get_remote_ptr(t, addr_of_buf_ptr);
-  if (param.dest.is_null()) {
+  bool ok = true;
+  param.dest = get_remote_ptr(t, addr_of_buf_ptr, &ok);
+  if (!ok || param.dest.is_null()) {
+    // If we can't read the pointer, the syscall can't either, and fails.
     return remote_ptr<void>();
   }
   param.num_bytes = size;
@@ -893,7 +908,12 @@ void TaskSyscallState::process_syscall_results() {
         auto& param = param_list[i];
         size_t size = actual_sizes[i];
         if (param.mode == IN_OUT_NO_SCRATCH) {
-          t->record_remote(param.dest, size);
+          if (syscall_failed) {
+            // The memory may not even be mapped.
+            record_writable_fallible(t, param.dest, size, false);
+          } else {
+            t->record_remote(param.dest, size);
+          }
         } else if (param.mode == IN_OUT || (param.mode == OUT && !syscall_failed)) {
           // If pointers in memory were fixed up in step 2, then record
           // from tracee memory to ensure we record such fixes. Otherwise we
@@ -954,7 +974,8 @@ void TaskSyscallState::process_syscall_results() {
     // size in memory says, e.g. a recvmmsg() that received a second message
     // and then failed to store its flags, so that its msg_len is stale. We
     // can't tell how much, so record those parameters in full, except where
-    // the tracee can't write.
+    // the tracee can't write. The memory of a failed syscall may not even be
+    // mapped, so record its outputs only where the tracee can write, too.
     bool efault = (should_emulate_result ? (int64_t)emulated_result
                                          : t->regs().syscall_result_signed()) ==
                   -EFAULT;
@@ -965,7 +986,7 @@ void TaskSyscallState::process_syscall_results() {
           (param.mode == OUT && syscall_failed && !efault)) {
         continue;
       }
-      if (!efault && !params_inaccessible) {
+      if (!syscall_failed && !params_inaccessible) {
         t->record_remote(param.dest, size);
         continue;
       }
@@ -1017,21 +1038,33 @@ void TaskSyscallState::abort_syscall_results() {
   }
 }
 
+/**
+ * Returns false if the kernel will fail to receive a message with |msgp|
+ * because it can't read it or its iovecs, or they are invalid.
+ */
 template <typename Arch>
-static void prepare_recvmsg(RecordTask* t, TaskSyscallState& syscall_state,
+static bool prepare_recvmsg(RecordTask* t, TaskSyscallState& syscall_state,
                             remote_ptr<typename Arch::msghdr> msgp,
                             const ParamSize& io_size) {
+  bool ok = true;
+  auto msg = t->read_mem(msgp, &ok);
+  if (!ok || msg.msg_iovlen > UIO_MAXIOV) {
+    return false;
+  }
+
   auto namelen_ptr = REMOTE_PTR_FIELD(msgp, msg_namelen);
   syscall_state.mem_ptr_parameter(
       REMOTE_PTR_FIELD(msgp, msg_name),
       ParamSize::from_initialized_mem(t, namelen_ptr));
 
-  auto msg = t->read_mem(msgp);
   remote_ptr<void> iovecsp_void = syscall_state.mem_ptr_parameter(
       REMOTE_PTR_FIELD(msgp, msg_iov),
       sizeof(typename Arch::iovec) * msg.msg_iovlen, IN);
   auto iovecsp = iovecsp_void.cast<typename Arch::iovec>();
-  auto iovecs = t->read_mem(iovecsp, msg.msg_iovlen);
+  auto iovecs = t->read_mem(iovecsp, msg.msg_iovlen, &ok);
+  if (!ok) {
+    return false;
+  }
   for (size_t i = 0; i < msg.msg_iovlen; ++i) {
     syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(iovecsp + i, iov_base),
                                     io_size.limit_size(iovecs[i].iov_len));
@@ -1041,16 +1074,21 @@ static void prepare_recvmsg(RecordTask* t, TaskSyscallState& syscall_state,
   syscall_state.mem_ptr_parameter(
       REMOTE_PTR_FIELD(msgp, msg_control),
       ParamSize::from_initialized_mem(t, controllen_ptr));
+  return true;
 }
 
 template <typename Arch>
 static void prepare_recvmmsg(RecordTask* t, TaskSyscallState& syscall_state,
                              remote_ptr<typename Arch::mmsghdr> mmsgp,
                              unsigned int vlen) {
-  for (unsigned int i = 0; i < vlen; ++i) {
+  // The kernel stops at the first message it fails to receive.
+  for (unsigned int i = 0; i < min(vlen, (unsigned int)UIO_MAXIOV); ++i) {
     auto msgp = mmsgp + i;
-    prepare_recvmsg<Arch>(t, syscall_state, REMOTE_PTR_FIELD(msgp, msg_hdr),
-                          ParamSize::from_mem(REMOTE_PTR_FIELD(msgp, msg_len)));
+    if (!prepare_recvmsg<Arch>(
+            t, syscall_state, REMOTE_PTR_FIELD(msgp, msg_hdr),
+            ParamSize::from_mem(REMOTE_PTR_FIELD(msgp, msg_len)))) {
+      break;
+    }
   }
 }
 
@@ -1142,7 +1180,19 @@ static Switchable prepare_socketcall(RecordTask* t,
    *
    *  (from http://lxr.linux.no/#linux+v3.6.3/net/socket.c#L2354)
    */
-  switch ((int)t->regs().arg1_signed()) {
+  int call = t->regs().arg1_signed();
+  // The number of arguments of each call, as in the kernel's socketcall
+  static const uint8_t nargs[] = { 0, 3, 3, 3, 2, 3, 3, 3, 4, 4, 4,
+                                   6, 6, 2, 5, 5, 3, 3, 4, 5, 4 };
+  if (call > 0 && call < int(sizeof(nargs))) {
+    uint8_t buf[6 * sizeof(typename Arch::unsigned_long)];
+    size_t size = nargs[call] * sizeof(typename Arch::unsigned_long);
+    if (t->read_bytes_fallible(t->regs().arg2(), size, buf) != ssize_t(size)) {
+      // The syscall will fail with EFAULT.
+      return PREVENT_SWITCH;
+    }
+  }
+  switch (call) {
     /* int socket(int domain, int type, int protocol); */
     case SYS_SOCKET:
     /* int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen); */
@@ -4013,7 +4063,12 @@ static bool protect_rr_sigs(RecordTask* t, remote_ptr<void> p, void* save) {
     return false;
   }
 
-  auto sig_set = t->read_mem(setp);
+  bool ok = true;
+  auto sig_set = t->read_mem(setp, &ok);
+  if (!ok) {
+    // The syscall will fail with EFAULT.
+    return false;
+  }
   auto new_sig_set = sig_set;
   new_sig_set &= ~t->session().rr_signal_mask();
   if (sig_set == new_sig_set) {
@@ -4037,7 +4092,12 @@ static bool protect_rr_sigs_sa_mask_arch(RecordTask* t, remote_ptr<void> p,
     return false;
   }
 
-  auto sa = t->read_mem(sap);
+  bool ok = true;
+  auto sa = t->read_mem(sap, &ok);
+  if (!ok) {
+    // The syscall will fail with EFAULT.
+    return false;
+  }
   auto new_sig_set = sa.sa_mask;
   // Don't let the tracee block TIME_SLICE_SIGNAL or
   // SYSCALLBUF_DESCHED_SIGNAL.
@@ -4726,7 +4786,12 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
           Arch::select_semantics == Arch::SelectStructArguments) {
         auto argsp =
             syscall_state.reg_parameter<typename Arch::select_args>(1, IN);
-        auto args = t->read_mem(argsp);
+        bool ok = true;
+        auto args = t->read_mem(argsp, &ok);
+        if (!ok) {
+          // The syscall will fail with EFAULT.
+          return ALLOW_SWITCH;
+        }
         ParamSize size = select_param_size(args.n_fds, Arch::arch());
         syscall_state.mem_ptr_parameter(
             REMOTE_PTR_FIELD(argsp, read_fds), size, IN_OUT);
@@ -5070,10 +5135,19 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       }
       int fd = regs.arg1_signed();
       int iovcnt = regs.arg3_signed();
+      if (iovcnt < 0 || iovcnt > UIO_MAXIOV) {
+        // The syscall will fail with EINVAL.
+        return ALLOW_SWITCH;
+      }
       remote_ptr<void> iovecsp_void = syscall_state.reg_parameter(
           2, sizeof(typename Arch::iovec) * iovcnt, IN);
       auto iovecsp = iovecsp_void.cast<typename Arch::iovec>();
-      auto iovecs = t->read_mem(iovecsp, iovcnt);
+      bool ok = true;
+      auto iovecs = t->read_mem(iovecsp, iovcnt, &ok);
+      if (!ok) {
+        // The syscall will fail with EFAULT.
+        return ALLOW_SWITCH;
+      }
       uint64_t result;
       vector<FileMonitor::Range> ranges;
       ranges.reserve(iovcnt);
@@ -5732,9 +5806,13 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       // On success the result is the number of ids written.
       auto size_ptr = syscall_state.reg_parameter<uint32_t>(2, IN_OUT);
       if (!size_ptr.is_null()) {
-        syscall_state.reg_parameter(
-            1, ParamSize::from_syscall_result<uint32_t>(t->read_mem(size_ptr),
-                                                        sizeof(uint64_t)));
+        bool ok = true;
+        uint32_t size = t->read_mem(size_ptr, &ok);
+        if (ok) {
+          syscall_state.reg_parameter(
+              1, ParamSize::from_syscall_result<uint32_t>(size,
+                                                          sizeof(uint64_t)));
+        }
       }
       return PREVENT_SWITCH;
     }
@@ -5878,8 +5956,13 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
     case Arch::mmap:
       switch (Arch::mmap_semantics) {
         case Arch::StructArguments: {
-          auto args =
-              t->read_mem(remote_ptr<typename Arch::mmap_args>(regs.arg1()));
+          bool ok = true;
+          auto args = t->read_mem(
+              remote_ptr<typename Arch::mmap_args>(regs.arg1()), &ok);
+          if (!ok) {
+            // The syscall will fail with EFAULT.
+            break;
+          }
           // XXX fix these unsupported features?
           // only the most ancient code should be using old-style mmap on 32bit,
           // modern glibc uses mmap2.
@@ -7258,7 +7341,16 @@ static void record_iovec_output(RecordTask* t, RecordTask* dest,
                                 uint32_t iov_cnt) {
   // Ignore the syscall result, the kernel may have written more data than that.
   // See https://bugzilla.kernel.org/show_bug.cgi?id=113541
-  auto iovs = t->read_mem(piov, iov_cnt);
+  if (iov_cnt > UIO_MAXIOV) {
+    // The syscall failed with EINVAL.
+    return;
+  }
+  bool ok = true;
+  auto iovs = t->read_mem(piov, iov_cnt, &ok);
+  if (!ok) {
+    // The syscall failed with EFAULT.
+    return;
+  }
   for (auto& iov : iovs) {
     dest->record_remote_writable(iov.iov_base, iov.iov_len);
   }
@@ -7485,6 +7577,36 @@ static void emulate_SIGCONT_sent_by_tracee(RecordTask* t) {
   }
 }
 
+/**
+ * Store the fields of |si| that Linux's waitid() stores, in the same order.
+ * Returns false when the tracee can't write one of them; then waitid() fails
+ * with EFAULT.
+ */
+template <typename Arch>
+static bool write_waitid_siginfo(RecordTask* t,
+                                 remote_ptr<typename Arch::siginfo_t> sip,
+                                 const typename Arch::siginfo_t& si) {
+  bool ok = true;
+  auto write_field = [&](auto field, const auto& value) {
+    if (ok && t->syscall_accessible_prefix(field, sizeof(value), PROT_WRITE) ==
+                  sizeof(value)) {
+      t->write_mem(field, value);
+    } else {
+      ok = false;
+    }
+  };
+  write_field(REMOTE_PTR_FIELD(sip, si_signo), si.si_signo);
+  write_field(REMOTE_PTR_FIELD(sip, si_errno), si.si_errno);
+  write_field(REMOTE_PTR_FIELD(sip, si_code), si.si_code);
+  write_field(REMOTE_PTR_FIELD(sip, _sifields._sigchld.si_pid_),
+              si._sifields._sigchld.si_pid_);
+  write_field(REMOTE_PTR_FIELD(sip, _sifields._sigchld.si_uid_),
+              si._sifields._sigchld.si_uid_);
+  write_field(REMOTE_PTR_FIELD(sip, _sifields._sigchld.si_status_),
+              si._sifields._sigchld.si_status_);
+  return ok;
+}
+
 template <typename Arch>
 static void rec_process_syscall_arch(RecordTask* t,
                                      TaskSyscallState& syscall_state) {
@@ -7588,6 +7710,11 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::mmap:
       switch (Arch::mmap_semantics) {
         case Arch::StructArguments: {
+          if (t->regs().syscall_failed()) {
+            // We purely emulate failed mmaps, and the arguments may not be
+            // readable.
+            break;
+          }
           auto args = t->read_mem(
               remote_ptr<typename Arch::mmap_args>(t->regs().orig_arg1()));
           process_mmap(t, args.len, args.prot, args.flags, args.fd,
@@ -7991,10 +8118,11 @@ static void rec_process_syscall_arch(RecordTask* t,
 
       RecordTask* tracee = syscall_state.emulate_wait_for_child;
       if (tracee) {
-        // Finish emulation of ptrace result or stop-signal
+        // Finish emulation of ptrace result or stop-signal. When the tracee
+        // can't write the result, the wait fails with EFAULT; as in Linux,
+        // that doesn't change whether it consumes the stop.
         Registers r = t->regs();
         r.set_syscall_result(syscallno == Arch::waitid ? 0 : tracee->tid);
-        t->set_regs(r);
         if (syscallno == Arch::waitid) {
           remote_ptr<typename Arch::siginfo_t> sip = r.arg3();
           if (!sip.is_null()) {
@@ -8002,14 +8130,22 @@ static void rec_process_syscall_arch(RecordTask* t,
             memset(&si, 0, sizeof(si));
             si.si_signo = SIGCHLD;
             tracee->set_siginfo_for_waited_task<Arch>(&si);
-            t->write_mem(sip, si);
+            if (!write_waitid_siginfo<Arch>(t, sip, si)) {
+              r.set_syscall_result(-EFAULT);
+            }
           }
         } else {
           remote_ptr<int> statusp = r.arg2();
           if (!statusp.is_null()) {
-            t->write_mem(statusp, tracee->emulated_stop_code.get());
+            if (t->syscall_accessible_prefix(statusp, sizeof(int),
+                                             PROT_WRITE) == sizeof(int)) {
+              t->write_mem(statusp, tracee->emulated_stop_code.get());
+            } else {
+              r.set_syscall_result(-EFAULT);
+            }
           }
         }
+        t->set_regs(r);
         if (syscallno == Arch::waitid && (r.arg4() & WNOWAIT)) {
           // Leave the child in a waitable state
         } else {
@@ -8043,14 +8179,11 @@ static void rec_process_syscall_arch(RecordTask* t,
         // EINVAL we forced too, but older kernels left *infop alone.)
         remote_ptr<typename Arch::siginfo_t> sip = t->regs().arg3();
         if (!sip.is_null()) {
-          auto si = t->read_mem(sip);
-          si.si_signo = 0;
-          si.si_errno = 0;
-          si.si_code = 0;
-          si._sifields._sigchld.si_pid_ = 0;
-          si._sifields._sigchld.si_uid_ = 0;
-          si._sifields._sigchld.si_status_ = 0;
-          t->write_mem(sip, si);
+          typename Arch::siginfo_t si;
+          memset(&si, 0, sizeof(si));
+          if (!write_waitid_siginfo<Arch>(t, sip, si)) {
+            syscall_state.emulated_result = -EFAULT;
+          }
         }
       }
       break;
