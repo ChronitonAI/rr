@@ -329,8 +329,8 @@ void Task::set_name(AutoRemoteSyscalls& remote, const std::string& name) {
   prname[16] = 0;
   AutoRestoreMem remote_prname(remote, (const uint8_t*)prname, 16);
   LOG(debug) << "    setting name to " << prname;
-  remote.infallible_syscall(syscall_number_for_prctl(remote.arch()), PR_SET_NAME,
-                            remote_prname.get().as_int());
+  remote.infallible_syscall_if_alive(syscall_number_for_prctl(remote.arch()),
+                                     PR_SET_NAME, remote_prname.get().as_int());
 }
 
 void Task::dump(FILE* out) const {
@@ -1141,12 +1141,14 @@ void Task::post_exec_syscall(const std::string& original_exe_file) {
   AutoRemoteSyscalls remote(this);
   set_name(remote, prname_from_exe_image(original_exe_file));
   if (session().has_cpuid_faulting()) {
-    remote.infallible_syscall(syscall_number_for_arch_prctl(arch()),
-                              ARCH_SET_CPUID, 0);
+    remote.infallible_syscall_if_alive(syscall_number_for_arch_prctl(arch()),
+                                       ARCH_SET_CPUID, 0);
   }
   if (arch() == aarch64) {
-    if (remote.syscall(syscall_number_for_prctl(remote.task()->arch()),
-                       PR_SET_TSC, PR_TSC_SIGSEGV, 0, 0) != 0) {
+    long ret = remote.syscall(syscall_number_for_prctl(remote.task()->arch()),
+                              PR_SET_TSC, PR_TSC_SIGSEGV, 0, 0);
+    // -ESRCH means the task has died.
+    if (ret != 0 && ret != -ESRCH) {
       LOG(warn) << "Missing kernel support for PR_SET_TSC; architected timer "
                    "accesses will not be replayed deterministically. It is "
                    "recommended to upgrade to kernel version 6.12";

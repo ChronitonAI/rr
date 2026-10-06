@@ -1775,6 +1775,7 @@ set(TESTS_WITHOUT_PROGRAM
   deliver_async_signal_during_syscalls
   env_newline
   exec_deleted
+  exec_killed_during_post_exec
   exec_stop
   execp
   explicit_checkpoint_clone

@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <linux/net.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 
 #include <sstream>
@@ -382,9 +383,54 @@ static bool ignore_signal(Task* t) {
   return false;
 }
 
+/**
+ * This is purely for testing purposes. See exec_killed_during_post_exec.
+ * Counting the remote syscalls rr makes, from the start of the recording, in
+ * tasks that are in execve (entering, exec'd or exiting) and whose parent is
+ * being recorded: with RR_KILL_EXEC_TASK_AT_REMOTE_SYSCALL=<n>, SIGKILL the
+ * task just before the n'th one; with RR_KILL_EXEC_TASK_AFTER_REMOTE_SYSCALL=<n>,
+ * just after the n'th one, and then act as if the task died before
+ * reporting its result. Either way, wait until we know the task is dying.
+ */
+enum KillForTesting { DONT_KILL, KILL_BEFORE, KILL_AFTER };
+static KillForTesting kill_exec_task_for_testing(Task* t) {
+  static const char* before = getenv("RR_KILL_EXEC_TASK_AT_REMOTE_SYSCALL");
+  static const char* after = getenv("RR_KILL_EXEC_TASK_AFTER_REMOTE_SYSCALL");
+  static int count = 0;
+  if ((!before && !after) || !t->session().is_recording() ||
+      t->is_exiting()) {
+    return DONT_KILL;
+  }
+  RecordTask* rt = static_cast<RecordTask*>(t);
+  if (!rt->ev().is_syscall_event() || !rt->ev().Syscall().is_exec() ||
+      !rt->session().find_task(rt->get_parent_pid())) {
+    return DONT_KILL;
+  }
+  ++count;
+  if (before && count == atoi(before)) {
+    return KILL_BEFORE;
+  }
+  if (after && count == atoi(after)) {
+    return KILL_AFTER;
+  }
+  return DONT_KILL;
+}
+
+static void kill_for_testing(Task* t) {
+  LOG(debug) << "Killing " << t->tid << " for testing";
+  syscall(SYS_tgkill, t->tgid(), t->tid, SIGKILL);
+  t->wait();
+  ASSERT(t, t->is_exiting());
+}
+
 long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
   SupportedArch arch = t->arch();
   LOG(debug) << "syscall " << syscall_name(syscallno, arch) << " " << callregs;
+
+  KillForTesting kill = kill_exec_task_for_testing(t);
+  if (kill == KILL_BEFORE) {
+    kill_for_testing(t);
+  }
 
   if (t->is_exiting()) {
     LOG(debug) << "Task is dying, don't try anything.";
@@ -498,6 +544,10 @@ long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
   }
 
   LOG(debug) << "done, result=" << t->regs().syscall_result();
+  if (kill == KILL_AFTER) {
+    kill_for_testing(t);
+    return -ESRCH;
+  }
   return t->regs().syscall_result();
 }
 
@@ -836,7 +886,11 @@ remote_ptr<void> AutoRemoteSyscalls::infallible_mmap_syscall_if_alive(
       if (!t->vm()->has_mapping(addr)) {
         KernelMapping km = t->vm()->read_kernel_mapping(t, addr);
         if (km.size()) {
-          ASSERT(t, km.start() == addr && km.size() == ceil_page_size(length));
+          // The kernel may have merged the new mapping with an adjacent one
+          // (e.g. the rr page with the page before it, which maps the same
+          // file).
+          ASSERT(t, km.start() <= addr &&
+                        addr + ceil_page_size(length) <= km.end());
           // The mapping was created. Pretend this call succeeded.
           ret = addr;
         }

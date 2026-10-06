@@ -719,6 +719,19 @@ public:
   }
 
   /**
+   * Set when the task that exec'd into this address space died while we
+   * were setting it up, after we unmapped its stack but before we restored
+   * the stack's contents. The stack then won't match replay, which restores
+   * the contents, so we don't checksum it.
+   */
+  void set_stack_contents_not_reproduced() {
+    stack_contents_not_reproduced_ = true;
+  }
+  bool stack_contents_not_reproduced() const {
+    return stack_contents_not_reproduced_;
+  }
+
+  /**
    * We'll map a page of memory here into every exec'ed process for our own
    * use.
    */
@@ -1231,6 +1244,7 @@ private:
   remote_code_ptr privileged_traced_syscall_ip_;
   bool syscallbuf_enabled_;
   bool layout_randomization_disabled_;
+  bool stack_contents_not_reproduced_ = false;
 
   remote_code_ptr do_breakpoint_fault_addr_;
   // These fields are deprecated and have been replaced by the

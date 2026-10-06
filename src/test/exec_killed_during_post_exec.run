@@ -1,0 +1,35 @@
+source `dirname $0`/util.sh
+# Make rr SIGKILL the child just before, and then just after, the n'th remote
+# syscall rr makes in it while processing its execve, for each n in turn until
+# the child isn't killed any more. Checksum memory at syscalls while we're at
+# it. (--checksum=on-all-events also checks the SCHED rr records when the
+# child dies, but makes the test twice as slow.)
+GLOBAL_OPTIONS="$GLOBAL_OPTIONS --checksum=on-syscalls"
+for when in AT AFTER; do
+  var=RR_KILL_EXEC_TASK_${when}_REMOTE_SYSCALL
+  n=1
+  while true; do
+    export $var=$n
+    record exec_killed_before_scratch$bitness
+    unset $var
+    replay
+    if ! just_check_record EXIT-SUCCESS || ! just_check_replay_err ||
+       ! just_check_record_replay_match; then
+      echo "(with $var=$n)"
+      exit
+    fi
+    if ! grep -q "child was killed" record.out; then
+      break
+    fi
+    n=$((n + 1))
+    if (( n > 200 )); then
+      failed ": the child was still killed with $var=200"
+      exit
+    fi
+  done
+  if (( n == 1 )); then
+    failed ": the child wasn't killed with $var=1"
+    exit
+  fi
+done
+passed_msg "killed at each of $((n - 1)) remote syscalls"

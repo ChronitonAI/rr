@@ -1335,8 +1335,11 @@ void RecordSession::syscall_state_changed(RecordTask* t,
          * restart_syscall */
         if (!may_restart) {
           rec_process_syscall(t);
+          // If the task died while we processed the syscall, we may have
+          // updated our AddressSpace for changes that didn't happen (see
+          // process_execve()).
           if (t->session().done_initial_exec() &&
-              Flags::get().check_cached_mmaps) {
+              Flags::get().check_cached_mmaps && !t->is_exiting()) {
             t->vm()->verify(t);
           }
         } else {

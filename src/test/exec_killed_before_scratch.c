@@ -3,7 +3,9 @@
 #include "util.h"
 
 /* Recorded by exec_killed_before_scratch.run, rr SIGKILLs the child after its
-   exec, just before mapping its scratch memory, before the new image runs. */
+   exec, just before mapping its scratch memory, before the new image runs.
+   exec_killed_during_post_exec.run kills it at each step of rr's processing
+   of the exec in turn. */
 
 int main(int argc, char** argv) {
   pid_t child;
