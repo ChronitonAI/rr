@@ -6,6 +6,7 @@
 #include <sched.h>
 #include <stdint.h>
 
+#include <deque>
 #include <memory>
 #include <set>
 
@@ -73,6 +74,23 @@ public:
   // thread doesn't. The emulated stops of the threads don't tell us this: we
   // use GROUP_STOP for some ptrace stops too.
   int stopping_signal;
+
+  // During recording: true if a SIGCONT ended a stop of this process and the
+  // parent hasn't waited for that with WCONTINUED yet. This is Linux's
+  // SIGNAL_STOP_CONTINUED, so a new stop ends it too.
+  bool continued;
+
+  // During recording: what the synthetic SIGCHLDs that we sent this process
+  // for stops and continues of its children report, until the process takes
+  // them. We identify each SIGCHLD by an id in its si_errno.
+  struct ChildSIGCHLD {
+    int id;
+    int code;
+    int status;
+    pid_t pid;
+  };
+  std::deque<ChildSIGCHLD> child_SIGCHLDs;
+  int last_child_SIGCHLD_id;
 
 private:
   ThreadGroup(const ThreadGroup&) = delete;

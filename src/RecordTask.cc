@@ -974,16 +974,8 @@ void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
     if (wake_task->is_sig_blocked(SIGCHLD) ||
         wake_task->stashed_signals_blocking_more_signals) {
       LOG(debug) << "SIGCHLD is blocked, kicking it out of the syscall";
-      // Just sending SIGCHLD won't wake it up. Send it a TIME_SLICE_SIGNAL
-      // as well to make sure it exits a blocking syscall. We ensure those
-      // can never be blocked.
-      // We have to send a negative code here because only the kernel can set
-      // positive codes. We set a magic number so we can recognize it
-      // when received.
-      si.si_code = SYNTHETIC_TIME_SLICE_SI_CODE;
-      ret = syscall(SYS_rt_tgsigqueueinfo, wake_task->tgid(), wake_task->tid,
-                    PerfCounters::TIME_SLICE_SIGNAL, &si);
-      ASSERT(this, ret == 0);
+      // Just sending SIGCHLD won't wake it up.
+      wake_task->kick_out_of_syscall();
     }
   } else {
     // Send the signal to the process as a whole and let the kernel
@@ -994,12 +986,140 @@ void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
   }
 }
 
+void RecordTask::send_child_stop_SIGCHLD(RecordTask* child, int code,
+                                         int status) {
+  RecordTask* wake_task = nullptr;
+  for (Task* t : thread_group()->task_set()) {
+    auto rt = static_cast<RecordTask*>(t);
+    if (rt->is_waiting_for(child)) {
+      wake_task = rt;
+      break;
+    }
+  }
+  if (has_pending_SIGCHLD()) {
+    // Linux sends this SIGCHLD to the process, and drops it while one is
+    // pending (legacy_queue()). It still wakes our waits.
+    LOG(debug) << "SIGCHLD already pending for " << tgid() << "; dropping "
+               << (code == CLD_STOPPED ? "CLD_STOPPED" : "CLD_CONTINUED")
+               << " for " << child->tgid();
+    kick_out_of_wait_for(child);
+    return;
+  }
+
+  // Remember what the SIGCHLD reports, since the child may change, or be
+  // gone, when we take it.
+  ThreadGroup* tg = thread_group().get();
+  if (tg->last_child_SIGCHLD_id == INT32_MAX) {
+    tg->last_child_SIGCHLD_id = 0;
+  }
+  int id = ++tg->last_child_SIGCHLD_id;
+  // Normally the SIGCHLD is delivered soon, and we use the record then.
+  // Don't let records pile up for SIGCHLDs that we don't see delivered:
+  // those taken with sigwaitinfo() or from a signalfd, or discarded by a
+  // sigaction() that ignores SIGCHLD.
+  if (tg->child_SIGCHLDs.size() >= 64) {
+    tg->child_SIGCHLDs.pop_front();
+  }
+  tg->child_SIGCHLDs.push_back({ id, code, status, child->tgid() });
+
+  siginfo_t si;
+  memset(&si, 0, sizeof(si));
+  si.si_code = SI_QUEUE;
+  si.si_value.sival_int = SIGCHLD_SYNTHETIC;
+  si.si_errno = id;
+  int ret;
+  if (wake_task && !wake_task->is_sig_blocked(SIGCHLD) &&
+      !wake_task->stashed_signals_blocking_more_signals) {
+    // Let a thread that waits for the child take the SIGCHLD.
+    LOG(debug) << "Sending synthetic SIGCHLD to waiting tid " << wake_task->tid;
+    ret = syscall(SYS_rt_tgsigqueueinfo, tgid(), wake_task->tid, SIGCHLD, &si);
+  } else {
+    // As Linux does. If |wake_task| blocks SIGCHLD, it's not for it.
+    LOG(debug) << "Sending synthetic SIGCHLD to pid " << tgid();
+    ret = syscall(SYS_rt_sigqueueinfo, tgid(), SIGCHLD, &si);
+  }
+  ASSERT(this, ret == 0);
+  // Linux wakes every wait for the child (__wake_up_parent()).
+  kick_out_of_wait_for(child);
+}
+
+bool RecordTask::has_pending_SIGCHLD() {
+  for (Task* t : thread_group()->task_set()) {
+    auto rt = static_cast<RecordTask*>(t);
+    if (rt->has_stashed_sig(SIGCHLD)) {
+      return true;
+    }
+    auto pending = read_proc_status_fields(rt->tid, "SigPnd", "ShdPnd");
+    if (pending.size() < 2) {
+      continue;
+    }
+    sig_set_t own = strtoull(pending[0].c_str(), nullptr, 16);
+    sig_set_t shared = strtoull(pending[1].c_str(), nullptr, 16);
+    // A SIGCHLD pending for a thread that blocks it isn't the process's.
+    if ((shared & signal_bit(SIGCHLD)) ||
+        ((own & signal_bit(SIGCHLD)) && !rt->is_sig_blocked(SIGCHLD))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void RecordTask::kick_out_of_wait_for(RecordTask* child) {
+  for (Task* t : thread_group()->task_set()) {
+    auto rt = static_cast<RecordTask*>(t);
+    if (rt->is_waiting_for(child) || rt->is_waiting_for_ptrace(child)) {
+      // A wait that is blocked in the kernel won't see an emulated stop or
+      // continue. Interrupt it; at the syscall exit,
+      // rec_return_normally_from_wait finds the stop or continue and
+      // returns it.
+      LOG(debug) << "Kicking " << rt->tid << " out of its wait for "
+                 << child->tid;
+      rt->kick_out_of_syscall();
+    }
+  }
+}
+
+void RecordTask::kick_out_of_syscall() {
+  // Send a TIME_SLICE_SIGNAL to make sure we exit a blocking syscall. We
+  // ensure those can never be blocked, and never deliver them to the tracee.
+  // We have to send a negative code here because only the kernel can set
+  // positive codes. We set a magic number so we can recognize it
+  // when received.
+  siginfo_t si;
+  memset(&si, 0, sizeof(si));
+  si.si_code = SYNTHETIC_TIME_SLICE_SI_CODE;
+  int ret = syscall(SYS_rt_tgsigqueueinfo, tgid(), tid,
+                    PerfCounters::TIME_SLICE_SIGNAL, &si);
+  ASSERT(this, ret == 0);
+}
+
 static bool is_synthetic_SIGCHLD(const siginfo_t& si) {
   return si.si_signo == SIGCHLD && si.si_value.sival_int == SIGCHLD_SYNTHETIC;
 }
 
 void RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
   if (!is_synthetic_SIGCHLD(*si)) {
+    return;
+  }
+
+  int id = si->si_errno;
+  si->si_errno = 0;
+  if (id) {
+    // We sent it for a stop or continue of a child process.
+    auto& records = thread_group()->child_SIGCHLDs;
+    for (auto it = records.begin(); it != records.end(); ++it) {
+      if (it->id == id) {
+        auto native_si = reinterpret_cast<NativeArch::siginfo_t*>(si);
+        native_si->si_code = it->code;
+        native_si->_sifields._sigchld.si_pid_ = it->pid;
+        native_si->_sifields._sigchld.si_uid_ = getuid();
+        // This replaces the SIGCHLD_SYNTHETIC in si_value.
+        native_si->_sifields._sigchld.si_status_ = it->status;
+        records.erase(it);
+        return;
+      }
+    }
+    LOG(warn) << "Can't find the child stop for synthetic SIGCHLD " << id;
     return;
   }
 
@@ -1145,11 +1265,6 @@ void RecordTask::apply_group_stop(int sig) {
       emulated_stop_type = GROUP_STOP;
       emulated_stop_code = status;
       emulated_stop_pending = true;
-      emulated_SIGCHLD_pending = true;
-      RecordTask* t = session().find_task(get_ppid(tid));
-      if (t) {
-        t->send_synthetic_SIGCHLD_if_necessary();
-      }
     }
   }
 }
@@ -1182,7 +1297,7 @@ bool RecordTask::has_any_actionable_signal() {
 }
 
 void RecordTask::emulate_SIGCONT() {
-  thread_group()->stopping_signal = 0;
+  end_process_stop_for_SIGCONT();
   // All threads in the process are resumed.
   for (Task* t : thread_group()->task_set()) {
     auto rt = static_cast<RecordTask*>(t);
@@ -1190,6 +1305,28 @@ void RecordTask::emulate_SIGCONT() {
     rt->clear_stashed_group_stop();
     rt->emulated_stop_pending = false;
     rt->emulated_stop_type = NOT_STOPPED;
+  }
+}
+
+void RecordTask::end_process_stop_for_SIGCONT() {
+  ThreadGroup* tg = thread_group().get();
+  if (!tg->stopping_signal) {
+    return;
+  }
+  tg->stopping_signal = 0;
+  if (sent_shutdown_kill) {
+    // We're killing the process; nobody will see the continue.
+    return;
+  }
+  LOG(debug) << "Process " << tgid() << " continued";
+  tg->continued = true;
+  notify_parent_of_stop_or_continue(CLD_CONTINUED, SIGCONT);
+}
+
+void RecordTask::notify_parent_of_stop_or_continue(int code, int status) {
+  RecordTask* parent = session().find_task(get_parent_pid());
+  if (parent) {
+    parent->send_child_stop_SIGCHLD(this, code, status);
   }
 }
 
@@ -1201,14 +1338,23 @@ void RecordTask::signal_delivered(int sig) {
   }
 
   if (is_sig_stopping(sig)) {
+    bool new_stop = !thread_group()->stopping_signal;
     thread_group()->stopping_signal = sig;
+    thread_group()->continued = false;
     // All threads in the process are stopped.
+    bool any_untraced = false;
     for (Task* t : thread_group()->task_set()) {
       auto rt = static_cast<RecordTask*>(t);
       rt->apply_group_stop(sig);
+      any_untraced = any_untraced || !rt->emulated_ptracer;
     }
-    // apply_group_stop calls send_synthetic_SIGCHLD_if_necessary(). Don't
-    // do it again.
+    // Linux tells the parent once the group-stop completes, but not again
+    // while the process stays stopped. For a traced thread, apply_group_stop
+    // notified its ptracer. (Linux also tells the real parent when the
+    // threads are all traced, by another process; we don't.)
+    if (new_stop && any_untraced) {
+      notify_parent_of_stop_or_continue(CLD_STOPPED, sig);
+    }
     needs_SIGCHLD = false;
   } else if (sig == SIGCONT && !is_sig_ignored(sig)) {
     emulate_SIGCONT();

@@ -219,6 +219,37 @@ public:
    */
   void emulate_SIGCONT();
   /**
+   * A SIGCONT was sent to our process, so end any stop of the process. If it
+   * was stopped, let the parent's WCONTINUED waits report that, and send the
+   * parent a SIGCHLD.
+   */
+  void end_process_stop_for_SIGCONT();
+  /**
+   * Tell our parent that our process stopped or continued: send it a SIGCHLD
+   * with si_code |code| (CLD_STOPPED or CLD_CONTINUED) and si_status
+   * |status|, as Linux does, and wake its waits for us.
+   */
+  void notify_parent_of_stop_or_continue(int code, int status);
+  /**
+   * Send us a synthetic SIGCHLD for a stop or continue of |child|, unless
+   * one is pending already. Wake our waits for |child|.
+   */
+  void send_child_stop_SIGCHLD(RecordTask* child, int code, int status);
+  /**
+   * Return true if a SIGCHLD is pending (or stashed) for our process, which
+   * would make Linux drop another one.
+   */
+  bool has_pending_SIGCHLD();
+  /**
+   * Interrupt the waits of our threads that are waiting for |child|, as a
+   * child or as a tracee.
+   */
+  void kick_out_of_wait_for(RecordTask* child);
+  /**
+   * Make us exit a blocking syscall by sending us a TIME_SLICE_SIGNAL.
+   */
+  void kick_out_of_syscall();
+  /**
    * Return true if the disposition of |sig| in |table| isn't
    * SIG_IGN or SIG_DFL, that is, if a user sighandler will be
    * invoked when |sig| is received.
