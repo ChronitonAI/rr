@@ -335,6 +335,18 @@ bool Scheduler::is_task_runnable(RecordTask* t, WaitAggregator& wait_aggregator,
       // PTRACE_EVENT_STOP for t before t returns to user space.
       return is_task_runnable(t, wait_aggregator, by_waitpid);
     } else {
+      if (t->emulated_ptracer && t->thread_group()->stopping_signal &&
+          t->is_signal_pending(SIGCONT)) {
+        // A SIGCONT doesn't end t's ptrace stop, but it does end the stop of
+        // t's process: Linux lets the parent's WCONTINUED waits see the
+        // continue as soon as it generates the SIGCONT (prepare_signal()).
+        // It sends the parent its SIGCHLD, and wakes waits that are already
+        // blocked, only when a thread of the process next runs
+        // (get_signal()), which for t is when its ptracer resumes or
+        // detaches it. We do both now. This also ends the job-control stops
+        // of the process's untraced threads.
+        t->emulate_SIGCONT();
+      }
       LOGM(debug) << "  " << t->tid << " is stopped by ptrace or signal";
       // We have no way to detect a SIGCONT coming from outside the tracees.
       // We just have to poll SigPnd in /proc/<pid>/status.

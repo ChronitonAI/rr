@@ -1514,6 +1514,11 @@ set(BASIC_TESTS
   vsyscall_timeslice
   x86/x87env
   wait
+  wait_continued
+  wait_continued_traced
+  wait_continued_traced_sigstop
+  wait_continued_two_waiters
+  wait_sigchld_blocked_thread
   wait_sigstop
   wait_stop_and_exit
   write_race
@@ -1750,6 +1755,7 @@ set(TESTS_WITH_PROGRAM
   vfork
   vfork_read_clone_stress
   vsyscall_reverse_next
+  wait_continued_traced_external
   wait_for_all
   watchpoint
   watchpoint_at_sched
