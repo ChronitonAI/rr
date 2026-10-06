@@ -1387,6 +1387,7 @@ set(BASIC_TESTS
   sighandler_fork
   sighandler_mask
   sigill
+  x86/signal_at_popf
   signal_deferred
   signal_during_preload_init
   signal_frame
@@ -1641,6 +1642,9 @@ set(TESTS_WITH_PROGRAM
   prctl_tsc
   priority
   ptrace_remote_unmap
+  x86/ptrace_singlestep_trap_flag
+  x86/ptrace_trap_flag
+  x86/ptrace_trap_flag_signal
   x86/rdtsc_loop
   x86/rdtsc_loop2
   x86/rdtsc_interfering
@@ -1705,6 +1709,8 @@ set(TESTS_WITH_PROGRAM
   threads
   tls
   tracee_unmap_vdso
+  x86/trap_flag
+  x86/trap_flag_once
   ttyname
   unexpected_stack_growth
   unicode

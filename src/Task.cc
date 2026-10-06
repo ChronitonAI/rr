@@ -1631,6 +1631,8 @@ bool Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
 
   address_of_last_execution_resume = ip();
   how_last_execution_resumed = how;
+  trap_flag_at_last_execution_resume =
+      is_x86ish(arch()) && registers.x86_singlestep_flag();
 
   bool flushed_ok = flush_regs();
 
@@ -2317,6 +2319,59 @@ static bool ignore_signal_for_detached_proxy(int sig) {
   }
 }
 
+/**
+ * Returns true if the instruction at |ip| sets the trap flag itself, as the
+ * kernel decides it (is_setting_trap_flag() in arch/x86/kernel/step.c): popf
+ * or iret, after prefixes.
+ */
+static bool is_x86_trap_flag_setting_instruction(Task* t, remote_code_ptr ip) {
+  static const uint8_t prefixes[] = { 0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65,
+                                      0x66, 0x67, 0xf0, 0xf2, 0xf3 };
+  uint8_t insn[15];
+  ssize_t len =
+      t->read_bytes_fallible(ip.to_data_ptr<uint8_t>(), sizeof(insn), insn);
+  for (ssize_t i = 0; i < len; ++i) {
+    if (insn[i] == 0x9d || insn[i] == 0xcf) {
+      // popf, iret
+      return true;
+    }
+    bool rex = t->arch() == x86_64 && (insn[i] & 0xf0) == 0x40;
+    if (!rex && !memchr(prefixes, insn[i], sizeof(prefixes))) {
+      return false;
+    }
+  }
+  return false;
+}
+
+bool Task::tracee_set_trap_flag(WaitStatus status) {
+  if (trap_flag_at_last_execution_resume) {
+    // The ptracer set it. The kernel may have cleared it since, e.g. when it
+    // entered a signal handler, but it would have saved it in the signal
+    // frame.
+    return true;
+  }
+  bool rr_stepped = is_singlestep_resume(how_last_execution_resumed);
+  if (registers.x86_singlestep_flag()) {
+    if (!rr_stepped) {
+      return true;
+    }
+    // The kernel hides the trap flag that a ptrace single-step sets, but it
+    // loses track of it when the instruction to step sets the trap flag
+    // itself (popf, iret). Then the trap flag is visible if the tracee stops
+    // before that instruction executes, e.g. for a signal, and after the next
+    // single-step, which the kernel thinks the tracee asked for. It's the
+    // tracee's own only if it executed such an instruction.
+    return ip() != address_of_last_execution_resume &&
+           is_x86_trap_flag_setting_instruction(
+               this, address_of_last_execution_resume);
+  }
+  // The trap flag may also have caused a SIGTRAP and been cleared again by
+  // the instruction that trapped.
+  return !rr_stepped && status.stop_sig() == SIGTRAP &&
+         pending_siginfo.si_code == TRAP_TRACE &&
+         (x86_debug_status() & DS_SINGLESTEP);
+}
+
 bool Task::did_waitpid(WaitStatus status) {
   if (is_detached_proxy() &&
       ignore_signal_for_detached_proxy(status.stop_sig())) {
@@ -2480,6 +2535,18 @@ bool Task::did_waitpid(WaitStatus status) {
       // after asking for a single step. We want to avoid taking that single
       // step after the signal resumes, so the singlestep flag needs to be
       // cleared. On aarch64, the kernel does this for us.
+      if (session().is_recording() && tracee_set_trap_flag(status)) {
+        // Recording that isn't supported: each of the tracee's instructions
+        // would raise a SIGTRAP, and they would have to be recorded and
+        // replayed, without exposing rr's own code. Close the trace, so
+        // that it can be replayed up to here.
+        session().as_record()->close_trace_writer(TraceWriter::CLOSE_ERROR);
+        CLEAN_FATAL() << "Tracee " << tid
+                      << " (or its ptracer) set the trap flag (TF) in "
+                         "EFLAGS, at "
+                      << ip()
+                      << ". rr doesn't support single-stepping that way.";
+      }
       if (registers.x86_singlestep_flag()) {
         registers.clear_x86_singlestep_flag();
         registers_dirty = true;
