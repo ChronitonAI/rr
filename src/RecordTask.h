@@ -801,6 +801,14 @@ public:
   bool break_at_syscallbuf_untraced_syscalls;
   bool break_at_syscallbuf_final_instruction;
   remote_code_ptr syscallstub_exit_breakpoint;
+  // The ptracer single-stepped the task into syscallbuf code (e.g. a patched
+  // syscall instruction). We run the task through that code, and report the
+  // single-step when it returns to the application. This is the siginfo of
+  // the step.
+  bool pending_singlestep_stop;
+  siginfo_t pending_singlestep_siginfo;
+  // Forget a pending_singlestep_stop: some other stop ends the single-step.
+  void cancel_pending_singlestep();
 
   // The pmc is programmed to interrupt at a value requested by the tracee, not
   // by rr.

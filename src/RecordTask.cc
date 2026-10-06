@@ -197,6 +197,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       break_at_syscallbuf_untraced_syscalls(false),
       break_at_syscallbuf_final_instruction(false),
       syscallstub_exit_breakpoint(),
+      pending_singlestep_stop(false),
       next_pmc_interrupt_is_for_user(false),
       did_record_robust_futex_changes(false),
       waiting_for_reap(false),
@@ -235,6 +236,7 @@ RecordTask::~RecordTask() {
     t->emulated_ptrace_options = 0;
     t->emulated_stop_pending = false;
     t->emulated_stop_type = NOT_STOPPED;
+    t->cancel_pending_singlestep();
   }
 
   // We expect tasks to usually exit by a call to exit() or
@@ -364,6 +366,7 @@ void RecordTask::post_wait_clone(Task* cloned_from, int flags) {
 }
 
 void RecordTask::post_exec() {
+  cancel_pending_singlestep();
   // Change syscall number to execve/execveat *for the new arch*. If we don't do this,
   // and the arch changes, then the syscall number for execve in the old arch/
   // is treated as the syscall we're executing in the new arch, with hilarious
@@ -811,6 +814,7 @@ void RecordTask::set_emulated_ptracer(RecordTask* tracer) {
                emulated_stop_type == GROUP_STOP);
     emulated_ptracer->emulated_ptrace_tracees.erase(this);
     emulated_ptracer = nullptr;
+    cancel_pending_singlestep();
   }
 }
 
@@ -839,6 +843,9 @@ bool RecordTask::emulate_ptrace_stop(WaitStatus status, EmulatedStopType stop_ty
 }
 
 void RecordTask::force_emulate_ptrace_stop(WaitStatus status, EmulatedStopType stop_type) {
+  // Any other stop ends a single-step that we're still running through a
+  // syscall hook.
+  cancel_pending_singlestep();
   emulated_stop_type = stop_type;
   emulated_stop_code = status;
   emulated_stop_pending = true;
@@ -1544,10 +1551,20 @@ void RecordTask::pop_stash_sig(const StashedSignal* stashed) {
   ASSERT(this, false) << "signal not found";
 }
 
+void RecordTask::cancel_pending_singlestep() {
+  if (!pending_singlestep_stop) {
+    return;
+  }
+  pending_singlestep_stop = false;
+  break_at_syscallbuf_final_instruction = has_stashed_sig();
+  syscallstub_exit_breakpoint = nullptr;
+}
+
 void RecordTask::stashed_signal_processed() {
-  break_at_syscallbuf_final_instruction = break_at_syscallbuf_traced_syscalls =
-      break_at_syscallbuf_untraced_syscalls =
-          stashed_signals_blocking_more_signals = has_stashed_sig();
+  break_at_syscallbuf_traced_syscalls = break_at_syscallbuf_untraced_syscalls =
+      stashed_signals_blocking_more_signals = has_stashed_sig();
+  break_at_syscallbuf_final_instruction =
+      has_stashed_sig() || pending_singlestep_stop;
   syscallstub_exit_breakpoint = nullptr;
 }
 

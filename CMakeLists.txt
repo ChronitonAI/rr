@@ -1309,6 +1309,8 @@ set(BASIC_TESTS
   ptrace_sigchld_blocked
   ptrace_signals
   ptrace_singlestep
+  x86/ptrace_singlestep_sigreturn_restart
+  x86/ptrace_singlestep_syscallbuf
   ptrace_syscall
   ptrace_syscall_clone_untraced
   x86/ptrace_sysemu
