@@ -30,6 +30,16 @@
 #endif
 
 #if defined(__i386__)
+#define SYSCALL_ARG2 ecx
+#elif defined(__x86_64__)
+#define SYSCALL_ARG2 rsi
+#elif defined(__aarch64__)
+#define SYSCALL_ARG2 regs[1]
+#else
+#error unknown architecture
+#endif
+
+#if defined(__i386__)
 #define IP eip
 #elif defined(__x86_64__)
 #define IP rip

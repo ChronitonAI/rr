@@ -1316,6 +1316,10 @@ set(BASIC_TESTS
   ptrace_interrupt_syscall_stops
   ptrace_interrupt_syscall
   ptrace_kill_grandtracee
+  ptrace_regs_blocked_tracee
+  ptrace_regs_busy_thread
+  ptrace_regs_syscall_args
+  ptrace_regs_tracer_sigcont
   ptrace_resume_signal_ignored
   x86/ptrace_tls
   ptrace_seize
