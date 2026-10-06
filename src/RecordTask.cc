@@ -760,6 +760,18 @@ vector<remote_code_ptr> RecordTask::syscallbuf_syscall_entry_breakpoints() {
 }
 
 void RecordTask::did_wait() {
+  if (ptrace_event() == PTRACE_EVENT_EXEC && ev().is_syscall_event() &&
+      ev().Syscall().is_exec()) {
+    // We're the task that exec'd. The exec has replaced our address space and
+    // our tid now refers to the new image. Switch to the new address space
+    // right away, so that nothing uses state from the old image through our
+    // tid in the meantime (e.g. will_schedule() writing to the old rseq
+    // area). If we didn't exec, we're the old leader and another thread's
+    // exec stop was reported for our tid; RecordSession's
+    // PTRACE_EVENT_EXEC handling deals with that.
+    post_exec();
+  }
+
   for (auto p : syscallbuf_syscall_entry_breakpoints()) {
     vm()->remove_breakpoint(p, BKPT_INTERNAL);
   }
@@ -2030,7 +2042,9 @@ void RecordTask::record_event(Event ev, FlushSyscallbuf flush,
     }
   }
 
-  if (trace_writer().clear_fip_fdp()) {
+  // A reaped task is gone; anything we'd read or write through its tid
+  // could belong to another task (see Task::did_die_in_exec()).
+  if (trace_writer().clear_fip_fdp() && !was_reaped()) {
     const ExtraRegisters* maybe_extra = extra_regs_fallible();
     if (maybe_extra) {
       ExtraRegisters extra_registers = *maybe_extra;

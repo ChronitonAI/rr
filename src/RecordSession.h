@@ -188,15 +188,14 @@ public:
   void on_proxy_detach(RecordTask *t, pid_t new_tid);
 
   /**
-   * This gets called when we detect that a task has been revived from the
-   * dead with a PTRACE_EVENT_EXEC. See ptrace man page under "execve(2) under
-   * ptrace" for the horrid details.
-   *
-   * The task in the thread-group that triggered the successful execve has changed
-   * its tid to |rec_tid|. We mirror that, and emit TraceTaskEvents to make it
-   * look like a new task was spawned and the old task exited.
+   * Called when |rec_tid| stops at PTRACE_EVENT_EXEC. Returns the task that
+   * did the exec. If that wasn't the thread-group leader, the exec'ing task
+   * has taken over the leader's tid |rec_tid| (see the ptrace man page under
+   * "execve(2) under ptrace" for the horrid details): we record the exit of
+   * the leader, which the exec killed, if we haven't yet, destroy it, and
+   * revive_task_for_exec().
    */
-  RecordTask* revive_task_for_exec(pid_t rec_tid);
+  RecordTask* find_execing_task(pid_t rec_tid);
 
   virtual TraceStream* trace_stream() override { return &trace_out; }
 
@@ -213,6 +212,14 @@ public:
   void on_destroy_record_task(RecordTask* t);
 
 private:
+  /**
+   * The task in the thread-group that triggered the successful execve, which
+   * had tid |former_tid|, has changed its tid to |rec_tid|. We mirror that,
+   * and emit TraceTaskEvents to make it look like a new task was spawned and
+   * the old task exited.
+   */
+  RecordTask* revive_task_for_exec(pid_t rec_tid, pid_t former_tid);
+
   RecordSession(const std::string& exe_path,
                 const std::vector<std::string>& argv,
                 const std::vector<std::string>& envp,

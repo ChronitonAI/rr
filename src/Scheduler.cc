@@ -610,17 +610,8 @@ static RecordTask* find_waited_task(RecordSession& session, pid_t tid, WaitStatu
 {
   RecordTask* waited = session.find_task(tid);
   if (status.ptrace_event() == PTRACE_EVENT_EXEC) {
-    if (waited && waited->waiting_for_reap) {
-      // We didn't reap this task yet but it's being replaced anyway. Get rid of it
-      // so we can replace it.
-      delete waited;
-      waited = nullptr;
-    }
-    if (!waited) {
-      // The thread-group-leader died and now the exec'ing thread has
-      // changed its thread ID to be thread-group leader.
-      waited = session.revive_task_for_exec(tid);
-    }
+    // If a non-leader thread exec'd, it now has the leader's tid.
+    waited = session.find_execing_task(tid);
   }
 
   if (!waited) {
@@ -757,6 +748,17 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
           }
           ASSERT(current_, wait_result == WAIT_OK);
           RecordTask *waited = find_waited_task(session, tid, status);
+          if (!current_) {
+            // find_waited_task() destroyed current_: it was the leader of a
+            // thread group in which another thread exec'd, and the exec
+            // killed it. Run the task that exec'd instead.
+            if (waited && waited->did_waitpid(status)) {
+              result.by_waitpid = true;
+              current_ = waited;
+            }
+            unlimited_ticks_mode = false;
+            break;
+          }
           if (!waited) {
             continue;
           }
@@ -798,13 +800,13 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
       }
 #ifdef MONITOR_UNSWITCHABLE_WAITS
       double wait_duration = monotonic_now_sec() - now;
-      if (wait_duration >= 0.010) {
+      if (wait_duration >= 0.010 && current_) {
         LOGM(warn) << "Waiting for unswitchable " << current_->ev()
                    << " took " << 1000.0 * wait_duration << "ms";
       }
 #endif
     }
-    if (current_->is_stopped() || current_->was_reaped()) {
+    if (current_ && (current_->is_stopped() || current_->was_reaped())) {
       validate_scheduled_task();
       return result;
     }

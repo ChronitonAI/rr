@@ -1085,6 +1085,7 @@ set(BASIC_TESTS
   exec_self
   exec_from_main_thread
   exec_from_other_thread
+  exec_rseq
   exec_stopsig
   execveat
   exit_with_syscallbuf_signal
