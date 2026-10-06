@@ -721,9 +721,12 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
     // unless a ptracer intercepts the signal as we do). Therefore, if the
     // signal was generated for rr's purposes, we need to restore the signal
     // state ourselves.
+    // While |t| has stashed signals it runs with our signal mask, which
+    // blocks the signal too (see RecordTask::will_resume_execution).
     if (sig == SIGSEGV &&
         (try_handle_trapped_instruction(t, si) || try_grow_map(t, si))) {
-      if (signal_was_blocked || t->is_sig_ignored(sig)) {
+      if (signal_was_blocked || t->is_sig_ignored(sig) ||
+          t->stashed_signals_blocking_more_signals) {
         restore_signal_state(t, sig, signal_was_blocked);
       }
       return SIGNAL_HANDLED;
