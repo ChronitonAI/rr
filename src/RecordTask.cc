@@ -410,6 +410,12 @@ template <typename Arch> static void do_preload_init_arch(RecordTask* t) {
       params.get_pc_thunks_start.rptr().as_int();
   t->syscallbuf_code_layout.get_pc_thunks_end =
       params.get_pc_thunks_end.rptr().as_int();
+  t->syscallbuf_code_layout.memory_checks_start =
+      params.memory_checks_start.rptr().as_int();
+  t->syscallbuf_code_layout.memory_checks_end =
+      params.memory_checks_end.rptr().as_int();
+  t->syscallbuf_code_layout.memory_check_failed =
+      params.memory_check_failed.rptr().as_int();
 
   unsigned char in_chaos = t->session().enable_chaos();
   auto in_chaos_ptr REMOTE_PTR_FIELD(params.globals.rptr(), in_chaos);

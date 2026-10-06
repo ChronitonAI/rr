@@ -1438,6 +1438,7 @@ set(BASIC_TESTS
   sync_file_range
   syscall_bp
   syscall_in_writable_mem
+  syscallbuf_efault
   syscallbuf_signal_reset
   syscallbuf_signal_blocking
   syscallbuf_sigstop

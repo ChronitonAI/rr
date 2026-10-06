@@ -209,6 +209,146 @@ static bool try_grow_map(RecordTask* t, siginfo_t* si) {
   return false;
 }
 
+/**
+ * If |ip| is at the memory access in _memory_check_writable or
+ * _memory_check_readable (see raw_syscall.S), return the length of that
+ * instruction, otherwise 0. Executing such an access has no effect that the
+ * following instructions depend on, so it can be skipped. Set |*writes| if
+ * it's the access in _memory_check_writable.
+ */
+static size_t skippable_memory_check_access_length(RecordTask* t,
+                                                   remote_code_ptr ip,
+                                                   bool* writes) {
+  // The access and the instruction after it. We match the latter too, since
+  // _memory_check_readable_str's access looks the same, but its control flow
+  // depends on what it reads.
+  static const uint8_t x86_writable[] = { 0xf0, 0x80, 0x09, 0x00, 0x81,
+                                          0xe1, 0x00, 0xf0, 0xff, 0xff };
+  static const uint8_t x86_readable[] = { 0x80, 0x39, 0x00, 0x81, 0xe1,
+                                          0x00, 0xf0, 0xff, 0xff };
+  static const uint8_t x64_writable[] = { 0xf0, 0x80, 0x0f, 0x00, 0x48, 0x81,
+                                          0xe7, 0x00, 0xf0, 0xff, 0xff };
+  static const uint8_t x64_readable[] = { 0x80, 0x3f, 0x00, 0x48, 0x81,
+                                          0xe7, 0x00, 0xf0, 0xff, 0xff };
+  static const uint8_t arm64_writable[] = { 0x1f, 0x10, 0x3f, 0x38,
+                                            0x00, 0xcc, 0x74, 0x92 };
+  static const uint8_t arm64_readable[] = { 0x1f, 0x00, 0x40, 0x39,
+                                            0x00, 0xcc, 0x74, 0x92 };
+  struct Access {
+    const uint8_t* bytes;
+    size_t size;
+    size_t length;
+    bool writes;
+  };
+  static const Access x86_accesses[] = {
+    { x86_writable, sizeof(x86_writable), 4, true },
+    { x86_readable, sizeof(x86_readable), 3, false }
+  };
+  static const Access x64_accesses[] = {
+    { x64_writable, sizeof(x64_writable), 4, true },
+    { x64_readable, sizeof(x64_readable), 3, false }
+  };
+  static const Access arm64_accesses[] = {
+    { arm64_writable, sizeof(arm64_writable), 4, true },
+    { arm64_readable, sizeof(arm64_readable), 4, false }
+  };
+  const Access* accesses;
+  switch (t->arch()) {
+    case x86:
+      accesses = x86_accesses;
+      break;
+    case x86_64:
+      accesses = x64_accesses;
+      break;
+    case aarch64:
+      accesses = arm64_accesses;
+      break;
+    default:
+      return 0;
+  }
+  uint8_t code[16];
+  ssize_t nread =
+      t->read_bytes_fallible(ip.to_data_ptr<void>(), sizeof(code), code);
+  for (int i = 0; i < 2; ++i) {
+    const Access& a = accesses[i];
+    if (nread >= ssize_t(a.size) && !memcmp(code, a.bytes, a.size)) {
+      *writes = a.writes;
+      return a.length;
+    }
+  }
+  return 0;
+}
+
+/**
+ * Return true if |t| was stopped by a fault in one of the functions that the
+ * syscallbuf code calls to check that it can access tracee memory, and we
+ * handled it.
+ * For a SIGSEGV, we make the function return 0. The syscallbuf code then makes
+ * a traced syscall, which fails with EFAULT as it would without rr. Replay
+ * must fault at the same point. That's the case for memory that isn't mapped
+ * or whose protection doesn't allow the access, since replay reproduces the
+ * tracee's mappings. For a fault that replay doesn't reproduce, we skip the
+ * access instead.
+ */
+static bool try_handle_memory_check_fault(RecordTask* t, siginfo_t* si) {
+  const SyscallbufCodeLayout& layout = t->syscallbuf_code_layout;
+  remote_code_ptr ip = t->ip();
+  // After an exec, |layout| is stale until the preload has initialized.
+  if (!t->vm()->syscallbuf_enabled() || layout.memory_checks_start.is_null() ||
+      ip < layout.memory_checks_start || layout.memory_checks_end <= ip) {
+    return false;
+  }
+  bool skip = false;
+  bool writes = false;
+  size_t length = 0;
+  if (si->si_signo == SIGBUS && si->si_code == BUS_ADRERR) {
+    // Replay doesn't fault here for a page past the end of a file: it maps
+    // that as anonymous memory, or for a shared mapping, from an emulated
+    // file that covers the whole mapping.
+    skip = true;
+    length = skippable_memory_check_access_length(t, ip, &writes);
+  } else if (si->si_signo == SIGSEGV && si->si_code == SEGV_PKUERR) {
+    // rr doesn't replay protection keys, so replay doesn't fault here, unless
+    // the mapping's protection doesn't allow the access either: x86 reports
+    // SEGV_PKUERR then too.
+    length = skippable_memory_check_access_length(t, ip, &writes);
+    // The address can have a tag.
+    remote_ptr<void> addr = untagged_addr(t->arch(), uintptr_t(si->si_addr));
+    if (t->vm()->has_mapping(addr)) {
+      int prot = t->vm()->mapping_of(addr).map.prot();
+      // Memory that is writable is also readable.
+      skip = (prot & PROT_WRITE) || (!writes && (prot & PROT_READ));
+    }
+  }
+  if (skip) {
+    // Skip the access, i.e. treat the memory as accessible, as if there was
+    // no check. Executing the access in replay has the same effect.
+    if (!length) {
+      FATAL() << "A syscall buffer check of a string got "
+              << signal_name(si->si_signo) << " at " << ip
+              << "; try recording without the syscall buffer (-n)";
+    }
+    LOG(debug) << "skipping syscallbuf memory check access at " << ip;
+    Registers r = t->regs();
+    r.set_ip(ip + length);
+    t->set_regs(r);
+    // Nothing to record.
+    t->push_event(Event::noop());
+    return true;
+  }
+  if (si->si_signo != SIGSEGV) {
+    return false;
+  }
+  LOG(debug) << "syscallbuf memory check faulted at " << ip;
+  Registers r = t->regs();
+  r.set_ip(layout.memory_check_failed);
+  t->set_regs(r);
+  // Replay faults at the same point and sets these registers.
+  t->record_event(Event::instruction_trap());
+  t->push_event(Event::noop());
+  return true;
+}
+
 void disarm_desched_event(RecordTask* t) {
   ScopedFd& fd = t->desched_fd.tracee_fd();
   if (fd.is_open() && ioctl(fd, PERF_EVENT_IOC_DISABLE, 0)) {
@@ -723,8 +863,10 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
     // state ourselves.
     // While |t| has stashed signals it runs with our signal mask, which
     // blocks the signal too (see RecordTask::will_resume_execution).
-    if (sig == SIGSEGV &&
-        (try_handle_trapped_instruction(t, si) || try_grow_map(t, si))) {
+    if ((sig == SIGSEGV &&
+         (try_handle_trapped_instruction(t, si) || try_grow_map(t, si))) ||
+        ((sig == SIGSEGV || sig == SIGBUS) &&
+         try_handle_memory_check_fault(t, si))) {
       if (signal_was_blocked || t->is_sig_ignored(sig) ||
           t->stashed_signals_blocking_more_signals) {
         restore_signal_state(t, sig, signal_was_blocked);
