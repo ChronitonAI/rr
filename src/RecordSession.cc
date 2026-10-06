@@ -1777,6 +1777,19 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
       // until we deal with the EV_SIGNAL_DELIVERY.
       if (has_handler) {
         t->record_current_event();
+        if (is_ptrace_any_singlestep(t->arch(),
+                                     t->emulated_ptrace_cont_command)) {
+          // The ptracer delivered the signal with PTRACE_SINGLESTEP. The
+          // kernel ends that step as soon as it has set up the signal frame,
+          // at the handler's first instruction, with ptrace_notify(SIGTRAP)
+          // (so si_code is SIGTRAP). The task is at that stop now, so use
+          // its siginfo. (Natively, a signal that the ptracer passes when it
+          // resumes the task from this stop is ignored; we deliver it, as
+          // for emulated PTRACE_EVENT stops.)
+          siginfo_t si = t->get_siginfo();
+          t->emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGTRAP),
+                                 SIGNAL_DELIVERY_STOP, &si);
+        }
       }
       break;
     }
