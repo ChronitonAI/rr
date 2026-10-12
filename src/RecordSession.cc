@@ -1401,6 +1401,10 @@ void RecordSession::syscall_state_changed(RecordTask* t,
           installed_temporary_sigmask(t, syscallno, syscall_arch,
                                       t->ev().Syscall().regs);
 
+      if (retval == -EINTR && rec_restart_after_spurious_EINTR(t)) {
+        retval = t->regs().syscall_result_signed();
+      }
+
       if (t->desched_rec()) {
         // If we enabled the desched event above, disable it.
         disarm_desched_event(t);
