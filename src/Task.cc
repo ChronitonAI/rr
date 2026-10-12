@@ -490,6 +490,11 @@ void Task::did_kill()
   cloned_file_data_fd_child = -1;
 }
 
+void Task::did_die_in_exec() {
+  did_kill();
+  was_reaped_ = true;
+}
+
 /**
  * Must be idempotent.
  */
