@@ -66,6 +66,11 @@ public:
   // couldn't push a signal handler frame. Only used during recording.
   bool received_sigframe_SIGSEGV;
 
+  // During recording: signals that were pending for the whole process when
+  // an emulated ptracer attached to one of its threads, and that the process
+  // ignored. See RecordTask::ignored_signals_pending_at_ptrace_attach.
+  uint64_t ignored_shared_signals_pending_at_ptrace_attach;
+
 private:
   ThreadGroup(const ThreadGroup&) = delete;
   ThreadGroup operator=(const ThreadGroup&) = delete;
