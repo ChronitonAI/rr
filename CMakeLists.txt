@@ -1390,6 +1390,7 @@ set(BASIC_TESTS
   seccomp_sigsys_args
   seccomp_sigsys_sigtrap
   seccomp_sigsys_syscallbuf
+  x86/seccomp_stop_remote_syscall
   seccomp_tsync
   seccomp_veto_exec
   self_shebang
