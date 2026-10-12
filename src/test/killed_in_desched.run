@@ -1,0 +1,8 @@
+source `dirname $0`/util.sh
+# Without the syscall buffer there is no desched signal, and the child's
+# read() would block forever.
+skip_if_no_syscall_buf
+# Make rr SIGKILL the child while it handles the child's desched signal.
+RR_KILL_TASK_IN_DESCHED=1 record $TESTNAME
+replay
+check EXIT-SUCCESS
