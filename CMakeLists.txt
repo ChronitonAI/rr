@@ -1672,6 +1672,7 @@ set(TESTS_WITH_PROGRAM
   jit_proc_mem
   killed_in_signal_stop
   killed_injecting_signal
+  killed_task_exit_order
   link
   madvise_dontfork
   madvise_fracture_flags
