@@ -47,6 +47,22 @@ struct Sighandler {
     takes_siginfo = (ksa.sa_flags & SA_SIGINFO) != 0;
   }
 
+  /**
+   * Set from the fields of a sigaction of another arch, stored as a
+   * kernel_sigaction of Arch (the task's).
+   */
+  template <typename Arch>
+  void init_from_fields_arch(uint64_t handler, uint64_t flags,
+                             uint64_t restorer, uint64_t mask) {
+    typename Arch::kernel_sigaction ksa;
+    memset(&ksa, 0, sizeof(ksa));
+    ksa.k_sa_handler = remote_ptr<void>(handler);
+    ksa.sa_flags = flags;
+    ksa.sa_restorer = remote_ptr<void>(restorer);
+    memcpy(&ksa.sa_mask, &mask, min(sizeof(ksa.sa_mask), sizeof(mask)));
+    init_arch<Arch>(ksa);
+  }
+
   template <typename Arch> void reset_arch() {
     typename Arch::kernel_sigaction ksa;
     memset(&ksa, 0, sizeof(ksa));
@@ -74,7 +90,7 @@ struct Sighandler {
   }
 
   remote_ptr<void> k_sa_handler;
-  // Saved kernel_sigaction; used to restore handler
+  // Saved kernel_sigaction of the task's arch; used to restore handler
   vector<uint8_t> sa;
   bool resethand;
   bool takes_siginfo;
@@ -82,6 +98,13 @@ struct Sighandler {
 
 static void reset_handler(Sighandler* handler, SupportedArch arch) {
   RR_ARCH_FUNCTION(handler->reset_arch, arch);
+}
+
+static void init_handler_from_fields(Sighandler* handler, SupportedArch arch,
+                                     uint64_t handler_addr, uint64_t flags,
+                                     uint64_t restorer, uint64_t mask) {
+  RR_ARCH_FUNCTION(handler->init_from_fields_arch, arch, handler_addr, flags,
+                   restorer, mask);
 }
 
 struct Sighandlers {
@@ -184,6 +207,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       in_wait_pid(0),
       creator_tid(0),
       emulated_stop_type(NOT_STOPPED),
+      emulated_stop_syscall_arch(a),
       blocked_sigs_dirty(true),
       syscallbuf_blocked_sigs_generation(0),
       flushed_num_rec_bytes(0),
@@ -192,6 +216,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       delay_syscallbuf_reset_for_seccomp_trap(false),
       prctl_seccomp_status(0),
       robust_futex_list_len(0),
+      compat_robust_futex_list_len(0),
       termination_signal(0),
       tsc_mode(PR_TSC_ENABLE),
       cpuid_mode(1),
@@ -356,8 +381,8 @@ void RecordTask::post_wait_clone(Task* cloned_from, int flags) {
   priority = rt->priority;
   syscallbuf_code_layout = rt->syscallbuf_code_layout;
   prctl_seccomp_status = rt->prctl_seccomp_status;
-  robust_futex_list = rt->robust_futex_list;
-  robust_futex_list_len = rt->robust_futex_list_len;
+  // The kernel doesn't pass robust lists on to new tasks (copy_process() ->
+  // futex_init_task()).
   tsc_mode = rt->tsc_mode;
   cpuid_mode = rt->cpuid_mode;
   if (CLONE_SHARE_SIGHANDLERS & flags) {
@@ -400,6 +425,7 @@ void RecordTask::post_exec() {
   // soon after exec, we must not do a bogus set_robust_list syscall for
   // the clone.
   set_robust_list(nullptr, 0);
+  set_compat_robust_list(nullptr, 0);
   sighandlers = sighandlers->clone();
   sighandlers->reset_user_handlers(arch());
 
@@ -622,12 +648,20 @@ void RecordTask::on_syscall_exit_arch(int syscallno, const Registers& regs) {
 
   switch (syscallno) {
     case Arch::set_robust_list:
-      set_robust_list(regs.orig_arg1(), (size_t)regs.arg2());
+      if (Arch::arch() != arch()) {
+        // An i386 syscall of an x86-64 task (int $0x80). The kernel keeps
+        // that list separately and processes both at exit.
+        set_compat_robust_list(regs.orig_arg1(), (size_t)regs.arg2());
+      } else {
+        set_robust_list(regs.orig_arg1(), (size_t)regs.arg2());
+      }
       return;
     case Arch::sigaction:
+      update_sigaction_arch<Arch>(regs, true);
+      return;
     case Arch::rt_sigaction:
       // TODO: SYS_signal
-      update_sigaction(regs);
+      update_sigaction_arch<Arch>(regs, false);
       return;
     case Arch::set_tid_address:
       set_tid_addr(regs.orig_arg1());
@@ -1372,23 +1406,38 @@ void RecordTask::set_siginfo(const siginfo_t& si) {
 }
 
 template <typename Arch>
-void RecordTask::update_sigaction_arch(const Registers& regs) {
+void RecordTask::update_sigaction_arch(const Registers& regs,
+                                       bool old_sigaction) {
   int sig = regs.orig_arg1_signed();
-  remote_ptr<typename Arch::kernel_sigaction> new_sigaction = regs.arg2();
-  if (0 == regs.syscall_result() && !new_sigaction.is_null()) {
-    // A new sighandler was installed.  Update our
-    // sighandler table.
-    // TODO: discard attempts to handle or ignore signals
-    // that can't be by POSIX
-    typename Arch::kernel_sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    read_bytes_helper(new_sigaction, sizeof(sa), &sa);
-    sighandlers->get(sig).init_arch<Arch>(sa);
+  remote_ptr<void> new_sigaction = regs.arg2();
+  if (0 != regs.syscall_result() || new_sigaction.is_null()) {
+    return;
   }
-}
-
-void RecordTask::update_sigaction(const Registers& regs) {
-  RR_ARCH_FUNCTION(update_sigaction_arch, regs.arch(), regs);
+  // A new sighandler was installed.  Update our
+  // sighandler table.
+  // TODO: discard attempts to handle or ignore signals
+  // that can't be by POSIX
+  uint64_t handler, flags, restorer, mask = 0;
+  if (old_sigaction) {
+    auto sa = read_mem(new_sigaction.cast<typename Arch::old_sigaction>());
+    handler = sa.k_sa_handler.rptr().as_int();
+    flags = sa.sa_flags;
+    restorer = sa.sa_restorer.rptr().as_int();
+    mask = sa.sa_mask;
+  } else {
+    auto sa = read_mem(new_sigaction.cast<typename Arch::kernel_sigaction>());
+    if (Arch::arch() == arch()) {
+      sighandlers->get(sig).init_arch<Arch>(sa);
+      return;
+    }
+    handler = sa.k_sa_handler.rptr().as_int();
+    flags = sa.sa_flags;
+    restorer = sa.sa_restorer.rptr().as_int();
+    memcpy(&mask, &sa.sa_mask, min(sizeof(mask), sizeof(sa.sa_mask)));
+  }
+  // Store it with the task's layout, which rr uses to install it again.
+  init_handler_from_fields(&sighandlers->get(sig), arch(), handler, flags,
+                           restorer, mask);
 }
 
 sig_set_t RecordTask::read_sigmask_from_process() {
@@ -1729,17 +1778,20 @@ const RecordTask::StashedSignal* RecordTask::peek_stashed_sig_to_deliver()
   return &stashed_signals[0];
 }
 
-bool RecordTask::is_syscall_restart() {
+bool RecordTask::is_syscall_restart(SupportedArch syscall_arch) {
   if (EV_SYSCALL_INTERRUPTION != ev().type()) {
     return false;
   }
 
   int syscallno = regs().original_syscallno();
-  SupportedArch syscall_arch = ev().Syscall().arch();
   string call_name = syscall_name(syscallno, syscall_arch);
   bool is_restart = false;
   LOG(debug) << "  is syscall interruption of recorded " << ev() << "? (now "
              << call_name << ")";
+  if (syscall_arch != ev().Syscall().arch()) {
+    LOG(debug) << "  interrupted " << ev() << " is a syscall of another arch";
+    goto done;
+  }
 
   /* It's possible for the tracee to resume after a sighandler
    * with a fresh syscall that happens to be the same as the one
@@ -1834,12 +1886,19 @@ bool RecordTask::at_may_restart_syscall() const {
           EV_SYSCALL_INTERRUPTION == prev_ev->type());
 }
 
-bool RecordTask::at_interrupted_non_restartable_signal_modifying_syscall() const {
+bool RecordTask::at_interrupted_non_restartable_signal_modifying_syscall() {
   auto r = regs();
+  if (r.syscall_result_signed() != -EINTR) {
+    return false;
+  }
+  // The syscall's arch: an x86-64 task can make i386 syscalls with
+  // int $0x80.
+  SupportedArch syscall_arch = arch();
+  get_syscall_instruction_arch(
+      this, r.ip().decrement_by_syscall_insn_length(arch()), &syscall_arch);
   // XXXkhuey io_uring_enter (not yet supported) can do this too.
-  return r.syscall_result_signed() == -EINTR &&
-    (is_epoll_pwait_syscall(r.original_syscallno(), arch()) ||
-     is_epoll_pwait2_syscall(r.original_syscallno(), arch()));
+  return is_epoll_pwait_syscall(r.original_syscallno(), syscall_arch) ||
+         is_epoll_pwait2_syscall(r.original_syscallno(), syscall_arch);
 }
 
 bool RecordTask::is_arm_desched_event_syscall() {

@@ -385,11 +385,11 @@ public:
   bool has_stashed_group_stop() const { return stashed_group_stop; }
 
   /**
-   * Return true if the current state of this looks like the
-   * interrupted syscall at the top of our event stack, if there
-   * is one.
+   * Return true if the current state of this, entering a syscall of
+   * |syscall_arch|, looks like the interrupted syscall at the top of our
+   * event stack, if there is one.
    */
-  bool is_syscall_restart();
+  bool is_syscall_restart(SupportedArch syscall_arch);
   /**
    * Return true iff this is at an execution state where
    * resuming execution may lead to the restart of an
@@ -406,7 +406,7 @@ public:
    * a syscall that modifies signals was interrupted but will not
    * be automatically restarted.
    **/
-  bool at_interrupted_non_restartable_signal_modifying_syscall() const;
+  bool at_interrupted_non_restartable_signal_modifying_syscall();
   /**
    * Return true if this is at an arm-desched-event syscall.
    */
@@ -599,6 +599,10 @@ public:
 
   remote_ptr<void> robust_list() const { return robust_futex_list; }
   size_t robust_list_len() const { return robust_futex_list_len; }
+  remote_ptr<void> compat_robust_list() const {
+    return compat_robust_futex_list;
+  }
+  size_t compat_robust_list_len() const { return compat_robust_futex_list_len; }
 
   /** Uses /proc so not trivially cheap. */
   pid_t get_parent_pid() const;
@@ -692,6 +696,14 @@ public:
     robust_futex_list = list;
     robust_futex_list_len = len;
   }
+  /**
+   * The same for the list of an i386 set_robust_list() of an x86-64 task
+   * (int $0x80), which the kernel keeps separately (compat_robust_list).
+   */
+  void set_compat_robust_list(remote_ptr<void> list, size_t len) {
+    compat_robust_futex_list = list;
+    compat_robust_futex_list_len = len;
+  }
 
   void set_stopped(bool stopped) override;
 
@@ -713,16 +725,15 @@ private:
    */
   void futex_wait(remote_ptr<int> futex, int val, bool* ok);
 
-  /**
-   * Call this when SYS_sigaction is finishing with |regs|.
-   */
-  void update_sigaction(const Registers& regs);
-
   template <typename Arch> void init_buffers_arch();
   template <typename Arch>
   void on_syscall_exit_arch(int syscallno, const Registers& regs);
-  /** Helper function for update_sigaction. */
-  template <typename Arch> void update_sigaction_arch(const Registers& regs);
+  /**
+   * Call this when an rt_sigaction() (or, with |old_sigaction|, a sigaction())
+   * syscall of arch Arch is finishing with |regs|.
+   */
+  template <typename Arch>
+  void update_sigaction_arch(const Registers& regs, bool old_sigaction);
 
   /** Update the clear-tid futex to |tid_addr|. */
   void set_tid_addr(remote_ptr<int> tid_addr);
@@ -805,6 +816,9 @@ public:
   // If not NOT_STOPPED, then the task is logically stopped and this is the type
   // of stop.
   EmulatedStopType emulated_stop_type;
+  // The arch of the syscall at a SYSCALL_ENTRY_STOP or SYSCALL_EXIT_STOP.
+  // An x86-64 task can make i386 syscalls (with int $0x80).
+  SupportedArch emulated_stop_syscall_arch;
   // True if the task sigmask may have changed and we need to refetch it.
   bool blocked_sigs_dirty;
   // Most accesses to this should use set_sigmask and get_sigmask to ensure
@@ -844,6 +858,9 @@ public:
   // the time of the most recent set_robust_list() call.
   remote_ptr<void> robust_futex_list;
   size_t robust_futex_list_len;
+  // The same for an i386 set_robust_list() of an x86-64 task.
+  remote_ptr<void> compat_robust_futex_list;
+  size_t compat_robust_futex_list_len;
   // The memory cell the kernel will clear and notify on exit,
   // if our clone parent requested it.
   remote_ptr<int> tid_futex;

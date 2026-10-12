@@ -498,7 +498,7 @@ void TraceWriter::write_frame(RecordTask* t, const Event& ev,
       auto syscall = event.initSyscall();
       syscall.setArch(to_trace_arch(e.arch()));
       syscall.setNumber(e.is_restart
-                            ? syscall_number_for_restart_syscall(t->arch())
+                            ? syscall_number_for_restart_syscall(e.arch())
                             : e.number);
       syscall.setState(to_trace_syscall_state(e.state));
       syscall.setFailedDuringPreparation(e.failed_during_preparation);
