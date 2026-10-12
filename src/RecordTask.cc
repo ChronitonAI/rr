@@ -459,6 +459,12 @@ template <typename Arch> static void do_preload_init_arch(RecordTask* t) {
       params.syscallbuf_hook_trampolines_start.rptr().as_int();
   t->syscallbuf_code_layout.syscallbuf_hook_trampolines_end =
       params.syscallbuf_hook_trampolines_end.rptr().as_int();
+  t->syscallbuf_code_layout.memory_checks_start =
+      params.memory_checks_start.rptr().as_int();
+  t->syscallbuf_code_layout.memory_checks_end =
+      params.memory_checks_end.rptr().as_int();
+  t->syscallbuf_code_layout.memory_check_failed =
+      params.memory_check_failed.rptr().as_int();
 
   unsigned char in_chaos = t->session().enable_chaos();
   auto in_chaos_ptr REMOTE_PTR_FIELD(params.globals.rptr(), in_chaos);
@@ -640,13 +646,32 @@ template <typename Arch>
 void RecordTask::on_syscall_exit_arch(int syscallno, const Registers& regs) {
   switch (syscallno) {
     // These syscalls affect the sigmask even if they fail.
+    // (rt_)sigprocmask sets the new mask before it stores the old one, which
+    // can fail.
     case Arch::epoll_pwait:
     case Arch::epoll_pwait2:
     case Arch::pselect6:
     case Arch::pselect6_time64:
     case Arch::ppoll:
     case Arch::ppoll_time64:
+    case Arch::sigprocmask:
+    case Arch::rt_sigprocmask:
       invalidate_sigmask();
+      break;
+    case Arch::sigaction:
+    case Arch::rt_sigaction:
+      // The kernel sets the new action before it stores the old one. If that
+      // fails, the new action is still set.
+      if (regs.syscall_result_signed() == -EFAULT && regs.arg2() &&
+          regs.arg3()) {
+        size_t size = sizeof(typename Arch::kernel_sigaction);
+        if (syscall_accessible_prefix(regs.arg2(), size, PROT_READ) == size &&
+            syscall_accessible_prefix(regs.arg3(), size, PROT_WRITE) < size) {
+          Registers r = regs;
+          r.set_syscall_result(0);
+          update_sigaction_arch<Arch>(r, syscallno == Arch::sigaction);
+        }
+      }
       break;
   }
 
@@ -2467,7 +2492,7 @@ void RecordTask::maybe_flush_syscallbuf() {
     records = read_mem(REMOTE_PTR_FIELD(preload_globals, mprotect_records[0]),
                        hdr.mprotect_record_count);
     for (auto& r : records) {
-      as->protect(this, r.start, r.size, r.prot);
+      as->protect(this, untagged_addr(arch(), r.start), r.size, r.prot);
     }
   }
 

@@ -96,6 +96,7 @@ Task::Task(Session& session, pid_t _tid, pid_t _rec_tid, uint32_t serial,
       in_unexpected_exit(false),
       in_injectable_signal_stop_(false),
       seccomp_bpf_enabled(false),
+      tagged_addr_abi(false),
       registers_dirty(false),
       orig_syscallno_dirty(false),
       extra_registers(a),
@@ -640,7 +641,7 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
     int prot = regs.arg4_signed();
     Task* t = session().find_task(tid);
     ASSERT(this, t);
-    return t->vm()->protect(t, addr, num_bytes, prot);
+    return t->vm()->protect(t, untagged_addr(t->arch(), addr), num_bytes, prot);
   }
 
   // mprotect can change the protection status of some mapped regions before
@@ -663,22 +664,23 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
       return;
     }
 
+    // The kernel ignores the tags of these addresses.
     case Arch::pkey_mprotect:
     case Arch::mprotect: {
-      remote_ptr<void> addr = regs.orig_arg1();
+      remote_ptr<void> addr = untagged_addr(Arch::arch(), regs.orig_arg1());
       size_t num_bytes = regs.arg2();
       int prot = regs.arg3_signed();
       return vm()->protect(this, addr, num_bytes, prot);
     }
     case Arch::munmap: {
-      remote_ptr<void> addr = regs.orig_arg1();
+      remote_ptr<void> addr = untagged_addr(Arch::arch(), regs.orig_arg1());
       size_t num_bytes = regs.arg2();
       return vm()->unmap(this, addr, num_bytes);
     }
     case Arch::shmdt:
       return process_shmdt(this, regs.orig_arg1());
     case Arch::madvise: {
-      remote_ptr<void> addr = regs.orig_arg1();
+      remote_ptr<void> addr = untagged_addr(Arch::arch(), regs.orig_arg1());
       size_t num_bytes = regs.arg2();
       int advice = regs.arg3();
       return vm()->advise(this, addr, num_bytes, advice);
@@ -712,6 +714,12 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
             return;
           }
           did_prctl_set_prname(regs.arg2());
+          break;
+        case PR_SET_TAGGED_ADDR_CTRL:
+          if (regs.syscall_failed()) {
+            return;
+          }
+          tagged_addr_abi = regs.arg2() & PR_TAGGED_ADDR_ENABLE;
           break;
         case PR_SET_VMA: {
           switch ((unsigned long)regs.arg2()) {
@@ -1132,6 +1140,8 @@ void Task::post_exec(const string& exe_file) {
   syscallbuf_size = 0;
   scratch_ptr = nullptr;
   cloned_file_data_fd_child = -1;
+  // The kernel disables the tagged address ABI at exec.
+  tagged_addr_abi = false;
   desched_fd_child = -1;
   preload_globals = nullptr;
   rseq_state = nullptr;
@@ -1190,6 +1200,16 @@ void Task::post_exec_syscall(const std::string& original_exe_file) {
 }
 
 bool Task::execed() const { return tg->execed; }
+
+size_t Task::syscall_accessible_prefix(remote_ptr<void> addr, size_t len,
+                                       int prot) {
+  if (tagged_addr_abi) {
+    // The kernel ignores the tag (see access_ok() in
+    // arch/arm64/include/asm/uaccess.h).
+    addr = aarch64_untagged_addr(addr);
+  }
+  return vm()->accessible_prefix(addr, len, prot);
+}
 
 void Task::unmap_dead_syscallbufs_if_required() {
   if (!as->regions_pending_unmap.empty()) {
@@ -2755,6 +2775,7 @@ Task* Task::clone(CloneReason reason, int flags, remote_ptr<void> stack,
   t->syscallbuf_size = syscallbuf_size;
   t->preload_globals = preload_globals;
   t->seccomp_bpf_enabled = seccomp_bpf_enabled;
+  t->tagged_addr_abi = tagged_addr_abi;
 
   // FdTable is either shared or copied, so the contents of
   // syscallbuf_fds_disabled_child are still valid.
@@ -3024,6 +3045,7 @@ Task::CapturedState Task::capture_state() {
   state.wait_status = wait_status;
   state.ticks = ticks;
   state.top_of_stack = top_of_stack;
+  state.tagged_addr_abi = tagged_addr_abi;
   return state;
 }
 
@@ -3070,6 +3092,7 @@ void Task::copy_state(const CapturedState& state) {
 
   ticks = state.ticks;
   own_namespace_rec_tid = state.own_namespace_rec_tid;
+  tagged_addr_abi = state.tagged_addr_abi;
   if (state.rseq_state) {
     rseq_state = make_unique<RseqState>(*state.rseq_state);
   }
@@ -3293,6 +3316,10 @@ ssize_t Task::read_bytes_fallible(remote_ptr<void> addr, ssize_t buf_size,
   if (0 == buf_size) {
     return 0;
   }
+  // On aarch64, syscall arguments can be tagged. /proc/<pid>/mem ignores the
+  // tag of the address too, but an offset with a tag of 0x80 or above is
+  // negative, which pread() rejects.
+  addr = untagged_addr(arch(), addr);
 
   if (uint8_t* local_addr = as->local_mapping(addr, buf_size)) {
     memcpy(buf, local_addr, buf_size);
@@ -3423,6 +3450,8 @@ static ssize_t safe_pwrite64(Task* t, const void* buf, ssize_t buf_size,
 
 ssize_t Task::write_bytes_helper(remote_ptr<void> addr, ssize_t buf_size,
                               const void* buf, bool* ok, uint32_t flags) {
+  // See read_bytes_fallible.
+  addr = untagged_addr(arch(), addr);
   ssize_t nwritten = write_bytes_helper_no_notifications(addr, buf_size, buf, ok, flags);
   if (nwritten > 0) {
     vm()->notify_written(addr, nwritten, flags);
@@ -3436,6 +3465,8 @@ ssize_t Task::write_bytes_helper_no_notifications(remote_ptr<void> addr, ssize_t
   if (0 == buf_size) {
     return 0;
   }
+  // See read_bytes_fallible.
+  addr = untagged_addr(arch(), addr);
 
   if (uint8_t* local_addr = as->local_mapping(addr, buf_size)) {
     memcpy(local_addr, buf, buf_size);

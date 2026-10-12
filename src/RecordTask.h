@@ -58,6 +58,9 @@ struct SyscallbufCodeLayout {
   remote_code_ptr syscallbuf_final_exit_instruction;
   remote_code_ptr syscallbuf_hook_trampolines_start;
   remote_code_ptr syscallbuf_hook_trampolines_end;
+  remote_code_ptr memory_checks_start;
+  remote_code_ptr memory_checks_end;
+  remote_code_ptr memory_check_failed;
 };
 
 enum SignalDisposition { SIGNAL_DEFAULT, SIGNAL_IGNORE, SIGNAL_HANDLER };
