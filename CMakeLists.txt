@@ -1325,6 +1325,8 @@ set(BASIC_TESTS
   ptrace_kill_grandtracee
   ptrace_resume_signal_ignored
   x86/ptrace_tls
+  ptrace_regs_blocked_tracee
+  ptrace_regs_tracer_sigcont
   ptrace_seize
   ptrace_seize_ignored_signals
   ptrace_sigchld
