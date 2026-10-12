@@ -761,6 +761,18 @@ static void handle_desched_event(RecordTask* t) {
     }
   }
 
+  // This is purely for testing purposes. See killed_in_desched. With
+  // RR_KILL_TASK_IN_DESCHED set, SIGKILL the first recorded task whose parent
+  // is also recorded that gets here, when it reports its first stop below,
+  // before we look at that stop.
+  static const char* kill_in_desched = getenv("RR_KILL_TASK_IN_DESCHED");
+  static bool killed_in_desched = false;
+  if (kill_in_desched && !killed_in_desched &&
+      t->session().find_task(t->get_parent_pid())) {
+    killed_in_desched = true;
+    t->kill_at_next_stop_for_testing = true;
+  }
+
   while (true) {
     // Prevent further desched notifications from firing
     // while we're advancing the tracee.  We're going to

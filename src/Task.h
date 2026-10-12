@@ -1407,6 +1407,12 @@ protected:
   // True when we've been kicked out of a ptrace-stop via SIGKILL or
   // equivalent.
   bool in_unexpected_exit;
+public:
+  // Purely for testing purposes: if set, wait() SIGKILLs the task when it
+  // gets the task's next stop, before did_waitpid() looks at the stop. See
+  // RR_KILL_TASK_IN_DESCHED in handle_desched_event().
+  bool kill_at_next_stop_for_testing;
+protected:
   // True when the task is stopped in a signal-stop where we can
   // inject our own signal. Usually equal to wait_status.stop_sig() > 0,
   // but can be different if an AutoRemoteSyscalls changed our state and

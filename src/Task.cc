@@ -95,6 +95,7 @@ Task::Task(Session& session, pid_t _tid, pid_t _rec_tid, uint32_t serial,
       did_set_breakpoint_after_cpuid(false),
       is_stopped_(false),
       in_unexpected_exit(false),
+      kill_at_next_stop_for_testing(false),
       in_injectable_signal_stop_(false),
       seccomp_bpf_enabled(false),
       tagged_addr_abi(false),
@@ -2353,6 +2354,25 @@ static void maybe_kill_task_after_stop(Task* t, WaitStatus status) {
   }
 }
 
+/**
+ * Purely for testing purposes (see Task::kill_at_next_stop_for_testing):
+ * SIGKILL |t|, which has just reported a stop that we haven't looked at
+ * yet, as if the SIGKILL had arrived just after waitid() returned.
+ */
+static void kill_before_looking_at_stop_for_testing(Task* t) {
+  LOG(debug) << "Killing " << t->tid << " before looking at its stop";
+  // We're usually bound to the same CPU as the tracees. Don't let the SIGKILL
+  // make them preempt us, so that |t| doesn't get to its PTRACE_EVENT_EXIT
+  // stop before we've looked at this stop: we want to test the window
+  // between the two.
+  struct sched_param param;
+  memset(&param, 0, sizeof(param));
+  for (Task* tt : t->thread_group()->task_set()) {
+    sched_setscheduler(tt->tid, SCHED_IDLE, &param);
+  }
+  t->tgkill(SIGKILL);
+}
+
 bool Task::wait(double interrupt_after_elapsed, bool warn_on_interrupt) {
   LOG(debug) << "going into blocking wait for " << tid << " ...";
   ASSERT(this, session().is_recording() || interrupt_after_elapsed == -1);
@@ -2409,6 +2429,10 @@ bool Task::wait(double interrupt_after_elapsed, bool warn_on_interrupt) {
     }
   }
   maybe_kill_task_after_stop(this, result.status);
+  if (kill_at_next_stop_for_testing) {
+    kill_at_next_stop_for_testing = false;
+    kill_before_looking_at_stop_for_testing(this);
+  }
   return did_waitpid(result.status);
 }
 

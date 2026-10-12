@@ -1699,6 +1699,7 @@ set(TESTS_WITH_PROGRAM
   invalid_jump
   jit_proc_mem
   kill_threads_no_exit_events
+  killed_in_desched
   killed_in_signal_stop
   killed_injecting_signal
   killed_task_exit_order
