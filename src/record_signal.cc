@@ -1039,8 +1039,7 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
     // The kernel ended any group stop when it generated the SIGCONT, whether
     // or not the signal is delivered (a ptracer may suppress it, or the
     // process may ignore it). See prepare_signal() in kernel/signal.c.
-    t->thread_group()->stopping_signal = 0;
-    t->thread_group()->stop_report_signal = 0;
+    t->end_process_stop_for_SIGCONT();
   }
 
   if (t->take_signal_ignored_before_ptrace_attach(sig)) {

@@ -1436,6 +1436,7 @@ set(BASIC_TESTS
   sigaction_old
   sigaltstack
   sigchld_interrupt_signal
+  sigchld_nocldstop
   sigcont
   sigcont_then_sigstop
   sigcont_threaded
@@ -1554,8 +1555,13 @@ set(BASIC_TESTS
   vsyscall_timeslice
   x86/x87env
   wait
+  wait_continued
+  wait_continued_traced
+  wait_continued_two_waiters
+  wait_sigchld_blocked_thread
   wait_sigstop
   wait_sigstop_threads
+  wait_stop_and_exit
   write_race
   writev
   xattr
