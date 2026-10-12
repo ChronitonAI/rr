@@ -792,7 +792,8 @@ static void process_mremap(ReplayTask* t, const TraceFrame& trace_frame,
 
   Registers trace_regs = trace_frame.regs();
   trace_regs.set_syscall_arch(trace_frame.event().Syscall().arch());
-  remote_ptr<void> old_addr = trace_regs.orig_arg1();
+  // The kernel ignores the tag of the old address.
+  remote_ptr<void> old_addr = untagged_addr(t->arch(), trace_regs.orig_arg1());
   size_t old_size = ceil_page_size(trace_regs.arg2());
   remote_ptr<void> new_addr = trace_frame.regs().syscall_result();
   size_t new_size = ceil_page_size(trace_regs.arg3());

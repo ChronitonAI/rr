@@ -115,7 +115,8 @@ const ReplaySession::MemoryRanges& ReplaySession::always_free_address_space(
       if (is_mprotect_syscall(syscall_event.number, syscall_event.arch()) ||
           is_pkey_mprotect_syscall(syscall_event.number, syscall_event.arch())) {
         if (regs.arg3() != PROT_NONE) {
-          remote_ptr<void> start = regs.arg1();
+          remote_ptr<void> start =
+              untagged_addr(syscall_event.arch(), regs.arg1());
           size_t size = regs.arg2();
           delete_range(*result, MemoryRange(start, size));
         }
@@ -131,7 +132,9 @@ const ReplaySession::MemoryRanges& ReplaySession::always_free_address_space(
       auto syscallbuf_flush_event = event.SyscallbufFlush();
       for (auto& record : syscallbuf_flush_event.mprotect_records) {
         if (record.prot != PROT_NONE) {
-          delete_range(*result, MemoryRange(record.start, record.size));
+          remote_ptr<void> start =
+              untagged_addr(frame.regs().arch(), record.start);
+          delete_range(*result, MemoryRange(start, record.size));
         }
       }
     }
@@ -1447,8 +1450,10 @@ static uint32_t apply_mprotect_records(ReplayTask* t,
         t->syscallbuf_child, mprotect_record_count_completed));
     size_t record_index = skip_mprotect_records;
     for (const auto& r : records) {
+      // The kernel ignores the tag of the address.
+      remote_ptr<void> start = untagged_addr(t->arch(), r.start);
       if (record_index >= completed_count) {
-        auto km = t->vm()->read_kernel_mapping(t, r.start);
+        auto km = t->vm()->read_kernel_mapping(t, start);
         if (km.prot() != r.prot) {
           // mprotect didn't happen yet.
           continue;
@@ -1462,9 +1467,9 @@ static uint32_t apply_mprotect_records(ReplayTask* t,
           << ": recorded " << mprotect_record_string(recorded_r)
           << ", got " << mprotect_record_string(r);
       }
-      t->vm()->protect(t, r.start, r.size, r.prot);
+      t->vm()->protect(t, start, r.size, r.prot);
       if (running_under_rr()) {
-        syscall(SYS_rrcall_mprotect_record, t->tid, (uintptr_t)r.start,
+        syscall(SYS_rrcall_mprotect_record, t->tid, start.as_int(),
                 (uintptr_t)r.size, r.prot);
       }
       ++record_index;

@@ -946,6 +946,23 @@ void* AddressSpace::detach_local_mapping(remote_ptr<void> addr) {
   return p;
 }
 
+size_t AddressSpace::accessible_prefix(remote_ptr<void> addr, size_t len,
+                                       int prot) const {
+  remote_ptr<void> end = addr + len;
+  if (end < addr) {
+    end = remote_ptr<void>(UINTPTR_MAX);
+  }
+  remote_ptr<void> p = addr;
+  while (p < end && has_mapping(p)) {
+    const KernelMapping& m = mapping_of(p).map;
+    if ((m.prot() & prot) != prot) {
+      break;
+    }
+    p = m.end();
+  }
+  return min(p, end) - addr;
+}
+
 bool AddressSpace::has_mapping(remote_ptr<void> addr) const {
   if (addr + page_size() < addr) {
     // Assume the last byte in the address space is never mapped; avoid overflow
@@ -1027,11 +1044,13 @@ void AddressSpace::fixup_mprotect_growsdown_parameters(Task* t) {
   ASSERT(t, !(t->regs().arg3() & PROT_GROWSUP));
   if (t->regs().arg3() & PROT_GROWSDOWN) {
     Registers r = t->regs();
-    if (r.arg1() == floor_page_size(r.arg1()) && has_mapping(r.arg1())) {
-      auto& km = mapping_of(r.arg1()).map;
+    // The kernel ignores the tag of the address.
+    remote_ptr<void> addr = untagged_addr(t->arch(), r.arg1());
+    if (addr == floor_page_size(addr) && has_mapping(addr)) {
+      auto& km = mapping_of(addr).map;
       if (km.flags() & MAP_GROWSDOWN) {
         auto new_start = km.start();
-        r.set_arg2(remote_ptr<void>(r.arg1()) + size_t(r.arg2()) - new_start);
+        r.set_arg2(addr + size_t(r.arg2()) - new_start);
         r.set_arg1(new_start);
         r.set_arg3(r.arg3() & ~PROT_GROWSDOWN);
         t->set_regs(r);
