@@ -908,9 +908,11 @@ public:
   /**
    * Called when the set of different fd tables associated with tasks
    * in this address space may have changed (e.g. a task changed its fd table,
-   * or a task got added or removed, etc).
+   * or a task got added or removed, etc). Tasks that are exiting, and
+   * |exiting| if set, don't count: they never run the preload library's code
+   * again.
    */
-  void fd_tables_changed();
+  void fd_tables_changed(Task* exiting = nullptr);
 
   static MemoryRange get_global_exclusion_range(const RecordSession* session);
 
