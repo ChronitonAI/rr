@@ -1688,6 +1688,7 @@ set(TESTS_WITH_PROGRAM
   ignore_nested
   immediate_restart
   x86/int3_ok
+  x86/int80_restart_replay
   x86/int80_sigframe
   interrupt
   intr_ptrace_decline
