@@ -1142,6 +1142,25 @@ const syscall_patch_hook* Monkeypatcher::find_syscall_hook(RecordTask* t,
   return nullptr;
 }
 
+enum KillAtSyscallPatch { KILL_BEFORE_EXIT_SYSCALL, KILL_BEFORE_PATCH };
+
+/**
+ * This is purely for testing purposes. See
+ * RRCALL_KILL_BEFORE_SYSCALL_PATCH_EXIT and RRCALL_KILL_BEFORE_SYSCALL_PATCH.
+ */
+static void maybe_kill_task_at_syscall_patch(RecordTask* t, intptr_t syscallno,
+                                             KillAtSyscallPatch when) {
+  int point = when == KILL_BEFORE_PATCH ? RRCALL_KILL_BEFORE_SYSCALL_PATCH
+                                        : RRCALL_KILL_BEFORE_SYSCALL_PATCH_EXIT;
+  if (!t->take_armed_kill(point, syscallno)) {
+    return;
+  }
+  t->tgkill(SIGKILL);
+  if (when == KILL_BEFORE_PATCH) {
+    t->wait();
+  }
+}
+
 // Syscalls can be patched either on entry or exit. For most syscall
 // instruction code patterns we can steal bytes after the syscall instruction
 // and thus we patch on entry, but some patterns require using bytes from
@@ -1159,12 +1178,18 @@ bool Monkeypatcher::try_patch_syscall_x86ish(RecordTask* t, remote_code_ptr ip, 
       entering_syscall, instruction_length, should_retry, transient_failure);
   bool success = false;
   // `syscallno` isn't necessarily correct here (in the extremely rare corner case that we
-  // deferred a patch and the signal handler changed it), but we only use it for logging.
+  // deferred a patch and the signal handler changed it), but we only use it for logging
+  // and, at syscall entry (where it is correct), to match a kill armed with
+  // SYS_rrcall_arm_kill.
   intptr_t syscallno = t->regs().original_syscallno();
   if (hook_ptr) {
     // Get out of executing the current syscall before we patch it.
-    if (entering_syscall && !t->exit_syscall_and_prepare_restart(arch)) {
-      return false;
+    if (entering_syscall) {
+      maybe_kill_task_at_syscall_patch(t, syscallno, KILL_BEFORE_EXIT_SYSCALL);
+      if (!t->exit_syscall_and_prepare_restart(arch)) {
+        return false;
+      }
+      maybe_kill_task_at_syscall_patch(t, syscallno, KILL_BEFORE_PATCH);
     }
 
     LOG(debug) << "Patching syscall at " << ip << " syscall "
@@ -1222,9 +1247,14 @@ bool Monkeypatcher::try_patch_syscall_aarch64(RecordTask* t, remote_code_ptr ip,
     return false;
   }
 
+  intptr_t syscallno = t->regs().original_syscallno();
   // Get out of executing the current syscall before we patch it.
-  if (entering_syscall && !t->exit_syscall_and_prepare_restart(aarch64)) {
-    return false;
+  if (entering_syscall) {
+    maybe_kill_task_at_syscall_patch(t, syscallno, KILL_BEFORE_EXIT_SYSCALL);
+    if (!t->exit_syscall_and_prepare_restart(aarch64)) {
+      return false;
+    }
+    maybe_kill_task_at_syscall_patch(t, syscallno, KILL_BEFORE_PATCH);
   }
 
   LOG(debug) << "Patching syscall at " << ip - 4 << " syscall "

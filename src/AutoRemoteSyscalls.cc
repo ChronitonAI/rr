@@ -382,9 +382,46 @@ static bool ignore_signal(Task* t) {
   return false;
 }
 
+/**
+ * This is purely for testing purposes. See
+ * RRCALL_KILL_BEFORE_EXEC_REMOTE_SYSCALL and
+ * RRCALL_KILL_AFTER_EXEC_REMOTE_SYSCALL.
+ */
+enum KillForTesting { DONT_KILL, KILL_BEFORE, KILL_AFTER };
+static KillForTesting kill_at_exec_remote_syscall(Task* t) {
+  if (!t->session().is_recording() || t->is_exiting()) {
+    return DONT_KILL;
+  }
+  RecordTask* rt = static_cast<RecordTask*>(t);
+  if (!rt->ev().is_syscall_event() || !rt->ev().Syscall().is_exec()) {
+    return DONT_KILL;
+  }
+  if (rt->count_down_armed_kill(RRCALL_KILL_BEFORE_EXEC_REMOTE_SYSCALL)) {
+    return KILL_BEFORE;
+  }
+  if (rt->count_down_armed_kill(RRCALL_KILL_AFTER_EXEC_REMOTE_SYSCALL)) {
+    return KILL_AFTER;
+  }
+  return DONT_KILL;
+}
+
+/**
+ * SIGKILL t and wait until we know it's dying.
+ */
+static void kill_for_testing(Task* t) {
+  t->tgkill(SIGKILL);
+  t->wait();
+  ASSERT(t, t->is_exiting());
+}
+
 long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
   SupportedArch arch = t->arch();
   LOG(debug) << "syscall " << syscall_name(syscallno, arch) << " " << callregs;
+
+  KillForTesting kill = kill_at_exec_remote_syscall(t);
+  if (kill == KILL_BEFORE) {
+    kill_for_testing(t);
+  }
 
   if (t->is_exiting()) {
     LOG(debug) << "Task is dying, don't try anything.";
@@ -498,6 +535,11 @@ long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
   }
 
   LOG(debug) << "done, result=" << t->regs().syscall_result();
+  if (kill == KILL_AFTER) {
+    kill_for_testing(t);
+    // Act as if the task had died before reporting the result.
+    return -ESRCH;
+  }
   return t->regs().syscall_result();
 }
 
