@@ -1,0 +1,5 @@
+source `dirname $0`/util.sh
+# Without the syscall buffer there are no SYSCALLBUF_FLUSH events, and the
+# test's many syscalls take long.
+skip_if_no_syscall_buf
+compare_test EXIT-SUCCESS

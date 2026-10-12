@@ -1285,6 +1285,7 @@ set(BASIC_TESTS
   pid_ns_kill_threads_exit_wait
   pid_ns_reap
   pid_ns_reap_before_exit
+  pid_ns_reap_sched
   pid_ns_segv
   pid_ns_shutdown
   pidfd
@@ -1802,6 +1803,7 @@ set(TESTS_WITH_PROGRAM
   ttyname
   unexpected_stack_growth
   unicode
+  unshare_files_exit
   user_ignore_sig
   vdso_clock_gettime_stack
   vdso_gettimeofday_stack
