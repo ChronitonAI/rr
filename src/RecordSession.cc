@@ -989,6 +989,13 @@ static void advance_to_disarm_desched_syscall(RecordTask* t) {
     if (t->session().syscallbuf_desched_sig() == sig) {
       continue;
     }
+    if (SIGTRAP == sig && handle_syscallbuf_debug_trap(t)) {
+      // Restoring the SIGTRAP state may have used AutoRemoteSyscalls, which
+      // re-arms the desched event because the syscallbuf still says it's
+      // relevant. Disarm it again.
+      disarm_desched_event(t);
+      continue;
+    }
     if (sig && sig == old_sig) {
       LOG(debug) << "  coalescing pending " << signal_name(sig);
       continue;
@@ -2017,7 +2024,8 @@ bool RecordSession::handle_signal_event(RecordTask* t, StepState* step_state) {
     return true;
   }
 
-  if (sig == SIGTRAP && handle_syscallbuf_breakpoint(t)) {
+  if (sig == SIGTRAP &&
+      (handle_syscallbuf_breakpoint(t) || handle_syscallbuf_debug_trap(t))) {
     return true;
   }
 
