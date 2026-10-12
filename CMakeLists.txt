@@ -1143,6 +1143,7 @@ set(BASIC_TESTS
   group_stop_thundering_herd
   x86/hle
   x86/hlt
+  ignored_signals_eintr
   inotify
   int3
   x86/int80_args

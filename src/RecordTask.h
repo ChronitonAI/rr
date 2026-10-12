@@ -225,6 +225,16 @@ public:
    */
   bool has_any_actionable_signal();
   /**
+   * Return true if signals that we don't block are pending for this thread,
+   * or for its process if it has no other thread (if it has, any such signal
+   * pending for the process makes this return false), and none of them would
+   * have woken the thread up natively: they're rr's own signals, or signals
+   * other than SIGCONT that we ignore, which Linux queues only because rr
+   * traces us (when we have no ptracer of our own). Return false if we're in
+   * an emulated stop.
+   */
+  bool only_spurious_signals_pending();
+  /**
    * True if the task is in an emulated group stop that SIGCONT ends, i.e.
    * a group stop of a task that has no (emulated) ptracer. For a traced task,
    * a group stop is a ptrace stop, and SIGCONT doesn't end ptrace stops (see
