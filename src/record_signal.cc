@@ -44,6 +44,40 @@ static void restore_sighandler_if_not_default(RecordTask* t, int sig) {
   }
 }
 
+template <typename Arch>
+static void reset_sighandler_arch(RecordTask* t, int sig) {
+  // Like the kernel, change only the handler, not the flags or the mask.
+  typename Arch::kernel_sigaction ksa;
+  memset(&ksa, 0, sizeof(ksa));
+  const vector<uint8_t>& sa = t->signal_action(sig);
+  memcpy(&ksa, sa.data(), min(sa.size(), sizeof(ksa)));
+  ksa.k_sa_handler = remote_ptr<void>();
+  AutoRemoteSyscalls remote(t);
+  AutoRestoreMem child_sa(remote, &ksa, sizeof(ksa));
+  remote.infallible_syscall(syscall_number_for_rt_sigaction(Arch::arch()), sig,
+                            child_sa.get().as_int(), nullptr,
+                            sizeof(ksa.sa_mask));
+}
+
+static void reset_sighandler(RecordTask* t, int sig) {
+  RR_ARCH_FUNCTION(reset_sighandler_arch, t->arch(), t, sig);
+}
+
+void emulate_forced_signal(RecordTask* t, int sig) {
+  bool blocked = t->is_sig_blocked(sig);
+  if (!blocked && !t->is_sig_ignored(sig)) {
+    return;
+  }
+  LOG(debug) << "Emulating a forced " << signal_name(sig);
+  if (t->sig_disposition(sig) != SIGNAL_DEFAULT) {
+    reset_sighandler(t, sig);
+    t->did_set_sig_handler_default(sig);
+  }
+  if (blocked) {
+    t->unblock_signal(sig);
+  }
+}
+
 /**
  * Restore the blocked-ness and sigaction for |sig| from |t|'s local
  * copy.

@@ -37,6 +37,16 @@ void restore_signal_state_after_hidden_sigtrap(RecordTask* t);
  * instructions.)
  */
 bool is_in_syscall_hook(RecordTask* t);
+/**
+ * The kernel forces the signals that it generates for a fault or a trap,
+ * e.g. the SIGTRAP of a single-step: if the signal is blocked or ignored,
+ * it unblocks it and resets its handler to SIG_DFL. Make that happen to
+ * |sig| in |t|, for a signal that the kernel would force natively but that
+ * we only emulate. This may run remote syscalls in |t| and change its
+ * signal mask with PTRACE_SETSIGMASK, so it must not be called while the
+ * kernel has a saved signal mask to restore.
+ */
+void emulate_forced_signal(RecordTask* t, int sig);
 
 enum SignalBlocked { SIG_UNBLOCKED = 0, SIG_BLOCKED = 1 };
 enum SignalHandled { SIGNAL_HANDLED, SIGNAL_PTRACE_STOP, DEFER_SIGNAL };
