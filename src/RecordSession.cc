@@ -146,6 +146,10 @@ static bool looks_like_syscall_entry(RecordTask* t) {
   return ok;
 }
 
+static bool is_in_execve(RecordTask* t) {
+  return t->ev().is_syscall_event() && t->ev().Syscall().is_exec();
+}
+
 /**
  * Return true if we handle a ptrace exit event for task t. When this returns
  * true, t may have been deleted.
@@ -739,46 +743,29 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
     }
 
     case PTRACE_EVENT_EXEC: {
-      if (t->thread_group()->task_set().size() > 1) {
-        // All tasks but the task that did the execve should have exited by
-        // now and notified us of their exits. However, it's possible that
-        // while running the thread-group leader, our PTRACE_CONT raced with its
-        // PTRACE_EVENT_EXIT and it exited, and the next event we got is this
-        // PTRACE_EVENT_EXEC after the exec'ing task changed its tid to the
-        // leader's tid. Or maybe there are kernel bugs; on
-        // 4.2.0-42-generic running exec_from_other_thread, we reproducibly
-        // enter PTRACE_EVENT_EXEC for the thread-group leader without seeing
-        // its PTRACE_EVENT_EXIT.
-
-        // So, record this task's exit and destroy it.
-        // XXX We can't do record_robust_futex_changes here because the address
-        // space has already gone. That would only matter if some of them were
-        // in memory accessible to another process even after exec, i.e. a
-        // shared-memory mapping or two different thread-groups sharing the same
-        // address space.
-        pid_t tid = t->rec_tid;
+      if (!is_in_execve(t)) {
+        // The scheduler waited for this task's tid specifically (e.g. the
+        // leader in a multithreaded exit_group) and got the exec stop of
+        // another thread, which now has this tid, because the exec killed
+        // this task before it could stop at PTRACE_EVENT_EXIT.
         WaitStatus status = t->status();
-        t->record_exit_trace_event(WaitStatus(0));
-        t->record_exit_event();
-        // Don't call RecordTask::destroy() because we don't want to
-        // PTRACE_DETACH.
-        delete t;
-        // Steal the exec'ing task and make it the thread-group leader, and
-        // carry on!
-        t = revive_task_for_exec(tid);
+        t = find_execing_task(t->tid);
+        if (!t || !is_in_execve(t)) {
+          FATAL() << "Can't find the task that exec'd";
+        }
         scheduler().set_current(t);
         *t_ptr = t;
-        // Tell t that it is actually stopped, because the stop we got is really
-        // for this task, not the old dead task.
         if (!t->did_waitpid(status)) {
-          // This is totally untested and almost certainly broken, but if the
-          // task was SIGKILLed out of the EXEC stop then we should probably
-          // just pretend the exec never happened.
-          step_state->continue_type = CONTINUE_SYSCALL;
-          break;
+          // The task was SIGKILLed out of the exec stop. Wait for its exit
+          // event and pretend this stop never happened. Replay won't get past
+          // this process's exit, just as when the scheduler collects such a
+          // stop.
+          last_task_switchable = ALLOW_SWITCH;
+          step_state->continue_type = DONT_CONTINUE;
+          return true;
         }
       }
-      t->post_exec();
+      // RecordTask::did_wait() did post_exec() when it saw this stop.
       t->session().scheduler().did_exit_execve(t);
 
       // Forward ptrace exec notification
@@ -1418,14 +1405,73 @@ void RecordSession::check_initial_task_syscalls(RecordTask* t,
   }
 }
 
-RecordTask* RecordSession::revive_task_for_exec(pid_t rec_tid) {
+RecordTask* RecordSession::find_execing_task(pid_t rec_tid) {
+  RecordTask* leader = find_task(rec_tid);
+  pid_t former_tid;
   unsigned long msg = 0;
   int ret =
       ptrace(_ptrace_request(PTRACE_GETEVENTMSG), rec_tid, nullptr, &msg);
-  if (ret < 0) {
-    FATAL() << "Can't get old tid for execve (leader=" << rec_tid << ")";
+  if (ret == 0) {
+    former_tid = msg;
+  } else {
+    // ptrace refuses once a SIGKILL is pending (e.g. kill -9 from outside),
+    // and the task will die. If the task in execve (we allow only one at a
+    // time) is the leader, return it; the caller's did_waitpid() will then
+    // fail and drop this stop. If another thread exec'd, we can't record the
+    // exec, and its exit would come under the leader's tid, which replay
+    // can't follow.
+    if (errno != ESRCH) {
+      FATAL() << "Can't get old tid for execve (leader=" << rec_tid << ")";
+    }
+    if (ThreadGroup* tg = find_thread_group(rec_tid)) {
+      for (Task* t : tg->task_set()) {
+        auto rt = static_cast<RecordTask*>(t);
+        if (is_in_execve(rt) && rt->tid != rec_tid) {
+          FATAL() << "Can't get old tid for execve (leader=" << rec_tid
+                  << ")";
+        }
+      }
+    }
+    return leader;
   }
-  RecordTask* t = find_task(msg);
+  if (former_tid == rec_tid) {
+    // The thread-group leader exec'd.
+    return leader;
+  }
+
+  // Another thread exec'd. The exec killed the leader, de_thread() reaped it,
+  // and the exec'ing thread now has the leader's tid.
+  if (leader) {
+    if (!leader->handled_ptrace_exit_event()) {
+      // We haven't handled the leader's PTRACE_EVENT_EXIT. Either it never
+      // stopped there, because it was already exiting (e.g. in SYS_exit or
+      // exit_group) when the exec killed it, or the exec's SIGKILL took it out
+      // of that stop before we handled it. Record its exit now.
+      // did_die_in_exec() marks the exit as handled, which ~Task() requires,
+      // and the task as reaped, so we don't touch it through its tid, which
+      // now refers to the new image; e.g. record_event() leaves the leader's
+      // rseq area alone.
+      // The ticks hpc.stop() reads are lost, as in handle_ptrace_exit_event();
+      // replay doesn't check them for EV_EXIT.
+      // XXX We can't do record_robust_futex_changes here because the address
+      // space has already gone. That would only matter if some of them were
+      // in memory accessible to another process even after exec, i.e. a
+      // shared-memory mapping or two different thread-groups sharing the same
+      // address space.
+      leader->did_die_in_exec();
+      leader->hpc.stop(leader);
+      leader->record_exit_trace_event(WaitStatus(0));
+      leader->record_exit_event();
+    }
+    // Don't call RecordTask::destroy() because we don't want to PTRACE_DETACH.
+    delete leader;
+  }
+  return revive_task_for_exec(rec_tid, former_tid);
+}
+
+RecordTask* RecordSession::revive_task_for_exec(pid_t rec_tid,
+                                                pid_t former_tid) {
+  RecordTask* t = find_task(former_tid);
   if (!t) {
     FATAL() << "Can't find old task for execve";
   }
