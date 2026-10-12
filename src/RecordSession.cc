@@ -2631,14 +2631,10 @@ RecordSession::RecordResult RecordSession::record_step() {
     // to do something (e.g. terminate the recording).
     return result;
   }
-  // If the task has been reaped prematurely then it's not running
-  // and we can't get registers etc, so minimize what we do between here
-  // to handle_ptrace_exit_event().
-  if (t->waiting_for_reap) {
-    // Give it another chance to be reaped
-    t->did_reach_zombie();
-    return result;
-  }
+  // Do this before we reap a task below: that may destroy it and leave us
+  // with no current task, and then we'd never record the previous task's
+  // SCHED. Another task's events could then end up in the trace before code
+  // that the previous task ran before them.
   RecordTask* prev_task = find_task(prev_task_tuid);
   if (prev_task && prev_task->ev().type() == EV_SCHED) {
     if (prev_task != t) {
@@ -2647,6 +2643,14 @@ RecordSession::RecordResult RecordSession::record_step() {
       prev_task->record_current_event();
     }
     prev_task->pop_event(EV_SCHED);
+  }
+  // If the task has been reaped prematurely then it's not running
+  // and we can't get registers etc, so minimize what we do between here
+  // to handle_ptrace_exit_event().
+  if (t->waiting_for_reap) {
+    // Give it another chance to be reaped
+    t->did_reach_zombie();
+    return result;
   }
   if (t->tuid() != prev_task_tuid) {
     t->will_schedule();
