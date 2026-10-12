@@ -1813,6 +1813,7 @@ set(TESTS_WITH_PROGRAM
   vfork
   vfork_read_clone_stress
   vsyscall_reverse_next
+  wait_continued_traced_external
   wait_for_all
   watchpoint
   watchpoint_at_sched
