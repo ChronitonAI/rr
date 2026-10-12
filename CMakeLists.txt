@@ -1342,6 +1342,7 @@ set(BASIC_TESTS
   ptrace_trace_exit
   ptrace_traceme
   ptrace_traceme_thread
+  ptrace_wait_traced_threads
   ptrace_waiter_thread
   ptrace_wnohang
   ptrace_wnohang_poll
@@ -1519,6 +1520,7 @@ set(BASIC_TESTS
   x86/x87env
   wait
   wait_sigstop
+  wait_sigstop_threads
   write_race
   writev
   xattr
