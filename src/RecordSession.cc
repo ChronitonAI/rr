@@ -2806,6 +2806,14 @@ RecordSession::RecordResult RecordSession::record_step() {
         last_task_switchable = ALLOW_SWITCH;
         return result;
       }
+      if (!t->is_stopped()) {
+        // A SIGKILL or equivalent took t out of a stop while we processed
+        // it. t's next status is its PTRACE_EVENT_EXIT stop (or its reap).
+        // Don't resume it; like the other places that find the running task
+        // killed, allow a switch.
+        last_task_switchable = ALLOW_SWITCH;
+        return result;
+      }
     } else {
       ASSERT(t, t->is_stopped()) << "handle_signal_event left us in a not-stopped state";
       runnable_state_changed(t, &step_state, &result, rescheduled.by_waitpid);
