@@ -243,14 +243,24 @@ void ReplayTask::will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
     return;
   }
   Registers r = regs();
+  // An x86-64 task can make i386 syscalls (int $0x80), which restart with
+  // the i386 restart_syscall. Tell them apart by the syscall instruction
+  // (the kernel uses the syscall's arch, which we don't keep). If we can't
+  // read it, or it's been changed to something else since, assume the
+  // task's arch.
+  SupportedArch syscall_arch = arch();
+  if (arch() == x86_64) {
+    get_syscall_instruction_arch(
+        this, r.ip().decrement_by_syscall_insn_length(arch()), &syscall_arch);
+  }
   LOG(debug) << "Restarting interrupted syscall "
-             << syscall_name(r.original_syscallno(), arch());
+             << syscall_name(r.original_syscallno(), syscall_arch);
   if (r.syscall_result_signed() == -ERESTART_RESTARTBLOCK) {
-    r.set_syscallno(syscall_number_for_restart_syscall(arch()));
+    r.set_syscallno(syscall_number_for_restart_syscall(syscall_arch));
   } else {
     r.set_syscallno(r.original_syscallno());
   }
-  r.set_ip(r.ip().decrement_by_syscall_insn_length(arch()));
+  r.set_ip(r.ip().decrement_by_syscall_insn_length(syscall_arch));
   set_regs(r);
 }
 
