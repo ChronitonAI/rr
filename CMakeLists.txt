@@ -1334,6 +1334,7 @@ set(BASIC_TESTS
   ptrace_singlestep
   ptrace_singlestep_interrupted_syscallbuf
   ptrace_singlestep_restarted_syscall
+  ptrace_singlestep_signal_handler
   ptrace_stop_sigcont
   ptrace_syscall
   ptrace_syscall_clone_untraced
