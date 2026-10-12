@@ -337,6 +337,15 @@ void RecordTask::record_exit_event(WriteChildTid write_child_tid) {
     }
   }
 
+  // Without us, the tasks of our address space that can still run the
+  // preload library's code may all share one fd table now. Update and record
+  // the preload library's flag for that (fd_tables_changed()) here, so that
+  // the record belongs to our exit event. Otherwise it happens when we leave
+  // the address space (did_reach_zombie()), after this event, and the record
+  // ends up in the next event, whatever that is: replay takes the first data
+  // record of a SYSCALLBUF_FLUSH event for the syscall buffer's contents.
+  as->fd_tables_changed(this);
+
   // Write the exit event here so that the value recorded above is captured.
   // Don't flush syscallbuf. Whatever triggered the exit (syscall, signal)
   // should already have flushed it, if it was running. If it was blocked,
