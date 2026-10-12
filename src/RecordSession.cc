@@ -889,6 +889,10 @@ void RecordSession::task_continue(const StepState& step_state) {
 
     bool singlestep = is_ptrace_any_singlestep(t->arch(),
       t->emulated_ptrace_cont_command);
+    if (singlestep && t->pending_singlestep_stop) {
+      // Run through the syscall hook; we report the step when it returns.
+      singlestep = false;
+    }
     if (singlestep && is_at_syscall_instruction(t, t->ip())) {
       // We're about to singlestep into a syscall instruction.
       // Act like we're NOT singlestepping since doing a PTRACE_SINGLESTEP would
@@ -1113,10 +1117,56 @@ static void copy_syscall_arg_regs(Registers* to, const Registers& from) {
   to->set_arg6(from.arg6());
 }
 
-static void maybe_trigger_emulated_ptrace_syscall_exit_stop(RecordTask* t) {
+/**
+ * The ptracer single-stepped |t| into a syscall hook: it executed a patched
+ * syscall instruction, which jumps to the hook, or the step started in the
+ * hook. Natively there is no such code, and a single-step executes the
+ * syscall instruction in one go. So don't report steps through the hook: run
+ * the task until the hook returns to the application, and report the step
+ * there, with |si|.
+ * Only on x86: on aarch64, the patch jumps to a stub whose first two
+ * instructions don't count as syscallbuf code, so steps there would still
+ * be reported.
+ */
+static bool can_defer_singlestep(RecordTask* t) {
+  return is_x86ish(t->arch()) &&
+         t->emulated_ptrace_cont_command == PTRACE_SINGLESTEP &&
+         !t->pending_singlestep_stop && is_in_syscall_hook(t);
+}
+
+static void defer_singlestep_to_syscallbuf_exit(RecordTask* t,
+                                                const siginfo_t& si) {
+  LOG(debug) << "Deferring the ptracer's single-step at " << t->ip()
+             << " until the syscall hook returns";
+  t->pending_singlestep_stop = true;
+  t->pending_singlestep_siginfo = si;
+  t->break_at_syscallbuf_final_instruction = true;
+  t->syscallstub_exit_breakpoint = nullptr;
+}
+
+/**
+ * |sigreturn| is true if the syscall was a sigreturn, which may have
+ * returned anywhere.
+ */
+static void maybe_trigger_emulated_ptrace_syscall_exit_stop(
+    RecordTask* t, bool sigreturn = false) {
   if (t->emulated_ptrace_cont_command == PTRACE_SYSCALL) {
     t->emulate_ptrace_stop(WaitStatus::for_syscall(t), SYSCALL_EXIT_STOP);
-  } else if (is_ptrace_any_singlestep(t->arch(), t->emulated_ptrace_cont_command)) {
+  } else if (is_ptrace_any_singlestep(t->arch(),
+                                      t->emulated_ptrace_cont_command) &&
+             !t->pending_singlestep_stop) {
+    if (can_defer_singlestep(t) && !sigreturn) {
+      // The syscall hook made the syscall, or the syscall restarted in it.
+      // (After a sigreturn that returns into a hook, natively the step ends
+      // right there, before the hook's syscall, which may block. So we
+      // report it now.)
+      siginfo_t si;
+      memset(&si, 0, sizeof(si));
+      si.si_signo = SIGTRAP;
+      si.si_code = SI_KERNEL;
+      defer_singlestep_to_syscallbuf_exit(t, si);
+      return;
+    }
     // Deliver the singlestep trap now that we've finished executing the
     // syscall.
     t->emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGTRAP), SIGNAL_DELIVERY_STOP, nullptr,
@@ -1382,7 +1432,8 @@ void RecordSession::syscall_state_changed(RecordTask* t,
       step_state->continue_type = DONT_CONTINUE;
 
       if (!is_in_privileged_syscall(t)) {
-        maybe_trigger_emulated_ptrace_syscall_exit_stop(t);
+        maybe_trigger_emulated_ptrace_syscall_exit_stop(
+            t, is_sigreturn(syscallno, syscall_arch));
       }
       return;
     }
@@ -1909,6 +1960,28 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
   return false;
 }
 
+/**
+ * Returns true if the SIGTRAP that stopped |t| is a single-step that its
+ * ptracer requested, which ended in syscallbuf code. Then we report it later
+ * (see defer_singlestep_to_syscallbuf_exit).
+ */
+static bool defer_singlestep_in_syscallbuf(RecordTask* t) {
+  if (!can_defer_singlestep(t)) {
+    return false;
+  }
+  TrapReasons reasons = t->compute_trap_reasons();
+  if (!reasons.singlestep || reasons.breakpoint || reasons.watchpoint) {
+    return false;
+  }
+  siginfo_t si = t->get_siginfo();
+  // The tracee doesn't see this SIGTRAP. Natively, its step ends after the
+  // syscall, and the SIGTRAP of our breakpoint at the hook's exit has the
+  // step's effects there.
+  restore_signal_state_after_hidden_sigtrap(t);
+  defer_singlestep_to_syscallbuf_exit(t, si);
+  return true;
+}
+
 bool RecordSession::handle_signal_event(RecordTask* t, StepState* step_state) {
   int sig = t->stop_sig();
   if (!sig) {
@@ -1931,7 +2004,47 @@ bool RecordSession::handle_signal_event(RecordTask* t, StepState* step_state) {
     return true;
   }
 
+  bool report_deferred_singlestep =
+      sig == SIGTRAP && t->pending_singlestep_stop &&
+      t->is_at_syscallbuf_final_instruction_breakpoint();
+  if (report_deferred_singlestep) {
+    // The syscall hook that the ptracer single-stepped the task into is
+    // returning to the application. The SIGTRAP of our breakpoint here has
+    // the effects that the step's SIGTRAP has natively: if SIGTRAP was
+    // blocked or ignored, it's unblocked now, and its handler is SIG_DFL.
+    // Keep them (so handle_syscallbuf_breakpoint doesn't restore the
+    // handler), and update our cached state. Our cached sigmask is from
+    // before the SIGTRAP.
+    bool was_blocked = t->is_sig_blocked(SIGTRAP);
+    if (was_blocked || t->is_sig_ignored(SIGTRAP)) {
+      t->did_set_sig_handler_default(SIGTRAP);
+    }
+    if (was_blocked) {
+      t->unblock_signal(SIGTRAP);
+    }
+  }
+
   if (sig == SIGTRAP && handle_syscallbuf_breakpoint(t)) {
+    if (report_deferred_singlestep) {
+      // Report the single-step now, at the instruction after the patched
+      // syscall.
+      LOG(debug) << "Reporting the deferred single-step at " << t->ip();
+      siginfo_t si = t->pending_singlestep_siginfo;
+      if (si.si_code == TRAP_TRACE) {
+        si.si_addr = (void*)t->ip().register_value();
+      }
+      t->pending_singlestep_stop = false;
+      t->stashed_signal_processed();
+      t->record_event(Event::sched());
+      if (t->emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGTRAP), &si)) {
+        last_task_switchable = ALLOW_SWITCH;
+        step_state->continue_type = DONT_CONTINUE;
+      }
+    }
+    return true;
+  }
+
+  if (sig == SIGTRAP && defer_singlestep_in_syscallbuf(t)) {
     return true;
   }
 
