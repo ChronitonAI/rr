@@ -1,0 +1,9 @@
+source `dirname $0`/util.sh
+# Without the syscall buffer, replay's exec of the vfork child leaves bytes
+# on the stack it shares with its parent (Task::os_exec doesn't restore all
+# of them), so the 64-bit checksums differ.
+skip_if_no_syscall_buf
+GLOBAL_OPTIONS="$GLOBAL_OPTIONS --checksum=on-all-events"
+record vfork_exec_map_noreplace$bitness
+replay
+check EXIT-SUCCESS

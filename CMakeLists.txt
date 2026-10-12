@@ -1055,6 +1055,7 @@ set(BASIC_TESTS
   clone_parent
   clone_untraced
   clone_vfork_pidfd
+  clone_vm_exec_traceexec
   cloned_sigmask
   close_range
   constructor
@@ -1521,6 +1522,8 @@ set(BASIC_TESTS
   vdso_parts
   vdso_symbols
   vfork_done
+  vfork_exec_map_noreplace
+  vfork_exec_map_over_buffers
   vfork_flush
   vfork_setopts
   vfork_shared
@@ -1901,6 +1904,7 @@ set(TESTS_WITHOUT_PROGRAM
   unwind_on_signal
   vfork_done_clone
   vfork_exec
+  vfork_exec_map_noreplace_checksum
   vfork_break_parent
   vfork_checksum
   vsyscall_singlestep
