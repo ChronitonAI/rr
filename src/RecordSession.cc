@@ -300,6 +300,15 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
   if (may_wait_exit) {
     t->did_reach_zombie();
   } else if (!t->was_reaped()) {
+    // We reap t only once it has become a zombie (see
+    // Scheduler::is_task_runnable()). Until then, t may wait for other tasks
+    // to exit, e.g. as the last thread of a pid namespace's init. Linux has
+    // detached t's tracees by then (exit_ptrace() comes before
+    // zap_pid_ns_processes()), so do that now rather than when we delete t:
+    // while other tasks are runnable, we don't schedule a tracee that is in
+    // an emulated stop for t, so we wouldn't handle its exit, and t wouldn't
+    // become a zombie.
+    t->detach_emulated_ptrace_tracees();
     t->waiting_for_reap = true;
   }
   return true;

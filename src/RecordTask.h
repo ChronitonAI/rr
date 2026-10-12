@@ -589,6 +589,11 @@ public:
    * it, emulating ptrace stops, etc.)
    */
   void did_reach_zombie();
+  /**
+   * Forget the tasks that this task traces with emulated ptrace, and their
+   * emulated stops, as Linux does when a ptracer exits (exit_ptrace()).
+   */
+  void detach_emulated_ptrace_tracees();
 
   // Is this task a container init? (which has special signal behavior)
   bool is_container_init() const { return tg->tgid_own_namespace == 1; }
