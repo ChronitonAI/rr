@@ -1562,6 +1562,7 @@ set(BASIC_TESTS
   wait
   wait_continued
   wait_continued_traced
+  wait_continued_traced_sigstop
   wait_continued_two_waiters
   wait_sigchld_blocked_thread
   wait_sigstop

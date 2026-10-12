@@ -7946,6 +7946,13 @@ static void emulate_SIGCONT_sent_by_tracee(RecordTask* t) {
       // This ends the emulated group stop of every untraced thread in rt's
       // process.
       rt->emulate_SIGCONT();
+    } else if (rt->emulated_ptracer && rt->thread_group()->stopping_signal &&
+               rt->is_signal_pending(SIGCONT)) {
+      // rt is traced, so the SIGCONT doesn't end any ptrace stop rt is in,
+      // but it ends the stop of rt's process (see
+      // Scheduler::is_task_runnable()). rt needn't be in an emulated stop:
+      // its ptracer may have resumed it.
+      rt->emulate_SIGCONT();
     }
   }
 }
