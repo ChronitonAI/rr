@@ -261,6 +261,42 @@ static void get_stub_scratch_2(RecordTask* t, void *buff, size_t sz) {
   RR_ARCH_FUNCTION(get_stub_scratch_2_arch, t->arch(), t, buff, sz);
 }
 
+template <typename Arch>
+static int32_t get_alt_stack_nesting_level_arch(RecordTask* t) {
+  // The preload_thread_locals page may hold another thread's values now, so
+  // use t's own.
+  auto locals = reinterpret_cast<const preload_thread_locals<Arch>*>(
+      t->fetch_preload_thread_locals());
+  return locals->alt_stack_nesting_level;
+}
+
+static int32_t get_alt_stack_nesting_level(RecordTask* t) {
+  RR_ARCH_FUNCTION(get_alt_stack_nesting_level_arch, t->arch(), t);
+}
+
+bool is_in_syscall_hook(RecordTask* t) {
+  if (!t->is_in_syscallbuf()) {
+    return false;
+  }
+  // A patched syscall jumps to a stub, which increments
+  // alt_stack_nesting_level and calls the hook. The hook's trampoline
+  // decrements it again just before it returns to the stub's code in the
+  // hook (which then jumps back to the application), so this misses the
+  // hook's last few instructions. Other code in the syscallbuf code range,
+  // e.g. the preload library's initialization, runs outside of any hook.
+  return t->vm()->monkeypatcher().is_jump_stub_instruction(t->ip(), false) ||
+         get_alt_stack_nesting_level(t) > 0;
+}
+
+void restore_signal_state_after_hidden_sigtrap(RecordTask* t) {
+  // Our cached sigmask is from before the SIGTRAP. (If rr has blocked all
+  // signals because it has stashed some, the kernel also reset the handler,
+  // so restore it whenever it isn't the default.)
+  SignalBlocked signal_was_blocked =
+      t->is_sig_blocked(SIGTRAP) ? SIG_BLOCKED : SIG_UNBLOCKED;
+  restore_signal_state(t, SIGTRAP, signal_was_blocked);
+}
+
 /**
  * This function is responsible for handling breakpoints we set in syscallbuf
  * code to detect sigprocmask calls and syscallbuf exit. It's called when we
