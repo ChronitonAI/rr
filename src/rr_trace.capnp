@@ -237,6 +237,10 @@ struct TaskEvent {
       # Not a Path since it is only meaningful during recording
       interpName @11 :CString;
       pacData @12 :PACData;
+      # Whether a ptracer saw the task at a PTRACE_EVENT_EXEC stop, which rr
+      # reports after the execve has returned. A write to the return value
+      # register at that stop has no effect.
+      ptraceExecStop @13 :Bool;
     }
     # Most frame 'exit' events generate one of these, but these are not
     # generated if rr ends abnormally so the tasks did not in fact exit during

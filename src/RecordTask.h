@@ -80,6 +80,18 @@ public:
                                const Registers& regs) override;
   virtual void will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
                                      int /*sig*/) override;
+  virtual void did_exec_stop() override;
+  virtual bool is_at_exec_stop() const override {
+    return emulated_stop_type != NOT_STOPPED &&
+           emulated_stop_code.ptrace_event() == PTRACE_EVENT_EXEC;
+  }
+  /**
+   * The registers as an emulated ptracer sees them. At a PTRACE_EVENT_EXEC
+   * stop, which we emulate after the execve has returned, the return value
+   * register reads as it did at the kernel's PTRACE_EVENT_EXEC stop
+   * (|exec_stop_syscall_result|).
+   */
+  Registers regs_for_ptracer() const;
   virtual void did_wait() override;
 
   bool enable_chaos_memory_allocations() const;
@@ -771,6 +783,10 @@ public:
   RecordTask* emulated_ptracer;
   std::set<RecordTask*> emulated_ptrace_tracees;
   uintptr_t emulated_ptrace_event_msg;
+  // The return value register at this task's last PTRACE_EVENT_EXEC stop.
+  // 64-bit x86 kernels leave the -ENOSYS from the syscall entry there;
+  // 32-bit x86 kernels and aarch64 ones have zeroed it.
+  uintptr_t exec_stop_syscall_result;
   // Saved emulated-ptrace signals
   std::vector<siginfo_t> saved_ptrace_siginfos;
   // Code to deliver to ptracer/waiter when it waits. Note that zero can be a

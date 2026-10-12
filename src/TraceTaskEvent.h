@@ -113,6 +113,14 @@ public:
     DEBUG_ASSERT(type() == EXEC);
     pac_data_ = data;
   }
+  bool ptrace_exec_stop() const {
+    DEBUG_ASSERT(type() == EXEC);
+    return ptrace_exec_stop_;
+  }
+  void set_ptrace_exec_stop(bool stop) {
+    DEBUG_ASSERT(type() == EXEC);
+    ptrace_exec_stop_ = stop;
+  }
   WaitStatus exit_status() const {
     DEBUG_ASSERT(type() == EXIT);
     return exit_status_;
@@ -133,6 +141,7 @@ private:
   remote_ptr<void> interp_base_;      // EXEC only
   std::string interp_name_;           // EXEC only
   std::vector<uint8_t> pac_data_;     // EXEC only
+  bool ptrace_exec_stop_ = false;     // EXEC only
   WaitStatus exit_status_;            // EXIT only
 };
 

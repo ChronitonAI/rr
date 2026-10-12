@@ -16,6 +16,7 @@ ReplayTask::ReplayTask(ReplaySession& session, pid_t _tid, pid_t _rec_tid,
                        uint32_t serial, SupportedArch a,
                        const std::string& name)
     : Task(session, _tid, _rec_tid, serial, a),
+      at_exec_stop(false),
       name_(name),
       seen_sched_in_syscallbuf_syscall_hook(false)
 {}
@@ -79,9 +80,12 @@ void ReplayTask::post_exec_syscall(const string& replay_exe, const string& origi
   // are set while we populate AddressSpace. We need that for the kernel
   // to identify the original stack region correctly.
   set_regs(current_trace_frame().regs());
-  extra_registers = current_trace_frame().extra_regs();
-  ASSERT(this, !extra_registers.empty());
-  set_extra_regs(extra_registers);
+  // The trace has no extra registers for a task that was dying when rr
+  // recorded the execve's return, since rr couldn't read them then. The
+  // task doesn't run again.
+  if (!current_trace_frame().extra_regs().empty()) {
+    set_extra_regs(current_trace_frame().extra_regs());
+  }
 }
 
 void ReplayTask::set_name(AutoRemoteSyscalls& remote, const std::string& name) {

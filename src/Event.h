@@ -191,9 +191,10 @@ struct SignalEvent {
  * the ENTERING_SYSCALL_PTRACE state, allow a context switch so the ptracer
  * can modify tracee registers, then perform ENTERING_SYSCALL (which actually
  * creates the new task or does the exec), allow a context switch so the
- * ptracer can modify the new task or post-exec state in a PTRACE_EVENT_EXEC/
- * CLONE/FORK/VFORK, then perform EXITING_SYSCALL to get into the correct
- * post-syscall state.
+ * ptracer can modify the new task in a PTRACE_EVENT_CLONE/FORK/VFORK stop,
+ * then perform EXITING_SYSCALL to get into the correct post-syscall state.
+ * An exec's PTRACE_EVENT_EXEC stop comes after EXITING_SYSCALL, since replay
+ * switches the task to the new image there.
  *
  * When PTRACE_SYSEMU is used, there will only be one event: an
  * ENTERING_SYSCALL_PTRACE.

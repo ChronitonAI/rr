@@ -188,15 +188,27 @@ public:
   void on_proxy_detach(RecordTask *t, pid_t new_tid);
 
   /**
-   * This gets called when we detect that a task has been revived from the
-   * dead with a PTRACE_EVENT_EXEC. See ptrace man page under "execve(2) under
-   * ptrace" for the horrid details.
-   *
-   * The task in the thread-group that triggered the successful execve has changed
-   * its tid to |rec_tid|. We mirror that, and emit TraceTaskEvents to make it
-   * look like a new task was spawned and the old task exited.
+   * Called when |rec_tid| stops at PTRACE_EVENT_EXEC. Returns the task that
+   * did the exec. If that wasn't the thread-group leader, the exec'ing task
+   * has taken over the leader's tid |rec_tid| (see the ptrace man page under
+   * "execve(2) under ptrace" for the horrid details): we record the exit of
+   * the leader, which the exec killed, if we haven't yet, destroy it, and
+   * revive_task_for_exec().
+   * Returns null if the task that exec'd has been killed since it stopped,
+   * in which case the caller should ignore the stop. If that task wasn't the
+   * leader, we've recorded its death and the leader's (see
+   * record_death_in_exec()), and destroyed the leader's task.
    */
-  RecordTask* revive_task_for_exec(pid_t rec_tid);
+  RecordTask* find_execing_task(pid_t rec_tid);
+
+  /**
+   * Called when |rec_tid|, a thread-group leader's tid, reports a
+   * PTRACE_EVENT_EXIT stop or exits. If that's really a non-leader thread
+   * of the group that exec'd, took over |rec_tid| in de_thread(), and was
+   * killed before it reported its PTRACE_EVENT_EXEC, deal with it (see
+   * record_death_in_exec()) and return true.
+   */
+  bool handle_death_of_execed_thread(pid_t rec_tid, WaitStatus status);
 
   /**
    * This is purely for testing purposes (see SYS_rrcall_arm_kill). If a task
@@ -222,6 +234,35 @@ public:
   void on_destroy_record_task(RecordTask* t);
 
 private:
+  /**
+   * The task in the thread-group that triggered the successful execve, which
+   * had tid |former_tid|, has changed its tid to |rec_tid|. We mirror that,
+   * and emit TraceTaskEvents to make it look like a new task was spawned and
+   * the old task exited.
+   */
+  RecordTask* revive_task_for_exec(pid_t rec_tid, pid_t former_tid);
+
+  /**
+   * Returns the task of a thread other than the leader of the thread group
+   * led by |rec_tid| that exec'd and has taken over |rec_tid| in
+   * de_thread(), if any.
+   */
+  RecordTask* execed_non_leader(pid_t rec_tid);
+
+  /**
+   * Record the exit of the thread-group leader |leader|, which a non-leader
+   * thread's exec killed, if we haven't yet, and destroy it.
+   */
+  void dispose_of_leader_killed_by_exec(RecordTask* leader);
+
+  /**
+   * |t|, a non-leader thread of the thread group led by |rec_tid|, exec'd
+   * and took over |rec_tid|, but was killed before we could record its
+   * exec. Record its exit, and the old leader's, and destroy the leader's
+   * task, and |t| once an emulated ptracer has collected its exit stop.
+   */
+  void record_death_in_exec(pid_t rec_tid, RecordTask* t);
+
   RecordSession(const std::string& exe_path,
                 const std::vector<std::string>& argv,
                 const std::vector<std::string>& envp,
@@ -301,6 +342,16 @@ private:
   bool unmap_vdso_;
   bool check_outside_mmaps_;
 };
+
+/**
+ * |t| has finished a syscall. Emulate the stop that its emulated ptracer
+ * gets there, if any: a syscall-exit stop after PTRACE_SYSCALL, or a
+ * single-step SIGTRAP (SI_KERNEL) after PTRACE_SINGLESTEP or
+ * PTRACE_SYSEMU_SINGLESTEP. On x86, the kernel reports no single-step at a
+ * syscall's exit after PTRACE_SYSEMU_SINGLESTEP (see report_single_step()),
+ * but this does.
+ */
+void maybe_trigger_emulated_ptrace_syscall_exit_stop(RecordTask* t);
 
 } // namespace rr
 

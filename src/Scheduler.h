@@ -11,6 +11,7 @@
 #include <set>
 #include <vector>
 
+#include "TaskishUid.h"
 #include "Ticks.h"
 #include "TraceFrame.h"
 #include "core.h"
@@ -187,6 +188,12 @@ public:
    * Let the scheduler know that the task has exited an execve.
    */
   void did_exit_execve(RecordTask* t);
+  /**
+   * Let the scheduler know that the task, which entered an execve, has died
+   * before we saw the execve finish. Does nothing if we have already been
+   * told that it's over.
+   */
+  void did_die_in_execve(RecordTask* t);
 
 private:
   struct CompareByScheduleOrder {
@@ -290,6 +297,12 @@ private:
    * threads is currently in an execve.
    */
   pid_t in_exec_tgid;
+
+  /**
+   * The tasks of the in_exec_tgid threadgroup that were already stopped at
+   * a PTRACE_EVENT_EXIT we hadn't handled when the execve started.
+   */
+  std::set<TaskUid> exit_stops_before_exec;
 
   /**
    * The number of tasks that have is_stopped_ set.

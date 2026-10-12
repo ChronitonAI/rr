@@ -1085,11 +1085,13 @@ set(BASIC_TESTS
   epoll_pwait_eintr_sigmask
   epoll_pwait2
   eventfd
+  exec_exit_group_race
   exec_flags
   exec_no_env
   exec_self
   exec_from_main_thread
   exec_from_other_thread
+  exec_rseq
   exec_stopsig
   execveat
   exit_with_syscallbuf_signal
@@ -1330,6 +1332,7 @@ set(BASIC_TESTS
   ptrace_waiter_thread
   ptrace_wnohang
   ptrace_wnohang_poll
+  ptrace_write_at_exec_stop
   ptracer_death
   ptracer_death_multithread
   ptracer_death_multithread_peer
@@ -1603,6 +1606,9 @@ set(TESTS_WITH_PROGRAM
   elapsed_time
   exclusion_region
   exec_failed
+  exec_killed_at_exec_stop
+  exec_killed_sibling_tracer
+  exec_killed_traced
   exec_many
   exec_shared_as
   execve_loop
@@ -1795,6 +1801,7 @@ set(TESTS_WITHOUT_PROGRAM
   deliver_async_signal_during_syscalls
   env_newline
   exec_deleted
+  exec_killed_initial_process
   exec_stop
   execp
   explicit_checkpoint_clone

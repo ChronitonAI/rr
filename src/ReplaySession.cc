@@ -1827,7 +1827,10 @@ Completion ReplaySession::exit_task(ReplayTask* t) {
 
 ReplayTask* ReplaySession::revive_task_for_exec() {
   const Event& ev = trace_frame.event();
-  if (!ev.is_syscall_event() || !ev.Syscall().is_exec()) {
+  // If a non-leader thread exec'd and was killed before the execve returned,
+  // we recorded its exit under the leader's tid, which it had taken over.
+  bool is_exit = ev.type() == EV_EXIT;
+  if (!is_exit && (!ev.is_syscall_event() || !ev.Syscall().is_exec())) {
     FATAL() << "Can't find task, but we're not in an execve";
   }
 
@@ -1847,13 +1850,21 @@ ReplayTask* ReplaySession::revive_task_for_exec() {
   }
 
   ReplayTask* t = static_cast<ReplayTask*>(*tg->task_set().begin());
+  if (is_exit) {
+    int syscallno = t->regs().original_syscallno();
+    ASSERT(t, is_execve_syscall(syscallno, t->arch()) ||
+                  is_execveat_syscall(syscallno, t->arch()))
+        << "Exit of " << trace_frame.tid() << " but " << t->rec_tid
+        << " isn't in an execve";
+  }
   LOG(debug) << "Changing task tid from " << t->rec_tid << " to "
              << trace_frame.tid();
   task_map.erase(t->rec_tid);
   t->rec_tid = trace_frame.tid();
   t->serial = next_task_serial();
   task_map.insert(make_pair(t->rec_tid, t));
-  // The real tid is not changing yet. It will, in process_execve.
+  // The real tid is not changing yet. It will, in process_execve, unless
+  // the task exits first.
   return t;
 }
 
@@ -1871,6 +1882,8 @@ ReplayTask* ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
   if (!t) {
     t = revive_task_for_exec();
   }
+  // Any exec stop is over by the time the task does anything.
+  t->at_exec_stop = false;
 
   if (t->tuid() != last_task_tuid) {
     t->will_schedule();

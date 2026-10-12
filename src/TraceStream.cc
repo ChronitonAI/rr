@@ -792,6 +792,7 @@ void TraceWriter::write_task_event(const TraceTaskEvent& event) {
       auto pac_data = exec.initPacData();
       std::vector<uint8_t> pac_data_vec = event.pac_data();
       pac_data.setRaw(Data::Reader(pac_data_vec.data(), pac_data_vec.size()));
+      exec.setPtraceExecStop(event.ptrace_exec_stop());
       break;
     }
     case TraceTaskEvent::EXIT:
@@ -856,6 +857,7 @@ TraceTaskEvent TraceReader::read_task_event(FrameTime* time) {
       r.interp_name_ = data_to_str(exec.getInterpName());
       auto pac_data = exec.getPacData().getRaw();
       r.pac_data_ = std::vector<uint8_t>(pac_data.begin(), pac_data.end());
+      r.ptrace_exec_stop_ = exec.getPtraceExecStop();
       break;
     }
     case trace::TaskEvent::Which::EXIT:

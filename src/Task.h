@@ -309,6 +309,13 @@ public:
 
   void did_kill();
 
+  /**
+   * Call when another thread's exec has killed this task, the thread-group
+   * leader, and de_thread() has reaped it before we handled its
+   * PTRACE_EVENT_EXIT. Like did_kill(), and also marks the task as reaped.
+   */
+  void did_die_in_exec();
+
   void unmap_buffers_for(
       AutoRemoteSyscalls& remote, Task* t,
       remote_ptr<struct syscallbuf_hdr> saved_syscallbuf_child);
@@ -406,6 +413,22 @@ public:
    */
   virtual void will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
                                      int /*sig*/) {}
+  /**
+   * Hook called by `did_waitpid` at a PTRACE_EVENT_EXEC stop, right after it
+   * has refreshed the registers and ticks.
+   */
+  virtual void did_exec_stop() {}
+  /**
+   * True if a ptracer sees this task at a PTRACE_EVENT_EXEC stop. The
+   * execve has returned, but as at a real exec stop, a ptracer's write to
+   * the register that holds the syscall's return value is discarded: the
+   * kernel writes the return value when the execve returns, after the stop.
+   */
+  virtual bool is_at_exec_stop() const { return false; }
+  /**
+   * Called when a ptracer resumes this task (or detaches from it).
+   */
+  virtual void did_ptrace_resume() {}
   /**
    * Hook called by `did_waitpid`.
    */
@@ -1012,6 +1035,8 @@ public:
     // on aarch64, tls_register is used
     uintptr_t tls_register;
     std::vector<X86Arch::user_desc> thread_areas;
+    // Replay only: ReplayTask::at_exec_stop.
+    bool at_exec_stop = false;
   };
 
   /**

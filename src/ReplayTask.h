@@ -23,6 +23,16 @@ public:
   ReplaySession& session() const;
   TraceReader& trace_reader() const;
 
+  bool is_at_exec_stop() const override { return at_exec_stop; }
+  void did_ptrace_resume() override { at_exec_stop = false; }
+
+  /**
+   * Whether a ptracer sees this task at a PTRACE_EVENT_EXEC stop (as the
+   * trace says when we replay the execve's return) and hasn't resumed it
+   * yet. The task doesn't run until then.
+   */
+  bool at_exec_stop;
+
   /**
    * Initialize tracee buffers in this, i.e., implement
    * RRCALL_init_syscall_buffer.  This task must be at the point

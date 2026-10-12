@@ -494,6 +494,8 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
   // Now it's safe to save the auxv data
   t->vm()->save_auxv(t);
 
+  t->at_exec_stop = tte.ptrace_exec_stop();
+
   // Notify outer rr if there is one. We're assuming here that our
   // rr is the same version as the outer rr, or at least is using
   // the same syscall numbers. The inner rr could be replaying

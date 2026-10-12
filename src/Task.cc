@@ -490,6 +490,11 @@ void Task::did_kill()
   cloned_file_data_fd_child = -1;
 }
 
+void Task::did_die_in_exec() {
+  did_kill();
+  was_reaped_ = true;
+}
+
 /**
  * Must be idempotent.
  */
@@ -542,6 +547,21 @@ static void process_shmdt(Task* t, remote_ptr<void> addr) {
   t->vm()->unmap(t, addr, size);
 }
 
+/**
+ * Sets |tracee|'s registers to |r|, which its ptracer has written, except
+ * at a PTRACE_EVENT_EXEC stop, where the kernel discards a write to the
+ * return value register (see Task::is_at_exec_stop()). On aarch64, |tracee|
+ * is really at a syscall-exit stop then, where the kernel restores x7 when
+ * the task resumes (see report_syscall()), so a write to x7 doesn't reach
+ * the new image either.
+ */
+static void set_regs_from_ptracer(Task* tracee, Registers r) {
+  if (tracee->is_at_exec_stop()) {
+    r.set_syscall_result(tracee->regs().syscall_result());
+  }
+  tracee->set_regs(r);
+}
+
 template <typename Arch>
 static void ptrace_syscall_exit_legacy_arch(Task* t, Task* tracee, const Registers& regs)
 {
@@ -551,7 +571,7 @@ static void ptrace_syscall_exit_legacy_arch(Task* t, Task* tracee, const Registe
           remote_ptr<typename Arch::user_regs_struct>(regs.arg4()));
       Registers r = tracee->regs();
       r.set_from_ptrace_for_arch(Arch::arch(), &data, sizeof(data));
-      tracee->set_regs(r);
+      set_regs_from_ptracer(tracee, r);
       break;
     }
     case Arch::PTRACE_SETFPREGS: {
@@ -580,7 +600,7 @@ static void ptrace_syscall_exit_legacy_arch(Task* t, Task* tracee, const Registe
       if (addr < sizeof(typename Arch::user_regs_struct)) {
         Registers r = tracee->regs();
         r.write_register_by_user_offset(addr, data);
-        tracee->set_regs(r);
+        set_regs_from_ptracer(tracee, r);
       } else if (addr >= offsetof(typename Arch::user, u_debugreg[0]) &&
                   addr < offsetof(typename Arch::user, u_debugreg[8])) {
         size_t regno =
@@ -785,6 +805,16 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
       pid_t pid = (pid_t)regs.arg2_signed();
       Task* tracee = session().find_task(pid);
       switch ((int)regs.orig_arg1_signed()) {
+        case PTRACE_CONT:
+        case PTRACE_SYSCALL:
+        case PTRACE_SINGLESTEP:
+        case Arch::PTRACE_SYSEMU:
+        case Arch::PTRACE_SYSEMU_SINGLESTEP:
+        case PTRACE_DETACH:
+          if (tracee) {
+            tracee->did_ptrace_resume();
+          }
+          break;
         case PTRACE_SETREGSET: {
           switch ((int)regs.arg3()) {
             case NT_PRSTATUS: {
@@ -792,7 +822,7 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
                   this, regs, user_regs_struct_size(tracee->arch()));
               Registers r = tracee->regs();
               r.set_from_ptrace_for_arch(tracee->arch(), set.data(), set.size());
-              tracee->set_regs(r);
+              set_regs_from_ptracer(tracee, r);
               break;
             }
             case NT_PRFPREG: {
@@ -1107,9 +1137,14 @@ void Task::post_exec(const string& exe_file) {
 
   extra_registers = ExtraRegisters(registers.arch());
   extra_registers_known = false;
-  ExtraRegisters e = *extra_regs_fallible();
-  e.reset();
-  set_extra_regs(e);
+  // This fails if the task has died (e.g. it was SIGKILLed) since we read
+  // its registers.
+  const ExtraRegisters* maybe_extra = extra_regs_fallible();
+  if (maybe_extra) {
+    ExtraRegisters e = *maybe_extra;
+    e.reset();
+    set_extra_regs(e);
+  }
 
   syscallbuf_child = nullptr;
   syscallbuf_size = 0;
@@ -2526,6 +2561,10 @@ bool Task::did_waitpid(WaitStatus status) {
   session().accumulate_ticks_processed(more_ticks);
   ticks += more_ticks;
 
+  if (status.ptrace_event() == PTRACE_EVENT_EXEC) {
+    did_exec_stop();
+  }
+
   if (was_reaped_) {
     ASSERT(this, !handled_ptrace_exit_event_);
   } else if (status.ptrace_event() == PTRACE_EVENT_EXIT) {
@@ -2959,6 +2998,9 @@ Task::CapturedState Task::capture_state() {
   state.wait_status = wait_status;
   state.ticks = ticks;
   state.top_of_stack = top_of_stack;
+  if (session().is_replaying()) {
+    state.at_exec_stop = static_cast<ReplayTask*>(this)->at_exec_stop;
+  }
   return state;
 }
 
@@ -3005,6 +3047,10 @@ void Task::copy_state(const CapturedState& state) {
 
   ticks = state.ticks;
   own_namespace_rec_tid = state.own_namespace_rec_tid;
+  if (session().is_replaying()) {
+    static_cast<ReplayTask*>(this)->at_exec_stop = state.at_exec_stop;
+  }
+
   if (state.rseq_state) {
     rseq_state = make_unique<RseqState>(*state.rseq_state);
   }

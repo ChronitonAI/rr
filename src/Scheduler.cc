@@ -93,6 +93,11 @@ static double high_priority_only_duration_step_factor = 2;
 static double high_priority_only_fraction = 0.2;
 static double start_high_priority_only_immediately_probability = 0.25;
 
+static bool is_at_unhandled_exit_stop(Task* t) {
+  return t->is_stopped() && t->ptrace_event() == PTRACE_EVENT_EXIT &&
+         !t->handled_ptrace_exit_event();
+}
+
 Scheduler::Scheduler(RecordSession& session)
     : reschedule_count(0),
       session(session),
@@ -617,17 +622,12 @@ static RecordTask* find_waited_task(RecordSession& session, pid_t tid, WaitStatu
                                            RRCALL_KILL_BEFORE_EXEC_STOP)) {
       return nullptr;
     }
-    if (waited && waited->waiting_for_reap) {
-      // We didn't reap this task yet but it's being replaced anyway. Get rid of it
-      // so we can replace it.
-      delete waited;
-      waited = nullptr;
-    }
-    if (!waited) {
-      // The thread-group-leader died and now the exec'ing thread has
-      // changed its thread ID to be thread-group leader.
-      waited = session.revive_task_for_exec(tid);
-    }
+    // If a non-leader thread exec'd, it now has the leader's tid.
+    waited = session.find_execing_task(tid);
+  } else if ((status.ptrace_event() == PTRACE_EVENT_EXIT ||
+              status.reaped()) &&
+             session.handle_death_of_execed_thread(tid, status)) {
+    return nullptr;
   }
 
   if (!waited) {
@@ -635,6 +635,15 @@ static RecordTask* find_waited_task(RecordSession& session, pid_t tid, WaitStatu
     waited = session.find_detached_proxy_task(tid);
     if (!waited) {
       LOGM(debug) << "    ... but it's dead";
+      if (status.ptrace_event() == PTRACE_EVENT_EXIT) {
+        // A task we've already recorded as dead (see
+        // RecordSession::record_death_in_exec()), or never heard about
+        // (e.g. a thread created by a clone() whose caller was killed before
+        // it could report PTRACE_EVENT_CLONE). Let it finish exiting; until
+        // it does, its thread group can't be reaped.
+        LOGM(debug) << "    ... letting it finish exiting";
+        ptrace(_ptrace_request(PTRACE_CONT), tid, nullptr, nullptr);
+      }
       return nullptr;
     }
 
@@ -764,6 +773,17 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
           }
           ASSERT(current_, wait_result == WAIT_OK);
           RecordTask *waited = find_waited_task(session, tid, status);
+          if (!current_) {
+            // find_waited_task() destroyed current_: it was the leader of a
+            // thread group in which another thread exec'd, and the exec
+            // killed it. Run the task that exec'd instead.
+            if (waited && waited->did_waitpid(status)) {
+              result.by_waitpid = true;
+              current_ = waited;
+            }
+            unlimited_ticks_mode = false;
+            break;
+          }
           if (!waited) {
             continue;
           }
@@ -805,13 +825,13 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
       }
 #ifdef MONITOR_UNSWITCHABLE_WAITS
       double wait_duration = monotonic_now_sec() - now;
-      if (wait_duration >= 0.010) {
+      if (wait_duration >= 0.010 && current_) {
         LOGM(warn) << "Waiting for unswitchable " << current_->ev()
                    << " took " << 1000.0 * wait_duration << "ms";
       }
 #endif
     }
-    if (current_->is_stopped() || current_->was_reaped()) {
+    if (current_ && (current_->is_stopped() || current_->was_reaped())) {
       validate_scheduled_task();
       return result;
     }
@@ -930,6 +950,32 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
     break;
   }
 
+  if (in_exec_tgid) {
+    // As below when all tasks are blocked, we can't service the round-robin
+    // queue in order now.
+    while (RecordTask* t = get_round_robin_task()) {
+      maybe_pop_round_robin_task(t);
+    }
+    // The exec can't complete until the other threads of its thread group
+    // have exited. If a SIGKILL (normally the exec's) stopped one of them at
+    // its PTRACE_EVENT_EXIT and we've already collected that stop without
+    // handling it (e.g. an internal wait ran into it), it won't produce a new
+    // status, so run that task now.
+    // Leave alone tasks that were already at such a stop when the exec
+    // started: the exec's SIGKILL ends those stops, after which a non-leader
+    // produces a new status and the leader's tid goes to the thread that
+    // exec'd. Running them here could race with that.
+    if (ThreadGroup* tg = session.find_thread_group(in_exec_tgid)) {
+      for (Task* t : tg->task_set()) {
+        if (is_at_unhandled_exit_stop(t) &&
+            !exit_stops_before_exec.count(t->tuid())) {
+          next = static_cast<RecordTask*>(t);
+          break;
+        }
+      }
+    }
+  }
+
   if (next) {
     LOGM(debug) << "  selecting task " << next->tid;
   } else {
@@ -946,6 +992,7 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
                << task_priority_set_total_count << " total)";
 
     WaitStatus status;
+    pid_t exec_tgid = in_exec_tgid;
     do {
       double timeout = enable_poll ? 1 : 0;
       pid_t tid;
@@ -967,6 +1014,14 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
       LOGM(debug) << "  " << tid << " changed status to " << status;
       next = find_waited_task(session, tid, status);
       now = -1; // invalid, don't use
+      if (exec_tgid && !in_exec_tgid && !next) {
+        // find_waited_task() found that the task in execve had been killed,
+        // and recorded its death (see RecordSession::record_death_in_exec()).
+        // That ended the execve, so the tasks we treated as blocked because
+        // of it may be runnable. Start over.
+        LOGM(debug) << "  ... execve in " << exec_tgid << " is over";
+        return reschedule(switchable);
+      }
       if (next) {
         ASSERT(next,
                next->may_be_blocked() ||
@@ -1076,6 +1131,7 @@ void Scheduler::on_destroy(RecordTask* t) {
   if (t->tgid() == in_exec_tgid &&
       t->thread_group()->task_set().size() == 1) {
     in_exec_tgid = 0;
+    exit_stops_before_exec.clear();
   }
 
   if (t->in_round_robin_queue) {
@@ -1165,12 +1221,25 @@ void Scheduler::did_enter_execve(RecordTask* t) {
   ASSERT(t, !in_exec_tgid) <<
     "Entering execve while another execve is already happening in tgid " << in_exec_tgid;
   in_exec_tgid = t->tgid();
+  exit_stops_before_exec.clear();
+  for (Task* tt : t->thread_group()->task_set()) {
+    if (is_at_unhandled_exit_stop(tt)) {
+      exit_stops_before_exec.insert(tt->tuid());
+    }
+  }
 }
 
 void Scheduler::did_exit_execve(RecordTask* t) {
   ASSERT(t, in_exec_tgid == t->tgid()) <<
     "Exiting an execve we didn't know about";
   in_exec_tgid = 0;
+  exit_stops_before_exec.clear();
+}
+
+void Scheduler::did_die_in_execve(RecordTask* t) {
+  if (in_exec_tgid == t->tgid()) {
+    in_exec_tgid = 0;
+  }
 }
 
 } // namespace rr
