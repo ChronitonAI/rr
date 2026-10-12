@@ -1,0 +1,14 @@
+source `dirname $0`/util.sh
+# rr doesn't support a tracee that sets the trap flag; recording must say so.
+record $TESTNAME
+if ! grep -q "set the trap flag (TF) in EFLAGS" record.err; then
+  failed ": recording didn't report the trap flag"
+  exit 1
+fi
+# The trace must replay up to there.
+if ! replay; then
+  failed ": replay of the trace failed"
+  cat replay.err
+elif just_check_replay_err && just_check_record_replay_match; then
+  passed_msg "recording failed as expected"
+fi
