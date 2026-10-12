@@ -490,6 +490,11 @@ void Task::did_kill()
   cloned_file_data_fd_child = -1;
 }
 
+void Task::did_die_in_exec() {
+  did_kill();
+  was_reaped_ = true;
+}
+
 /**
  * Must be idempotent.
  */
@@ -1107,9 +1112,14 @@ void Task::post_exec(const string& exe_file) {
 
   extra_registers = ExtraRegisters(registers.arch());
   extra_registers_known = false;
-  ExtraRegisters e = *extra_regs_fallible();
-  e.reset();
-  set_extra_regs(e);
+  // This fails if the task has died (e.g. it was SIGKILLed) since we read
+  // its registers.
+  const ExtraRegisters* maybe_extra = extra_regs_fallible();
+  if (maybe_extra) {
+    ExtraRegisters e = *maybe_extra;
+    e.reset();
+    set_extra_regs(e);
+  }
 
   syscallbuf_child = nullptr;
   syscallbuf_size = 0;
@@ -2525,6 +2535,10 @@ bool Task::did_waitpid(WaitStatus status) {
   in_injectable_signal_stop_ = in_injectable_signal_stop;
   session().accumulate_ticks_processed(more_ticks);
   ticks += more_ticks;
+
+  if (status.ptrace_event() == PTRACE_EVENT_EXEC) {
+    did_exec_stop();
+  }
 
   if (was_reaped_) {
     ASSERT(this, !handled_ptrace_exit_event_);

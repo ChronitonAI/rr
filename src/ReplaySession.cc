@@ -1827,7 +1827,10 @@ Completion ReplaySession::exit_task(ReplayTask* t) {
 
 ReplayTask* ReplaySession::revive_task_for_exec() {
   const Event& ev = trace_frame.event();
-  if (!ev.is_syscall_event() || !ev.Syscall().is_exec()) {
+  // If a non-leader thread exec'd and was killed before the execve returned,
+  // we recorded its exit under the leader's tid, which it had taken over.
+  bool is_exit = ev.type() == EV_EXIT;
+  if (!is_exit && (!ev.is_syscall_event() || !ev.Syscall().is_exec())) {
     FATAL() << "Can't find task, but we're not in an execve";
   }
 
@@ -1847,13 +1850,21 @@ ReplayTask* ReplaySession::revive_task_for_exec() {
   }
 
   ReplayTask* t = static_cast<ReplayTask*>(*tg->task_set().begin());
+  if (is_exit) {
+    int syscallno = t->regs().original_syscallno();
+    ASSERT(t, is_execve_syscall(syscallno, t->arch()) ||
+                  is_execveat_syscall(syscallno, t->arch()))
+        << "Exit of " << trace_frame.tid() << " but " << t->rec_tid
+        << " isn't in an execve";
+  }
   LOG(debug) << "Changing task tid from " << t->rec_tid << " to "
              << trace_frame.tid();
   task_map.erase(t->rec_tid);
   t->rec_tid = trace_frame.tid();
   t->serial = next_task_serial();
   task_map.insert(make_pair(t->rec_tid, t));
-  // The real tid is not changing yet. It will, in process_execve.
+  // The real tid is not changing yet. It will, in process_execve, unless
+  // the task exits first.
   return t;
 }
 
@@ -1953,6 +1964,21 @@ ReplayTask* ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
       process_grow_map(t);
       current_step.action = TSTEP_RETIRE;
       break;
+    case EV_PTRACE_EVENT_STOP:
+    case EV_PTRACE_EVENT_STOP_CONCLUDED: {
+      // The task hasn't run since its syscall's exit, so only the syscall
+      // result register can differ (registers the ptracer wrote at the stop
+      // have been applied, as in recording).
+      Registers r = t->regs();
+      r.set_syscall_result(trace_frame.regs().syscall_result());
+      Registers::Comparison comparison = r.compare_with(trace_frame.regs());
+      ASSERT(t, !comparison.mismatch_count)
+          << "Mismatched registers at " << ev << ", replay vs rec: "
+          << comparison;
+      t->set_regs(trace_frame.regs());
+      current_step.action = TSTEP_RETIRE;
+      break;
+    }
     case EV_SIGNAL: {
       if (skip_next_execution_event) {
         current_step.action = TSTEP_NONE;

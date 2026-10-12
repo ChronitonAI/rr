@@ -207,6 +207,13 @@ public:
   void write_frame(RecordTask* t, const Event& ev, const Registers* registers,
                    const ExtraRegisters* extra_registers);
 
+  /**
+   * True if there are raw-data records that the next frame will carry.
+   */
+  bool has_pending_raw_data() const {
+    return !raw_recs.empty() || !raw_recs_at_end_of_frame.empty();
+  }
+
   enum RecordInTrace { DONT_RECORD_IN_TRACE, RECORD_IN_TRACE };
   enum MappingOrigin {
     SYSCALL_MAPPING,

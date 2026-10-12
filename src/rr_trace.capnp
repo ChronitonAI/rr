@@ -398,5 +398,10 @@ struct Frame {
     patchAfterSyscall @26: Void;
     patchVsyscall @27: Void;
     patchTrappingInstruction @31: Void;
+    # The task stops at a PTRACE_EVENT stop for its ptracer. 'registers' are
+    # its registers at the stop.
+    ptraceEventStop @33 :Void;
+    # The task leaves that stop. 'registers' are its registers from here on.
+    ptraceEventStopConcluded @34 :Void;
   }
 }

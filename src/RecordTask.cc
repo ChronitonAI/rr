@@ -170,6 +170,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       detached_proxy(false),
       emulated_ptracer(nullptr),
       emulated_ptrace_event_msg(0),
+      exec_stop_syscall_result(0),
       emulated_ptrace_options(0),
       emulated_ptrace_cont_command(0),
       emulated_stop_pending(false),
@@ -234,6 +235,10 @@ RecordTask::~RecordTask() {
   for (RecordTask* t : emulated_ptrace_tracees) {
     // XXX emulate PTRACE_O_EXITKILL
     ASSERT(this, t->emulated_ptracer == this);
+    if (t->is_at_exec_stop() && !t->handled_ptrace_exit_event()) {
+      // The kernel detaches the tracee and wakes it up.
+      t->conclude_exec_stop();
+    }
     t->emulated_ptracer = nullptr;
     t->emulated_ptrace_options = 0;
     t->emulated_stop_pending = false;
@@ -402,6 +407,9 @@ void RecordTask::post_exec() {
   // Newly execed tasks always have non-faulting mode (from their point of
   // view, even if rr is secretly causing faults).
   cpuid_mode = 1;
+
+  // An exec makes the task's exit signal SIGCHLD (de_thread()).
+  termination_signal = SIGCHLD;
 }
 
 template <typename Arch> static void do_preload_init_arch(RecordTask* t) {
@@ -783,6 +791,41 @@ vector<remote_code_ptr> RecordTask::syscallbuf_syscall_entry_breakpoints() {
         AddressSpace::RECORDING_AND_REPLAY, arch()));
   }
   return result;
+}
+
+void RecordTask::did_exec_stop() {
+  if (ev().is_syscall_event() && ev().Syscall().is_exec()) {
+    // We're the task that exec'd. The exec has replaced our address space and
+    // our tid now refers to the new image. Switch to the new address space
+    // right away, so that nothing uses state from the old image through our
+    // tid in the meantime (e.g. will_schedule() writing to the old rseq
+    // area). If we didn't exec, we're the old leader and another thread's
+    // exec stop was reported for our tid; RecordSession's
+    // PTRACE_EVENT_EXEC handling deals with that.
+    post_exec();
+    // For an emulated ptracer at the PTRACE_EVENT_EXEC stop we report once
+    // the execve has returned: the return value register as it is here, and
+    // (for PTRACE_GETEVENTMSG) our tid before the exec.
+    exec_stop_syscall_result = regs().syscall_result();
+    unsigned long msg = 0;
+    if (ptrace_if_stopped(PTRACE_GETEVENTMSG, nullptr, &msg)) {
+      emulated_ptrace_event_msg = msg;
+    }
+  }
+}
+
+void RecordTask::conclude_exec_stop() {
+  ASSERT(this, is_at_exec_stop());
+  // Replay has no task for a frame after our EV_EXIT.
+  ASSERT(this, !handled_ptrace_exit_event());
+  // Whatever we'd record here would go to the current task's next frame.
+  ASSERT(this, !trace_writer().has_pending_raw_data());
+  Registers r = regs();
+  // The return value of a successful execve.
+  r.set_syscall_result(0);
+  set_regs(r);
+  record_event(Event::ptrace_event_stop_concluded(), DONT_FLUSH_SYSCALLBUF,
+               DONT_RESET_SYSCALLBUF);
 }
 
 void RecordTask::did_wait() {
@@ -2092,7 +2135,9 @@ void RecordTask::record_event(Event ev, FlushSyscallbuf flush,
     }
   }
 
-  if (trace_writer().clear_fip_fdp()) {
+  // A reaped task is gone; anything we'd read or write through its tid
+  // could belong to another task (see Task::did_die_in_exec()).
+  if (trace_writer().clear_fip_fdp() && !was_reaped()) {
     const ExtraRegisters* maybe_extra = extra_regs_fallible();
     if (maybe_extra) {
       ExtraRegisters extra_registers = *maybe_extra;

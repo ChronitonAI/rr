@@ -2449,11 +2449,28 @@ static void maybe_pause_instead_of_waiting(RecordTask* t,
   t->set_regs(r);
 }
 
+/**
+ * |allow_exited| is for the requests that the kernel accepts for a tracee
+ * that has exited but that the tracer hasn't collected yet (PTRACE_KILL and
+ * PTRACE_INTERRUPT); others fail with ESRCH for it.
+ */
 static RecordTask* verify_ptrace_target(RecordTask* tracer,
                                         TaskSyscallState& syscall_state,
                                         pid_t pid,
-                                        bool require_stopped = true) {
+                                        bool require_stopped = true,
+                                        bool allow_exited = false) {
   RecordTask* tracee = tracer->session().find_task(pid);
+  if (!tracee) {
+    // A dead tracee that's only waiting for the tracer to collect its exit
+    // may be gone from the task map (see
+    // RecordSession::record_death_in_exec()).
+    for (RecordTask* t : tracer->emulated_ptrace_tracees) {
+      if (t->tid == pid && t->already_exited()) {
+        tracee = t;
+        break;
+      }
+    }
+  }
   if (!tracee) {
     LOG(debug) << "tracee pid " << pid << " is unknown to rr";
     syscall_state.emulate_result(-ESRCH);
@@ -2461,6 +2478,15 @@ static RecordTask* verify_ptrace_target(RecordTask* tracer,
   }
   if (tracee->emulated_ptracer != tracer) {
     LOG(debug) << pid << " is not traced by " << tracer->tid;
+    syscall_state.emulate_result(-ESRCH);
+    return nullptr;
+  }
+  if (tracee->already_exited()) {
+    // It's dead, and only waits for the tracer to collect its exit.
+    LOG(debug) << pid << " has exited";
+    if (allow_exited) {
+      return tracee;
+    }
     syscall_state.emulate_result(-ESRCH);
     return nullptr;
   }
@@ -2474,12 +2500,13 @@ static RecordTask* verify_ptrace_target(RecordTask* tracer,
 
 static void prepare_ptrace_cont(RecordTask* tracee, int sig, int command) {
   // We hold a tracee in the middle of its syscall, at a stop we've already
-  // processed, when we report a fork, vfork, clone, exec or exit event for
-  // that syscall to its tracer. Other stops in the middle of a syscall, e.g.
+  // processed, when we report a fork, vfork, clone or exit event for that
+  // syscall to its tracer. Other stops in the middle of a syscall, e.g.
   // after a PTRACE_INTERRUPT, are emulated: the tracee may still be running,
   // or be at a stop we haven't processed yet. The scheduler will deal with
   // those like with any other task.
   bool held = tracee->held_at_emulated_ptrace_event;
+  bool at_exec_stop = tracee->is_at_exec_stop();
   if (sig && (held || tracee->emulated_stop_code.ptrace_event() ||
               tracee->emulated_stop_code.group_stop())) {
     // Linux ignores the signal when the tracer resumes the tracee from a
@@ -2501,10 +2528,29 @@ static void prepare_ptrace_cont(RecordTask* tracee, int sig, int command) {
                                          si.si_signo, NONDETERMINISTIC_SIG))));
   }
 
+  if (at_exec_stop && !tracee->handled_ptrace_exit_event()) {
+    tracee->conclude_exec_stop();
+  }
   tracee->emulated_stop_type = NOT_STOPPED;
   tracee->emulated_stop_pending = false;
   tracee->emulated_stop_code = WaitStatus();
   tracee->emulated_ptrace_cont_command = command;
+
+  if (at_exec_stop) {
+    // The execve returns next, and the kernel reports that as for any
+    // syscall (see syscall_exit_work() and, on aarch64, report_syscall()).
+    // maybe_trigger_emulated_ptrace_syscall_exit_stop() emulates that,
+    // except that it gives a single-step trap after x86's
+    // PTRACE_SYSEMU_SINGLESTEP, where the kernel gives none (see
+    // report_single_step()). Here we keep the kernel's behavior.
+    if (!(is_x86ish(tracee->arch()) &&
+          command == X64Arch::PTRACE_SYSEMU_SINGLESTEP)) {
+      maybe_trigger_emulated_ptrace_syscall_exit_stop(tracee);
+      if (tracee->emulated_stop_type != NOT_STOPPED) {
+        return;
+      }
+    }
+  }
 
   if (held) {
     ASSERT(tracee, tracee->ev().is_syscall_event() &&
@@ -3215,18 +3261,30 @@ static Switchable prepare_ptrace(RecordTask* t,
       break;
     }
     case PTRACE_KILL: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, tid);
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, tid, true,
+                                                true);
       if (tracee) {
-        tracee->kill_if_alive();
+        if (!tracee->already_exited()) {
+          tracee->kill_if_alive();
+        }
         syscall_state.emulate_result(0);
       }
       break;
     }
     case PTRACE_INTERRUPT: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, tid, false);
-      if (tracee) {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, tid, false,
+                                                true);
+      if (tracee && tracee->already_exited()) {
+        // There's nothing to interrupt, but the kernel only fails this if
+        // the tracee wasn't seized.
+        syscall_state.emulate_result(tracee->emulated_ptrace_seized ? 0
+                                                                    : -EIO);
+      } else if (tracee) {
         uint64_t result = 0;
-        if (!tracee->is_stopped()) {
+        if (tracee->emulated_stop_type != NOT_STOPPED) {
+          // The tracee is in a ptrace-stop already, which the kernel leaves
+          // alone.
+        } else if (!tracee->is_stopped()) {
           // Running in a blocked syscall. Forward the PTRACE_INTERRUPT.
           // Regular syscall exit handling will take over from here.
           LOG(debug) << "Interrupting " << tracee->tid;
@@ -3240,12 +3298,11 @@ static Switchable prepare_ptrace(RecordTask* t,
           tracee->apply_group_stop(SIGSTOP);
         } else if (tracee->status().is_syscall()) {
           tracee->emulate_ptrace_stop(tracee->status(), SYSCALL_EXIT_STOP);
-        } else if (tracee->emulated_stop_pending == NOT_STOPPED) {
+        } else {
           // The tracee is stopped from our perspective, but not stopped from
           // the perspective of the ptracer. Emulate a stop now.
           tracee->apply_group_stop(SIGSTOP);
         }
-        // Otherwise, there's nothing to do.
         syscall_state.emulate_result(result);
       }
       break;
@@ -5962,7 +6019,13 @@ static void aarch64_kernel_bug_workaround(RecordTask *t,
     // un-recorded divergence). I'm really hoping to get this fixed
     // in the kernel.
     Registers r = t->regs();
-    r.set_x(7, syscall_state.syscall_entry_registers.x(7));
+    if (t->ev().is_syscall_event() && t->ev().Syscall().is_exec() &&
+        !r.syscall_failed()) {
+      // start_thread() zeroed the new image's registers.
+      r.set_x(7, 0);
+    } else {
+      r.set_x(7, syscall_state.syscall_entry_registers.x(7));
+    }
     t->set_regs(r);
   }
 }

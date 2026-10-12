@@ -479,6 +479,12 @@ void TraceWriter::write_frame(RecordTask* t, const Event& ev,
     case EV_GROW_MAP:
       event.setGrowMap(Void());
       break;
+    case EV_PTRACE_EVENT_STOP:
+      event.setPtraceEventStop(Void());
+      break;
+    case EV_PTRACE_EVENT_STOP_CONCLUDED:
+      event.setPtraceEventStopConcluded(Void());
+      break;
     case EV_SIGNAL:
       to_trace_signal(event.initSignal(), ev);
       break;
@@ -662,6 +668,12 @@ TraceFrame TraceReader::read_frame(FrameTime skip_before) {
       break;
     case trace::Frame::Event::GROW_MAP:
       ret.ev = Event::grow_map();
+      break;
+    case trace::Frame::Event::PTRACE_EVENT_STOP:
+      ret.ev = Event::ptrace_event_stop();
+      break;
+    case trace::Frame::Event::PTRACE_EVENT_STOP_CONCLUDED:
+      ret.ev = Event::ptrace_event_stop_concluded();
       break;
     case trace::Frame::Event::SIGNAL:
       ret.ev = from_trace_signal(EV_SIGNAL, event.getSignal());

@@ -246,8 +246,13 @@ void Session::on_destroy(AddressSpace* vm) {
 }
 
 void Session::on_destroy(Task* t) {
-  DEBUG_ASSERT(task_map.count(t->rec_tid) == 1);
-  task_map.erase(t->rec_tid);
+  auto it = task_map.find(t->rec_tid);
+  // A dead task that a recording keeps for its emulated ptracer can be gone
+  // from task_map already (see RecordSession::record_death_in_exec()), and
+  // another task can have its tid by now.
+  if (it != task_map.end() && it->second == t) {
+    task_map.erase(it);
+  }
 }
 
 void Session::on_create(Task* t) { task_map[t->rec_tid] = t; }

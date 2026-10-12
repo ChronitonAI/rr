@@ -82,6 +82,16 @@ enum EventType {
   // Map memory pages due to a (future) memory access. This is associated
   // with a mmap entry for the new pages.
   EV_GROW_MAP,
+  // The task stops at a PTRACE_EVENT stop for its ptracer, which we report
+  // once we've recorded the syscall's exit (for PTRACE_EVENT_EXEC, see
+  // RecordSession's report_exec_to_ptracer()). The frame has the task's
+  // registers at the stop, which differ from those at the syscall's exit only
+  // in the syscall result register.
+  EV_PTRACE_EVENT_STOP,
+  // The task leaves the stop that EV_PTRACE_EVENT_STOP started, and the
+  // kernel stores the syscall's return value. The frame has the task's
+  // registers from here on.
+  EV_PTRACE_EVENT_STOP_CONCLUDED,
   // Use .signal.
   EV_SIGNAL,
   EV_SIGNAL_DELIVERY,
@@ -191,9 +201,10 @@ struct SignalEvent {
  * the ENTERING_SYSCALL_PTRACE state, allow a context switch so the ptracer
  * can modify tracee registers, then perform ENTERING_SYSCALL (which actually
  * creates the new task or does the exec), allow a context switch so the
- * ptracer can modify the new task or post-exec state in a PTRACE_EVENT_EXEC/
- * CLONE/FORK/VFORK, then perform EXITING_SYSCALL to get into the correct
- * post-syscall state.
+ * ptracer can modify the new task in a PTRACE_EVENT_CLONE/FORK/VFORK stop,
+ * then perform EXITING_SYSCALL to get into the correct post-syscall state.
+ * An exec's PTRACE_EVENT_EXEC stop comes after EXITING_SYSCALL, since replay
+ * switches the task to the new image there.
  *
  * When PTRACE_SYSEMU is used, there will only be one event: an
  * ENTERING_SYSCALL_PTRACE.
@@ -417,6 +428,10 @@ struct Event {
   }
   static Event syscallbuf_reset() { return Event(EV_SYSCALLBUF_RESET); }
   static Event grow_map() { return Event(EV_GROW_MAP); }
+  static Event ptrace_event_stop() { return Event(EV_PTRACE_EVENT_STOP); }
+  static Event ptrace_event_stop_concluded() {
+    return Event(EV_PTRACE_EVENT_STOP_CONCLUDED);
+  }
   static Event exit() { return Event(EV_EXIT); }
   static Event sentinel() { return Event(EV_SENTINEL); }
 

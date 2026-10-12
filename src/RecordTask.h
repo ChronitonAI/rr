@@ -80,6 +80,27 @@ public:
                                const Registers& regs) override;
   virtual void will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
                                      int /*sig*/) override;
+  virtual void did_exec_stop() override;
+  /**
+   * True if a ptracer sees this task at a PTRACE_EVENT_EXEC stop, which we
+   * emulate once the execve has returned (see RecordSession's
+   * report_exec_to_ptracer()).
+   */
+  bool is_at_exec_stop() const {
+    return emulated_stop_type != NOT_STOPPED &&
+           emulated_stop_code.ptrace_event() == PTRACE_EVENT_EXEC;
+  }
+  /**
+   * This task is at a PTRACE_EVENT_EXEC stop and leaves it now, and the
+   * kernel stores the execve's return value. Set the syscall result register
+   * to that and record EV_PTRACE_EVENT_STOP_CONCLUDED. Call this whenever
+   * the stop ends with the task going on (its ptracer resumes it, detaches
+   * or exits), before the emulated stop state is reset and before anything
+   * reports the execve's syscall-exit stop, unless we've handled the task's
+   * exit (and recorded its EV_EXIT). This task need not be the current one,
+   * but no other task's frame can be half-built.
+   */
+  void conclude_exec_stop();
   virtual void did_wait() override;
 
   bool enable_chaos_memory_allocations() const;
@@ -771,6 +792,10 @@ public:
   RecordTask* emulated_ptracer;
   std::set<RecordTask*> emulated_ptrace_tracees;
   uintptr_t emulated_ptrace_event_msg;
+  // The return value register at this task's last PTRACE_EVENT_EXEC stop.
+  // 64-bit x86 kernels leave the -ENOSYS from the syscall entry there;
+  // 32-bit x86 kernels and aarch64 ones have zeroed it.
+  uintptr_t exec_stop_syscall_result;
   // Saved emulated-ptrace signals
   std::vector<siginfo_t> saved_ptrace_siginfos;
   // Code to deliver to ptracer/waiter when it waits. Note that zero can be a

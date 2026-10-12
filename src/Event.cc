@@ -82,6 +82,8 @@ bool Event::record_regs() const {
   switch (type()) {
     case EV_INSTRUCTION_TRAP:
     case EV_PATCH_SYSCALL:
+    case EV_PTRACE_EVENT_STOP:
+    case EV_PTRACE_EVENT_STOP_CONCLUDED:
     case EV_SCHED:
     case EV_SYSCALL:
     case EV_SIGNAL:
@@ -213,6 +215,8 @@ std::string Event::type_name() const {
       CASE(SYSCALLBUF_RESET);
       CASE(PATCH_SYSCALL);
       CASE(GROW_MAP);
+      CASE(PTRACE_EVENT_STOP);
+      CASE(PTRACE_EVENT_STOP_CONCLUDED);
       CASE(DESCHED);
       CASE(SIGNAL);
       CASE(SIGNAL_DELIVERY);

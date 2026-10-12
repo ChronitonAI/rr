@@ -309,6 +309,16 @@ public:
 
   void did_kill();
 
+  /**
+   * Call when this task has died in or because of an exec and its tid may
+   * now refer to another task: the thread-group leader that another
+   * thread's exec killed (and de_thread() reaped), or the thread that
+   * exec'd and took over the leader's tid, and was killed before we could
+   * handle its exec stop. Like did_kill(), and also marks the task as reaped
+   * so nothing touches it through its tid.
+   */
+  void did_die_in_exec();
+
   void unmap_buffers_for(
       AutoRemoteSyscalls& remote, Task* t,
       remote_ptr<struct syscallbuf_hdr> saved_syscallbuf_child);
@@ -406,6 +416,11 @@ public:
    */
   virtual void will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
                                      int /*sig*/) {}
+  /**
+   * Hook called by `did_waitpid` at a PTRACE_EVENT_EXEC stop, right after it
+   * has refreshed the registers and ticks.
+   */
+  virtual void did_exec_stop() {}
   /**
    * Hook called by `did_waitpid`.
    */
