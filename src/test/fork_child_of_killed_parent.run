@@ -1,0 +1,17 @@
+source `dirname $0`/util.sh
+# rr finds the child of a task killed in fork() through
+# /proc/<pid>/task/<tid>/children, which needs CONFIG_PROC_CHILDREN.
+if [[ ! -e /proc/$$/task/$$/children ]]; then
+  echo NOTE: Skipping "'$TESTNAME'" because CONFIG_PROC_CHILDREN is off
+  exit 0
+fi
+# Make rr SIGKILL our child at its PTRACE_EVENT_FORK and PTRACE_EVENT_VFORK
+# stops, before rr reads the new pid.
+RR_KILL_TASK_AT_CLONE_EVENT=1 record $TESTNAME
+replay
+if ! grep -q "^fork parent was killed" record.out ||
+   ! grep -q "^vfork parent was killed" record.out; then
+  failed ": the child wasn't killed"
+else
+  check EXIT-SUCCESS
+fi
