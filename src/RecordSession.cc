@@ -2834,7 +2834,7 @@ void RecordSession::terminate_tracees() {
       LOG(debug) << "Terminating tracee " << t->tid;
       ::kill(t->rec_tid, SIGKILL);
       t->sent_shutdown_kill = true;
-      t->emulate_SIGCONT();
+      t->end_all_emulated_stops();
     }
   }
 }

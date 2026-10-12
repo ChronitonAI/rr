@@ -1305,6 +1305,7 @@ set(BASIC_TESTS
   ptrace_breakpoint
   ptrace_change_patched_syscall
   x86/ptrace_debug_regs
+  ptrace_event_stop_sigcont
   ptrace_exec
   x86/ptrace_exec32
   ptrace_group_stop
@@ -1316,6 +1317,7 @@ set(BASIC_TESTS
   ptrace_signal_during_clone
   ptrace_signals
   ptrace_singlestep
+  ptrace_stop_sigcont
   ptrace_syscall
   ptrace_syscall_clone_untraced
   x86/ptrace_sysemu
@@ -1420,6 +1422,7 @@ set(BASIC_TESTS
   sigrt
   sigstop
   sigstop2
+  sigstop_blocked_thread
   sigsuspend
   sigtrap
   simple_threads_stress
