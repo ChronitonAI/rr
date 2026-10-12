@@ -1137,6 +1137,7 @@ void RecordTask::detach_emulated_ptrace_tracees() {
       // The SIGKILL ends any stop of the process.
       t->thread_group()->stopping_signal = 0;
       t->thread_group()->stop_report_signal = 0;
+      t->thread_group()->continued = false;
     }
     // Linux delivers the signal of a signal-delivery-stop that the ptracer
     // hasn't waited for (only its wait clears the signal).
@@ -1435,9 +1436,29 @@ static bool is_synthetic_SIGCHLD(const siginfo_t& si) {
   return si.si_signo == SIGCHLD && si.si_value.sival_int == SIGCHLD_SYNTHETIC;
 }
 
-void RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
+void RecordTask::maybe_drop_pending_SIGCHLD_notifications() {
+  for (Task* t : thread_group()->task_set()) {
+    auto rt = static_cast<RecordTask*>(t);
+    if (rt->is_signal_pending(SIGCHLD) || rt->has_stashed_sig(SIGCHLD)) {
+      return;
+    }
+  }
+  for (Task* t : thread_group()->task_set()) {
+    for (RecordTask* tracee :
+         static_cast<RecordTask*>(t)->emulated_ptrace_tracees) {
+      tracee->emulated_ptrace_SIGCHLD_pending = false;
+    }
+  }
+  for (ThreadGroup* child_tg : thread_group()->children()) {
+    for (Task* child : child_tg->task_set()) {
+      static_cast<RecordTask*>(child)->emulated_SIGCHLD_pending = false;
+    }
+  }
+}
+
+bool RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
   if (!is_synthetic_SIGCHLD(*si)) {
-    return;
+    return false;
   }
 
   int id = si->si_errno;
@@ -1454,20 +1475,25 @@ void RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
         // This replaces the SIGCHLD_SYNTHETIC in si_value.
         native_si->_sifields._sigchld.si_status_ = it->status;
         records.erase(it);
-        return;
+        return true;
       }
     }
     LOG(warn) << "Can't find the child stop for synthetic SIGCHLD " << id;
-    return;
+    return false;
   }
 
+  // The SIGCHLD is for our process, and any thread can take it, not just
+  // the ptracer.
   RecordTask* from_task = nullptr;
-  for (RecordTask* tracee : emulated_ptrace_tracees) {
-    if (tracee->emulated_ptrace_SIGCHLD_pending) {
-      if (!from_task) {
-        from_task = tracee;
+  for (Task* t : thread_group()->task_set()) {
+    for (RecordTask* tracee :
+         static_cast<RecordTask*>(t)->emulated_ptrace_tracees) {
+      if (tracee->emulated_ptrace_SIGCHLD_pending) {
+        if (!from_task) {
+          from_task = tracee;
+        }
+        tracee->emulated_ptrace_SIGCHLD_pending = false;
       }
-      tracee->emulated_ptrace_SIGCHLD_pending = false;
     }
   }
 
@@ -1487,13 +1513,21 @@ void RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
     if (!from_task) {
       // Maybe the task died after the synthetic SIGCHLD was sent
       LOG(warn) << "Can't find traced task that send synthetic SIGCHLD";
-      return;
+      return false;
     }
   }
 
-  from_task->set_siginfo_for_waited_task<NativeArch>(
-      reinterpret_cast<NativeArch::siginfo_t*>(si));
-  si->si_value.sival_int = 0;
+  // This overwrites the SIGCHLD_SYNTHETIC in si_value: si_status is at the
+  // same place.
+  auto native_si = reinterpret_cast<NativeArch::siginfo_t*>(si);
+  from_task->set_siginfo_for_waited_task<NativeArch>(native_si);
+  if (native_si->si_code == CLD_STOPPED || native_si->si_code == CLD_TRAPPED) {
+    // waitid() reports the whole stop code for a ptrace event or syscall
+    // stop, but a SIGCHLD has just the signal (do_notify_parent_cldstop()).
+    native_si->_sifields._sigchld.si_status_ =
+        from_task->emulated_stop_code.ptrace_signal();
+  }
+  return true;
 }
 
 bool RecordTask::is_waiting_for_ptrace(RecordTask* t) {

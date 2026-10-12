@@ -51,6 +51,7 @@
 #include <sys/mman.h>
 #include <sys/quota.h>
 #include <sys/resource.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
@@ -92,6 +93,7 @@
 #include "RecordSession.h"
 #include "RecordTask.h"
 #include "Scheduler.h"
+#include "SignalfdMonitor.h"
 #include "StdioMonitor.h"
 #include "SysCpuMonitor.h"
 #include "TraceStream.h"
@@ -102,6 +104,7 @@
 #include "kernel_metadata.h"
 #include "kernel_supplement.h"
 #include "log.h"
+#include "record_signal.h"
 #include "util.h"
 
 // muslc defines those, but we want a typedef instead
@@ -565,6 +568,9 @@ struct TaskSyscallState : TaskSyscallStateBase {
    *  make an i386 syscall). Pointers in memory parameters have its size. */
   SupportedArch arch;
 
+  /** For a read, whether it reads from a signalfd */
+  bool read_from_signalfd;
+
   /** Saved syscall-entry registers, used by code paths that modify the
    *  registers temporarily.
    */
@@ -618,6 +624,7 @@ struct TaskSyscallState : TaskSyscallStateBase {
         emulate_wait_group_stop(false),
         emulate_wait_continued(false),
         arch(NativeArch::arch()),
+        read_from_signalfd(false),
         expect_errno(0),
         should_emulate_result(false),
         preparation_done(false),
@@ -4541,6 +4548,11 @@ static Switchable reject_preadv2_pwritev2(RecordTask* t,
   return PREVENT_SWITCH;
 }
 
+static bool is_signalfd(RecordTask* t, int fd) {
+  FileMonitor* monitor = t->fd_table()->get_monitor(fd);
+  return monitor && monitor->type() == FileMonitor::Signalfd;
+}
+
 template <typename Arch>
 static Switchable rec_prepare_syscall_arch(RecordTask* t,
                                            TaskSyscallState& syscall_state,
@@ -5090,6 +5102,8 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       syscall_state.reg_parameter(
           2, ParamSize::from_syscall_result<typename Arch::ssize_t>(
                  (size_t)regs.arg3()));
+      // We may fix up synthetic SIGCHLDs read from a signalfd.
+      syscall_state.read_from_signalfd = is_signalfd(t, fd);
       return ALLOW_SWITCH;
     }
 
@@ -7779,6 +7793,85 @@ static void emulate_SIGCONT_sent_by_tracee(RecordTask* t) {
   }
 }
 
+/**
+ * The synthetic SIGCHLDs we send (see
+ * RecordTask::send_synthetic_SIGCHLD_if_necessary) carry none of the siginfo
+ * that the kernel fills in for a SIGCHLD. We fill it in when we deliver such a
+ * SIGCHLD to a handler (RecordTask::set_siginfo_for_synthetic_SIGCHLD). This
+ * does the same when the tracee takes it some other way. Returns false if |si|
+ * isn't a synthetic SIGCHLD, or if we can't tell what it's for.
+ */
+static bool fix_up_synthetic_SIGCHLD(RecordTask* t, siginfo_t* si) {
+  return si->si_signo == SIGCHLD && si->si_code == SI_QUEUE &&
+         si->si_value.sival_int == SIGCHLD_SYNTHETIC &&
+         t->set_siginfo_for_synthetic_SIGCHLD(si);
+}
+
+/**
+ * Fix up a synthetic SIGCHLD that the tracee took with rt_sigtimedwait().
+ */
+template <typename Arch>
+static void fix_up_synthetic_SIGCHLD_siginfo(
+    RecordTask* t, remote_ptr<typename Arch::siginfo_t> sip) {
+  if (sip.is_null()) {
+    // We can't tell which SIGCHLD the process took.
+    return;
+  }
+  auto tracee_si = t->read_mem(sip);
+  siginfo_t si;
+  memset(&si, 0, sizeof(si));
+  si.si_signo = tracee_si.si_signo;
+  si.si_errno = tracee_si.si_errno;
+  si.si_code = tracee_si.si_code;
+  si.si_value.sival_int = tracee_si._sifields._rt.si_sigval_.sival_int;
+  if (!fix_up_synthetic_SIGCHLD(t, &si)) {
+    return;
+  }
+  tracee_si.si_errno = 0;
+  tracee_si.si_code = si.si_code;
+  memset(&tracee_si._sifields, 0, sizeof(tracee_si._sifields));
+  tracee_si._sifields._sigchld.si_pid_ = si.si_pid;
+  tracee_si._sifields._sigchld.si_uid_ = si.si_uid;
+  tracee_si._sifields._sigchld.si_status_ = si.si_status;
+  t->write_mem(sip, tracee_si);
+}
+
+/**
+ * Fix up the synthetic SIGCHLDs that the tracee read from a signalfd.
+ * (struct signalfd_siginfo is the same for all architectures.) Returns true
+ * if it read a SIGCHLD.
+ */
+static bool fix_up_synthetic_SIGCHLDs_from_signalfd(RecordTask* t,
+                                                    remote_ptr<void> buf,
+                                                    size_t size) {
+  bool read_SIGCHLD = false;
+  auto records = buf.cast<struct signalfd_siginfo>();
+  for (size_t i = 0; i < size / sizeof(struct signalfd_siginfo); ++i) {
+    auto ssi = t->read_mem(records + i);
+    read_SIGCHLD = read_SIGCHLD || ssi.ssi_signo == SIGCHLD;
+    siginfo_t si;
+    memset(&si, 0, sizeof(si));
+    si.si_signo = ssi.ssi_signo;
+    si.si_errno = ssi.ssi_errno;
+    si.si_code = ssi.ssi_code;
+    si.si_value.sival_int = ssi.ssi_int;
+    if (!fix_up_synthetic_SIGCHLD(t, &si)) {
+      continue;
+    }
+    ssi.ssi_errno = 0;
+    ssi.ssi_code = si.si_code;
+    ssi.ssi_pid = si.si_pid;
+    ssi.ssi_uid = si.si_uid;
+    ssi.ssi_status = si.si_status;
+    ssi.ssi_int = 0;
+    ssi.ssi_ptr = 0;
+    ssi.ssi_utime = 0;
+    ssi.ssi_stime = 0;
+    t->write_mem(records + i, ssi);
+  }
+  return read_SIGCHLD;
+}
+
 template <typename Arch>
 static void rec_process_syscall_arch(RecordTask* t,
                                      TaskSyscallState& syscall_state) {
@@ -8226,7 +8319,6 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::preadv2:
     case Arch::pwritev2:
     case Arch::ptrace:
-    case Arch::read:
     case Arch::readv:
     case Arch::rseq:
     case Arch::sched_setaffinity:
@@ -8266,6 +8358,40 @@ static void rec_process_syscall_arch(RecordTask* t,
               : (int)r.arg2();
       if (sig == SIGCONT && !t->regs().syscall_failed()) {
         emulate_SIGCONT_sent_by_tracee(t);
+      }
+      break;
+    }
+
+    case Arch::read: {
+      // The data is still in the buffer we read into, which may be scratch
+      // memory. process_syscall_results copies it to the tracee's buffer and
+      // records it after this.
+      remote_ptr<void> buf = t->regs().arg2();
+      ssize_t result = t->regs().syscall_result_signed();
+      if (result > 0 && syscall_state.read_from_signalfd &&
+          fix_up_synthetic_SIGCHLDs_from_signalfd(t, buf, result)) {
+        // Unlike signal_delivered, we don't send another SIGCHLD for the
+        // notifications that we still owe the process.
+        t->maybe_drop_pending_SIGCHLD_notifications();
+      }
+      // Restore the registers that we may have altered.
+      Registers r = t->regs();
+      r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
+      r.set_arg2(syscall_state.syscall_entry_registers.arg2());
+      r.set_arg3(syscall_state.syscall_entry_registers.arg3());
+      t->set_regs(r);
+      break;
+    }
+
+    case Arch::rt_sigtimedwait_time64:
+    case Arch::rt_sigtimedwait: {
+      // As for read, this may be scratch memory.
+      remote_ptr<typename Arch::siginfo_t> sip = t->regs().arg2();
+      if (t->regs().syscall_result_signed() == SIGCHLD) {
+        fix_up_synthetic_SIGCHLD_siginfo<Arch>(t, sip);
+        // Unlike signal_delivered, we don't send another SIGCHLD for the
+        // notifications that we still owe the process.
+        t->maybe_drop_pending_SIGCHLD_notifications();
       }
       break;
     }
