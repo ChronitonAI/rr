@@ -22,6 +22,7 @@
 #include "Task.h"
 #include "core.h"
 #include "log.h"
+#include "SoftwareTicks.h"
 
 using namespace std;
 
@@ -668,12 +669,15 @@ void AddressSpace::post_exec_syscall(Task* t) {
   map_rr_page(remote);
   // Set up the preload_thread_locals shared area.
   KernelMapping thread_locals = t->session().create_shared_mmap(
-      remote, PRELOAD_THREAD_LOCALS_SIZE, preload_thread_locals_start(),
-      "preload_thread_locals");
+      remote, software_ticks_thread_locals_size(),
+      preload_thread_locals_start(), "preload_thread_locals");
   // If the task died (e.g. it was SIGKILLed), there's no mapping.
   if (thread_locals.size()) {
     mapping_flags_of(preload_thread_locals_start()) |=
         AddressSpace::Mapping::IS_THREAD_LOCALS;
+    // Software ticks: the page's creator parks the countdown
+    // (SoftwareTicks.h).
+    init_software_ticks_slot(t);
   }
 }
 
@@ -1969,11 +1973,13 @@ bool AddressSpace::post_vm_clone(Task* t) {
   // Otherwise, the preload_thread_locals mapping is nonexistent or ours.
   // Recreate it.
   AutoRemoteSyscalls remote(t);
-  t->session().create_shared_mmap(remote, PRELOAD_THREAD_LOCALS_SIZE,
+  t->session().create_shared_mmap(remote, software_ticks_thread_locals_size(),
                                   preload_thread_locals_start(),
                                   "preload_thread_locals");
   mapping_flags_of(preload_thread_locals_start()) |=
       AddressSpace::Mapping::IS_THREAD_LOCALS;
+  // Software ticks: the page's creator parks the countdown (SoftwareTicks.h).
+  init_software_ticks_slot(t);
   return true;
 }
 
