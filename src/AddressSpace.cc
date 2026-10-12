@@ -1446,9 +1446,10 @@ void AddressSpace::unmap_internal(Task* t, remote_ptr<void> addr,
     }
 
     if (m.local_addr) {
-      auto addr = m.local_addr + (rem.start() - m.map.start());
-      auto size = std::min(rem.size(), m.map.size() - (rem.start() - m.map.start()));
-      int ret = munmap(addr, size);
+      // |rem| may start before the mapping.
+      MemoryRange unmapped = m.map.intersect(rem);
+      auto addr = m.local_addr + (unmapped.start() - m.map.start());
+      int ret = munmap(addr, unmapped.size());
       if (ret < 0) {
         FATAL() << "Can't munmap";
       }
@@ -1903,6 +1904,9 @@ AddressSpace::AddressSpace(Session* session, const AddressSpace& o,
     // all local mappings.
     m.second.local_addr = nullptr;
   }
+  // A checkpoint may be taken between an exec and the unmapping of the
+  // buffers that it left behind.
+  regions_pending_unmap = o.regions_pending_unmap;
 
   for (auto& it : o.breakpoints) {
     breakpoints.insert(make_pair(it.first, it.second));
