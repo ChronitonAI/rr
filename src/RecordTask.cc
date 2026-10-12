@@ -204,7 +204,8 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       sent_shutdown_kill(false),
       did_execveat(false),
       tick_request_override((TicksRequest)0),
-      schedule_frozen(false) {
+      schedule_frozen(false),
+      in_desched_handling(false) {
   push_event(Event::sentinel());
   if (session.tasks().empty()) {
     // Initial tracee.
@@ -2295,6 +2296,15 @@ void RecordTask::maybe_restore_original_syscall_registers() {
 }
 
 bool RecordTask::post_vm_clone(CloneReason reason, int flags, Task* origin) {
+  // Share a kill that `origin` armed with RRCALL_ARM_KILL_INHERIT. Doing it
+  // here, once Task::clone() has set us up (e.g. our thread group), means
+  // that no kill point fires for us before we're set up.
+  RecordTask* rt = static_cast<RecordTask*>(origin);
+  if (rt->armed_kill && rt->armed_kill->inherit &&
+      rt->armed_kill->point != RRCALL_KILL_NONE) {
+    armed_kill = rt->armed_kill;
+  }
+
   if (Task::post_vm_clone(reason, flags, origin)) {
     KernelMapping preload_thread_locals_mapping =
       vm()->mapping_of(AddressSpace::preload_thread_locals_start()).map;
@@ -2384,6 +2394,50 @@ bool RecordTask::try_grow_map(remote_ptr<void> addr) {
   LOG(debug) << "try_grow_map " << addr << ": extended map "
              << vm()->mapping_of(addr).map;
   return true;
+}
+
+void RecordTask::arm_kill(int point, uintptr_t arg, bool inherit) {
+  // Tasks that inherited what we had armed before keep it.
+  armed_kill = point == RRCALL_KILL_NONE ? nullptr :
+      make_shared<ArmedKill>(ArmedKill{ point, arg, inherit });
+}
+
+RecordTask::ArmedKill* RecordTask::armed_kill_at(int point) {
+  return armed_kill && armed_kill->point == point ? armed_kill.get() : nullptr;
+}
+
+bool RecordTask::take_armed_kill(int point) {
+  if (!armed_kill_at(point)) {
+    return false;
+  }
+  LOG(debug) << "Kill point " << point << " fires for " << tid;
+  disarm_kill();
+  return true;
+}
+
+bool RecordTask::take_armed_kill(int point, uintptr_t arg) {
+  ArmedKill* kill = armed_kill_at(point);
+  return kill && kill->arg == arg && take_armed_kill(point);
+}
+
+bool RecordTask::count_down_armed_kill(int point) {
+  ArmedKill* kill = armed_kill_at(point);
+  if (!kill) {
+    return false;
+  }
+  if (kill->arg > 1) {
+    --kill->arg;
+    return false;
+  }
+  return take_armed_kill(point);
+}
+
+void RecordTask::disarm_kill() {
+  if (armed_kill) {
+    // Disarm it for the tasks that share it, too.
+    armed_kill->point = RRCALL_KILL_NONE;
+    armed_kill = nullptr;
+  }
 }
 
 } // namespace rr

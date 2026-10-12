@@ -8,6 +8,7 @@
 #include <linux/futex.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 
 #include <algorithm>
 #include <sstream>
@@ -781,6 +782,16 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
       t->post_exec();
       t->session().scheduler().did_exit_execve(t);
 
+      // This is purely for testing purposes. See RRCALL_KILL_AFTER_EXEC_STOP.
+      if (t->take_armed_kill(RRCALL_KILL_AFTER_EXEC_STOP)) {
+        t->tgkill(SIGKILL);
+        // As for SECCOMP_RET_KILL above.
+        last_task_switchable = ALLOW_SWITCH;
+        step_state->continue_type = DONT_CONTINUE;
+        t->wait();
+        return true;
+      }
+
       // Forward ptrace exec notification
       if (t->emulated_ptracer) {
         if (t->emulated_ptrace_options & PTRACE_O_TRACEEXEC) {
@@ -1347,6 +1358,12 @@ void RecordSession::syscall_state_changed(RecordTask* t,
           // on restart.
           t->ev().Syscall().regs = r;
         }
+        // This is purely for testing purposes. See
+        // RRCALL_KILL_BEFORE_EXEC_EXIT_EVENT.
+        if (t->ev().Syscall().is_exec() && !t->regs().syscall_failed() &&
+            t->take_armed_kill(RRCALL_KILL_BEFORE_EXEC_EXIT_EVENT)) {
+          t->tgkill(SIGKILL);
+        }
         t->record_current_event();
 
         /* If we're not going to restart this syscall, we're
@@ -1418,7 +1435,36 @@ void RecordSession::check_initial_task_syscalls(RecordTask* t,
   }
 }
 
+bool RecordSession::kill_exec_task_for_testing(pid_t rec_tid, int point) {
+  ThreadGroup* tg = find_thread_group(rec_tid);
+  if (!tg) {
+    return false;
+  }
+  // Several threads of the group can be in an execve at once (the kernel
+  // only serializes them later on), so try each of them.
+  for (Task* tt : tg->task_set()) {
+    RecordTask* rt = static_cast<RecordTask*>(tt);
+    if (rt->ev().is_syscall_event() && rt->ev().Syscall().is_exec() &&
+        rt->take_armed_kill(point)) {
+      syscall(SYS_tgkill, rec_tid, rec_tid, SIGKILL);
+      return true;
+    }
+  }
+  return false;
+}
+
 RecordTask* RecordSession::revive_task_for_exec(pid_t rec_tid) {
+  // This is purely for testing purposes. See
+  // RRCALL_KILL_BEFORE_EXEC_GETEVENTMSG(_AT_EXIT_STOP).
+  if (kill_exec_task_for_testing(
+          rec_tid, RRCALL_KILL_BEFORE_EXEC_GETEVENTMSG_AT_EXIT_STOP)) {
+    WaitOptions options(rec_tid);
+    options.consume = false;
+    WaitManager::wait_stop_or_exit(options);
+  } else {
+    kill_exec_task_for_testing(rec_tid, RRCALL_KILL_BEFORE_EXEC_GETEVENTMSG);
+  }
+
   unsigned long msg = 0;
   int ret =
       ptrace(_ptrace_request(PTRACE_GETEVENTMSG), rec_tid, nullptr, &msg);
@@ -2597,6 +2643,21 @@ RecordSession::~RecordSession() {
   kill_all_tasks();
 }
 
+/**
+ * This is purely for testing purposes. See RRCALL_KILL_BEFORE_INITIAL_EXEC.
+ * record_step() calls this each time it takes up `t`. Returns true if we
+ * killed t.
+ */
+static bool maybe_kill_task_before_initial_exec(RecordTask* t) {
+  if (t->session().done_initial_exec() ||
+      !t->count_down_armed_kill(RRCALL_KILL_BEFORE_INITIAL_EXEC)) {
+    return false;
+  }
+  t->tgkill(SIGKILL);
+  t->wait();
+  return true;
+}
+
 RecordSession::RecordResult RecordSession::record_step() {
   RecordResult result;
 
@@ -2662,7 +2723,9 @@ RecordSession::RecordResult RecordSession::record_step() {
     t->log_pending_events();
   }
 
-  if (handle_ptrace_exit_event(t)) {
+  if (handle_ptrace_exit_event(t) ||
+      (maybe_kill_task_before_initial_exec(t) &&
+       handle_ptrace_exit_event(t))) {
     // t may have been deleted.
     last_task_switchable = ALLOW_SWITCH;
     return result;
