@@ -91,8 +91,16 @@ int main(void) {
   uintptr_t saved_ip;
   siginfo_t* siginfo;
   int dummy[4] = { 1, 2, 3, 4 };
+  int seized_pipe[2];
+  char ch = 'x';
 
+  test_assert(0 == pipe(seized_pipe));
   if (0 == (child = fork())) {
+    /* Wait until we're seized, so that the SIGSTOP below stops us in a
+       signal-delivery-stop for our tracer. (If we stopped first, the seize
+       would report a PTRACE_EVENT_STOP, and our process would stay stopped
+       after the tracer detaches.) */
+    test_assert(1 == read(seized_pipe[0], &ch, 1));
     /* Ensure XMM registers are modified so that ptrace will read
        the real registers, not stale registers. Working around kernel bug.
        Also, puts them in a known state in case they were actually used.
@@ -128,6 +136,7 @@ int main(void) {
   }
 
   test_assert(0 == ptrace(PTRACE_SEIZE, child, NULL, NULL));
+  test_assert(1 == write(seized_pipe[1], &ch, 1));
   test_assert(child == waitpid(child, &status, 0));
   test_assert(status == ((SIGSTOP << 8) | 0x7f));
 

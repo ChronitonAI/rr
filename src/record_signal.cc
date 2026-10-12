@@ -1040,6 +1040,7 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
     // or not the signal is delivered (a ptracer may suppress it, or the
     // process may ignore it). See prepare_signal() in kernel/signal.c.
     t->thread_group()->stopping_signal = 0;
+    t->thread_group()->stop_report_signal = 0;
   }
 
   if (t->take_signal_ignored_before_ptrace_attach(sig)) {
@@ -1049,6 +1050,7 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
     LOG(debug) << "Not reporting " << signal_name(sig)
                << " from before the ptracer attached";
   } else if (t->emulate_ptrace_stop(WaitStatus::for_stop_sig(sig), si)) {
+    t->emulated_stop_holds_signal = true;
     // Record an event so that replay progresses the tracee to the
     // current point before we notify the tracer.
     // If the signal is deterministic, record it as an EV_SIGNAL so that

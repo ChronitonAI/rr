@@ -554,6 +554,10 @@ struct TaskSyscallState : TaskSyscallStateBase {
   // process's id.
   bool emulate_wait_for_ptrace_stop;
 
+  /** When emulate_wait_for_child is set, report the group-stop of its
+   *  process (ThreadGroup::stop_report_signal) */
+  bool emulate_wait_group_stop;
+
   /** The arch of the syscall (which an x86-64 task can make with int $0x80 to
    *  make an i386 syscall). Pointers in memory parameters have its size. */
   SupportedArch arch;
@@ -608,6 +612,7 @@ struct TaskSyscallState : TaskSyscallStateBase {
       : t(nullptr),
         emulate_wait_for_child(nullptr),
         emulate_wait_for_ptrace_stop(false),
+        emulate_wait_group_stop(false),
         arch(NativeArch::arch()),
         expect_errno(0),
         should_emulate_result(false),
@@ -2546,6 +2551,7 @@ static bool maybe_emulate_wait(RecordTask* t, TaskSyscallState& syscall_state) {
       if (t->is_waiting_for_ptrace(child) && child->emulated_stop_pending) {
         syscall_state.emulate_wait_for_child = child;
         syscall_state.emulate_wait_for_ptrace_stop = true;
+        syscall_state.emulate_wait_group_stop = false;
         return true;
       }
     }
@@ -2563,11 +2569,10 @@ static bool maybe_emulate_wait(RecordTask* t, TaskSyscallState& syscall_state) {
     }
     for (Task* child : child_process->task_set()) {
       auto rchild = static_cast<RecordTask*>(child);
-      if (rchild->emulated_stop_type == NOT_STOPPED ||
-          is_traced_by_thread_group_of(rchild, t)) {
-        continue;
-      }
-      if (!(t->in_wait_options & WUNTRACED) && rchild->emulated_stop_type != CHILD_STOP) {
+      // Group-stops are reported for the whole process, below. The emulated
+      // stop of a traced child is for its ptracer, above.
+      if (rchild->emulated_stop_type != CHILD_STOP ||
+          rchild->emulated_ptracer) {
         continue;
       }
       if (!rchild->emulated_stop_pending || !t->is_waiting_for(rchild)) {
@@ -2575,6 +2580,34 @@ static bool maybe_emulate_wait(RecordTask* t, TaskSyscallState& syscall_state) {
       }
       syscall_state.emulate_wait_for_child = rchild;
       syscall_state.emulate_wait_for_ptrace_stop = false;
+      syscall_state.emulate_wait_group_stop = false;
+      return true;
+    }
+  }
+
+  if (t->in_wait_options & WUNTRACED) {
+    for (ThreadGroup* child_process : t->thread_group()->children()) {
+      if (!child_process->stop_report_signal) {
+        continue;
+      }
+      RecordTask* rchild = nullptr;
+      for (Task* child : child_process->task_set()) {
+        auto rc = static_cast<RecordTask*>(child);
+        if (!rchild || rc->tid == child_process->tgid) {
+          rchild = rc;
+        }
+      }
+      // Linux looks only at the child's main thread here: if our process
+      // traces it, Linux reports its ptrace stops to us instead
+      // (wait_consider_task()).
+      if (!rchild || !t->is_waiting_for(rchild) ||
+          (rchild->emulated_ptracer &&
+           rchild->emulated_ptracer->thread_group() == t->thread_group())) {
+        continue;
+      }
+      syscall_state.emulate_wait_for_child = rchild;
+      syscall_state.emulate_wait_for_ptrace_stop = false;
+      syscall_state.emulate_wait_group_stop = true;
       return true;
     }
   }
@@ -3395,12 +3428,20 @@ static Switchable prepare_ptrace(RecordTask* t,
     case PTRACE_DETACH: {
       RecordTask* tracee = verify_ptrace_target(t, syscall_state, tid);
       if (tracee) {
+        // If the tracee's process is stopped, Linux puts the tracee back into
+        // the group-stop (see stop_again_after_ptrace_detach). We don't
+        // deliver the signal passed with PTRACE_DETACH then.
+        bool stop_again = tracee->should_stop_again_after_ptrace_detach();
         tracee->set_syscallbuf_locked(0);
         tracee->emulated_ptrace_options = 0;
         tracee->emulated_ptrace_cont_command = 0;
         tracee->emulated_stop_pending = false;
-        prepare_ptrace_cont(tracee, t->regs().arg4(), 0);
+        prepare_ptrace_cont(tracee, stop_again ? 0 : t->regs().arg4(), 0);
         tracee->set_emulated_ptracer(nullptr);
+        tracee->emulated_ptrace_seized = false;
+        if (stop_again) {
+          tracee->stop_again_after_ptrace_detach();
+        }
         syscall_state.emulate_result(0);
       }
       break;
@@ -4212,9 +4253,17 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
     new_task->emulated_ptrace_options = t->emulated_ptrace_options;
     t->emulated_ptrace_event_msg = new_task->rec_tid;
     t->emulate_ptrace_stop(WaitStatus::for_ptrace_event(ptrace_event));
-    // ptrace(2) man page says that SIGSTOP is used here, but it's really
-    // SIGTRAP (in 4.4.4-301.fc23.x86_64 anyway).
-    new_task->apply_group_stop(SIGTRAP);
+    if (new_task->emulated_ptrace_seized) {
+      // A seized child starts with a PTRACE_EVENT_STOP, which reports
+      // SIGTRAP.
+      new_task->apply_group_stop(SIGTRAP);
+    } else {
+      // Linux queues a SIGSTOP for any other child (ptrace_init_task()), so
+      // it starts with the signal-delivery-stop of that SIGSTOP.
+      new_task->emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGSTOP),
+                                    SIGNAL_DELIVERY_STOP, nullptr, SI_USER);
+      new_task->emulated_stop_holds_signal = true;
+    }
     switchable = ALLOW_SWITCH;
   }
 
@@ -8180,11 +8229,13 @@ static void rec_process_syscall_arch(RecordTask* t,
       RecordTask* tracee = syscall_state.emulate_wait_for_child;
       if (tracee) {
         // Finish emulation of ptrace result or stop-signal
+        bool group_stop = syscall_state.emulate_wait_group_stop;
+        ThreadGroup* tg = tracee->thread_group().get();
         Registers r = t->regs();
         // A wait for a ptrace stop returns the tracee's tid, a wait for the
         // stop of a child process its pid.
-        pid_t pid = syscall_state.emulate_wait_for_ptrace_stop ? tracee->tid
-                                                               : tracee->tgid();
+        pid_t pid =
+            syscall_state.emulate_wait_for_ptrace_stop ? tracee->tid : tg->tgid;
         r.set_syscall_result(syscallno == Arch::waitid ? 0 : pid);
         t->set_regs(r);
         if (syscallno == Arch::waitid) {
@@ -8193,19 +8244,39 @@ static void rec_process_syscall_arch(RecordTask* t,
             typename Arch::siginfo_t si;
             memset(&si, 0, sizeof(si));
             si.si_signo = SIGCHLD;
-            tracee->set_siginfo_for_waited_task<Arch>(&si);
+            if (group_stop) {
+              si.si_code = CLD_STOPPED;
+              si._sifields._sigchld.si_pid_ = tg->tgid;
+              si._sifields._sigchld.si_uid_ = getuid();
+              si._sifields._sigchld.si_status_ = tg->stop_report_signal;
+            } else {
+              tracee->set_siginfo_for_waited_task<Arch>(&si);
+            }
             t->write_mem(sip, si);
           }
         } else {
           remote_ptr<int> statusp = r.arg2();
           if (!statusp.is_null()) {
-            t->write_mem(statusp, tracee->emulated_stop_code.get());
+            WaitStatus status =
+                group_stop ? WaitStatus::for_stop_sig(tg->stop_report_signal)
+                           : tracee->emulated_stop_code;
+            t->write_mem(statusp, status.get());
           }
         }
         if (syscallno == Arch::waitid && (r.arg4() & WNOWAIT)) {
           // Leave the child in a waitable state
         } else {
-          if (syscall_state.emulate_wait_for_ptrace_stop) {
+          if (group_stop) {
+            // The real parent waited for the process's group-stop.
+            tg->stop_report_signal = 0;
+            for (Task* thread : tg->task_set()) {
+              auto rt = static_cast<RecordTask*>(thread);
+              if (!rt->emulated_ptracer &&
+                  rt->emulated_stop_type == GROUP_STOP) {
+                rt->emulated_stop_pending = false;
+              }
+            }
+          } else if (syscall_state.emulate_wait_for_ptrace_stop) {
             tracee->emulated_stop_pending = false;
           } else {
             // The job-control stop of the process. The stops of threads

@@ -1326,6 +1326,7 @@ set(BASIC_TESTS
   ptrace_exec
   x86/ptrace_exec32
   ptrace_group_stop
+  ptrace_group_stop_real_parent
   ptrace_interrupt_syscall_stops
   ptrace_interrupt_syscall
   ptrace_kill_grandtracee
@@ -1363,8 +1364,14 @@ set(BASIC_TESTS
   ptrace_wnohang
   ptrace_wnohang_poll
   ptracer_death
+  ptracer_death_event_stop
+  ptracer_death_group_stop
+  ptracer_death_interrupt
+  ptracer_death_leader
   ptracer_death_multithread
   ptracer_death_multithread_peer
+  ptracer_death_signal
+  ptracer_death_syscall_stop
   # pivot_root ... disabled because it fails when run as root and does nothing otherwise
   quotactl
   x86/rdtsc
