@@ -431,6 +431,13 @@ name:                              \
         .cfi_endproc;                                           \
         .size name, .-name
 
+/* The hooks below run instructions of the application that the syscall
+   patching displaced, which can access the application's memory. rr needs to
+   know where they are. */
+        .global _syscallbuf_hook_trampolines_start
+        .hidden _syscallbuf_hook_trampolines_start
+_syscallbuf_hook_trampolines_start:
+
 /* See note above on what __morestack is for */
 .global __morestack
 .hidden __morestack
@@ -684,6 +691,10 @@ SYSCALLHOOK_END(_syscall_hook_trampoline_48_89_fb)
 SYSCALLHOOK_START(_syscall_hook_trampoline_nops)
         callq __morestack
 SYSCALLHOOK_END(_syscall_hook_trampoline_nops)
+
+        .global _syscallbuf_hook_trampolines_end
+        .hidden _syscallbuf_hook_trampolines_end
+_syscallbuf_hook_trampolines_end:
 
 #elif defined(__aarch64__)
         .text

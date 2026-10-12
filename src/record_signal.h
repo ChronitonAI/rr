@@ -17,6 +17,13 @@ void disarm_desched_event(RecordTask* t);
 void arm_desched_event(RecordTask* t);
 bool desched_event_armed(RecordTask *t);
 bool handle_syscallbuf_breakpoint(RecordTask* t);
+/**
+ * Called when |t| stops for a SIGTRAP. Returns true if the SIGTRAP came from
+ * a hardware breakpoint or watchpoint in |t|'s debug registers (set by its
+ * ptracer) that triggered in syscallbuf code. Then SIGTRAP's handler and
+ * blocked-ness have been restored and the caller must drop the signal.
+ */
+bool handle_syscallbuf_debug_trap(RecordTask* t);
 
 enum SignalBlocked { SIG_UNBLOCKED = 0, SIG_BLOCKED = 1 };
 enum SignalHandled { SIGNAL_HANDLED, SIGNAL_PTRACE_STOP, DEFER_SIGNAL };
