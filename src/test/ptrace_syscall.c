@@ -33,13 +33,33 @@ int main(void) {
   test_assert(child == waitpid(child, &status, 0));
   test_assert(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
 
+#ifdef PTRACE_GET_SYSCALL_INFO
+  struct ptrace_syscall_info* info;
+  /* At a stop that isn't a syscall stop, Linux returns op, arch,
+     instruction_pointer and stack_pointer. */
+  ptrace_getregs(child, &regs);
+  ALLOCATE_GUARD(info, 'a');
+  memset(info, 0xff, sizeof(*info));
+  ret = ptrace(PTRACE_GET_SYSCALL_INFO, child, sizeof(*info), info);
+  if (ret >= 0) {
+    test_assert(offsetof(struct ptrace_syscall_info, entry) == ret);
+    test_assert(info->op == PTRACE_SYSCALL_INFO_NONE);
+    test_assert(info->arch != 0xffffffff);
+    test_assert(info->instruction_pointer == (uintptr_t)regs.IP);
+    test_assert(info->stack_pointer == (uintptr_t)regs.SP);
+    test_assert(info->entry.nr == (uint64_t)-1);
+  } else {
+    test_assert(errno == EIO);
+  }
+  VERIFY_GUARD(info);
+#endif
+
   test_assert(0 == ptrace(PTRACE_SYSCALL, child, NULL, (void*)0));
   test_assert(child == waitpid(child, &status, 0));
   test_assert(status == (((0x80 | SIGTRAP) << 8) | 0x7f));
   ptrace_getregs(child, &regs);
 
 #ifdef PTRACE_GET_SYSCALL_INFO
-  struct ptrace_syscall_info *info;
   ALLOCATE_GUARD(info, 'a');
   ret = ptrace(PTRACE_GET_SYSCALL_INFO, child, sizeof(*info), info);
   if (ret > 0) {
@@ -104,6 +124,33 @@ int main(void) {
   regs.SYSCALL_RESULT = uid + 1;
   ptrace_setregs(child, &regs);
 
+  test_assert(0 == ptrace(PTRACE_CONT, child, NULL, (void*)0));
+  test_assert(child == waitpid(child, &status, 0));
+  test_assert(WIFEXITED(status) && WEXITSTATUS(status) == 77);
+
+  /* Without PTRACE_O_TRACESYSGOOD, Linux reports op
+     PTRACE_SYSCALL_INFO_NONE at syscall stops. */
+  if (0 == (child = fork())) {
+    kill(getpid(), SIGSTOP);
+    return 77;
+  }
+  test_assert(0 == ptrace(PTRACE_SEIZE, child, NULL, NULL));
+  test_assert(child == waitpid(child, &status, 0));
+  test_assert(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+  test_assert(0 == ptrace(PTRACE_SYSCALL, child, NULL, (void*)0));
+  test_assert(child == waitpid(child, &status, 0));
+  test_assert(status == ((SIGTRAP << 8) | 0x7f));
+#ifdef PTRACE_GET_SYSCALL_INFO
+  ALLOCATE_GUARD(info, 'a');
+  ret = ptrace(PTRACE_GET_SYSCALL_INFO, child, sizeof(*info), info);
+  if (ret >= 0) {
+    test_assert(offsetof(struct ptrace_syscall_info, entry) == ret);
+    test_assert(info->op == PTRACE_SYSCALL_INFO_NONE);
+  } else {
+    test_assert(errno == EIO);
+  }
+  VERIFY_GUARD(info);
+#endif
   test_assert(0 == ptrace(PTRACE_CONT, child, NULL, (void*)0));
   test_assert(child == waitpid(child, &status, 0));
   test_assert(WIFEXITED(status) && WEXITSTATUS(status) == 77);
