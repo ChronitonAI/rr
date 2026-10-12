@@ -80,17 +80,14 @@ static void record_robust_futex_change(
  * TID, not the actual TID of the dying task.
  */
 template <typename Arch>
-static void record_robust_futex_changes_arch(RecordTask* t) {
-  if (t->did_record_robust_futex_changes) {
-    return;
-  }
-  t->did_record_robust_futex_changes = true;
-
-  auto head_ptr = t->robust_list().cast<typename Arch::robust_list_head>();
+static void record_robust_futex_changes_arch(RecordTask* t,
+                                             remote_ptr<void> list,
+                                             size_t len) {
+  auto head_ptr = list.cast<typename Arch::robust_list_head>();
   if (head_ptr.is_null()) {
     return;
   }
-  ASSERT(t, t->robust_list_len() == sizeof(typename Arch::robust_list_head));
+  ASSERT(t, len == sizeof(typename Arch::robust_list_head));
   bool ok = true;
   auto head = t->read_mem(head_ptr, &ok);
   if (!ok) {
@@ -98,8 +95,11 @@ static void record_robust_futex_changes_arch(RecordTask* t) {
   }
   record_robust_futex_change<Arch>(t, head,
                                    mask_low_bit(head.list_op_pending.rptr()));
+  // Like the kernel, give up on a list that's too long or has a cycle that
+  // doesn't lead back to the head.
+  int limit = ROBUST_LIST_LIMIT;
   for (auto current = mask_low_bit(head.list.next.rptr());
-       current.as_int() != head_ptr.as_int();) {
+       current.as_int() != head_ptr.as_int() && limit > 0; --limit) {
     record_robust_futex_change<Arch>(t, head, current);
     auto next = t->read_mem(current, &ok);
     if (!ok) {
@@ -109,8 +109,24 @@ static void record_robust_futex_changes_arch(RecordTask* t) {
   }
 }
 
+static void record_robust_futex_list_changes(RecordTask* t, SupportedArch arch,
+                                             remote_ptr<void> list,
+                                             size_t len) {
+  RR_ARCH_FUNCTION(record_robust_futex_changes_arch, arch, t, list, len);
+}
+
 static void record_robust_futex_changes(RecordTask* t) {
-  RR_ARCH_FUNCTION(record_robust_futex_changes_arch, t->arch(), t);
+  if (t->did_record_robust_futex_changes) {
+    return;
+  }
+  t->did_record_robust_futex_changes = true;
+
+  record_robust_futex_list_changes(t, t->arch(), t->robust_list(),
+                                   t->robust_list_len());
+  // An x86-64 task can also have a list from an i386 set_robust_list()
+  // (int $0x80), which the kernel processes too.
+  record_robust_futex_list_changes(t, x86, t->compat_robust_list(),
+                                   t->compat_robust_list_len());
 }
 
 static bool looks_like_syscall_entry(RecordTask* t) {
@@ -526,7 +542,8 @@ void RecordSession::handle_seccomp_trap(RecordTask* t,
   // The architecture may be wrong, but that's ok, because an actual syscall
   // entry did happen, so the registers are already updated according to the
   // architecture of the system call.
-  t->canonicalize_regs(t->detect_syscall_arch());
+  SupportedArch syscall_arch = t->detect_syscall_arch();
+  t->canonicalize_regs(syscall_arch);
   t->apply_syscall_entry_regs();
 
   Registers r = t->regs();
@@ -588,7 +605,7 @@ void RecordSession::handle_seccomp_trap(RecordTask* t,
   si.native_api.si_signo = SIGSYS;
   si.native_api.si_errno = seccomp_data;
   si.native_api.si_code = SYS_SECCOMP;
-  si.native_api._sifields._sigsys._arch = to_audit_arch(r.arch());
+  si.native_api._sifields._sigsys._arch = to_audit_arch(syscall_arch);
   si.native_api._sifields._sigsys._syscall = syscallno;
   // Documentation says that si_call_addr is the address of the syscall
   // instruction, but in tests it's immediately after the syscall
@@ -1052,16 +1069,17 @@ static void syscall_not_restarted(RecordTask* t) {
  * syscall interruption, whether or whether not a syscall was
  * restarted.
  */
-static bool maybe_restart_syscall(RecordTask* t) {
-  if (is_restart_syscall_syscall(t->regs().original_syscallno(), t->arch())) {
+static bool maybe_restart_syscall(RecordTask* t, SupportedArch syscall_arch) {
+  if (is_restart_syscall_syscall(t->regs().original_syscallno(),
+                                 syscall_arch)) {
     LOG(debug) << "  " << t->tid << ": SYS_restart_syscall'ing " << t->ev();
   }
-  if (t->is_syscall_restart()) {
+  if (t->is_syscall_restart(syscall_arch)) {
     t->ev().transform(EV_SYSCALL);
     Registers regs = t->regs();
     regs.set_original_syscallno(t->ev().Syscall().regs.original_syscallno());
     t->set_regs(regs);
-    t->canonicalize_regs(t->arch());
+    t->canonicalize_regs(t->ev().Syscall().arch());
     return true;
   }
   if (EV_SYSCALL_INTERRUPTION == t->ev().type()) {
@@ -1091,8 +1109,10 @@ static void maybe_discard_syscall_interruption(RecordTask* t, intptr_t ret) {
     syscall_not_restarted(t);
   } else if (t->arch() == x86 || t->arch() == x86_64) {
     SupportedArch arch;
-    if (get_syscall_instruction_arch(t, t->regs().ip(), &arch) && arch == t->arch() &&
-        (syscallno == ret || is_restart_syscall_syscall(ret, t->ev().Syscall().arch()))) {
+    if (get_syscall_instruction_arch(t, t->regs().ip(), &arch) &&
+        arch == t->ev().Syscall().arch() &&
+        (syscallno == ret ||
+         is_restart_syscall_syscall(ret, t->ev().Syscall().arch()))) {
       return;
     }
     syscall_not_restarted(t);
@@ -1112,8 +1132,10 @@ static void copy_syscall_arg_regs(Registers* to, const Registers& from) {
   to->set_arg6(from.arg6());
 }
 
-static void maybe_trigger_emulated_ptrace_syscall_exit_stop(RecordTask* t) {
+static void maybe_trigger_emulated_ptrace_syscall_exit_stop(
+    RecordTask* t, SupportedArch syscall_arch) {
   if (t->emulated_ptrace_cont_command == PTRACE_SYSCALL) {
+    t->emulated_stop_syscall_arch = syscall_arch;
     t->emulate_ptrace_stop(WaitStatus::for_syscall(t), SYSCALL_EXIT_STOP);
   } else if (is_ptrace_any_singlestep(t->arch(), t->emulated_ptrace_cont_command)) {
     // Deliver the singlestep trap now that we've finished executing the
@@ -1141,6 +1163,8 @@ static bool is_in_privileged_syscall(RecordTask* t) {
 
 void RecordSession::syscall_state_changed(RecordTask* t,
                                           StepState* step_state) {
+  SupportedArch syscall_arch = t->ev().Syscall().arch();
+  Task::SyscallArchScope scope(t, syscall_arch);
   switch (t->ev().Syscall().state) {
     case ENTERING_SYSCALL_PTRACE:
       debug_exec_state("EXEC_SYSCALL_ENTRY_PTRACE", t);
@@ -1164,7 +1188,7 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         if (t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
           ASSERT(t, t->ip() == r.ip());
           t->set_regs(orig_regs);
-          maybe_trigger_emulated_ptrace_syscall_exit_stop(t);
+          maybe_trigger_emulated_ptrace_syscall_exit_stop(t, syscall_arch);
         }
         return;
       }
@@ -1244,7 +1268,6 @@ void RecordSession::syscall_state_changed(RecordTask* t,
 
       DEBUG_ASSERT(t->stop_sig() == 0);
 
-      SupportedArch syscall_arch = t->ev().Syscall().arch();
       int syscallno = t->ev().Syscall().number;
       intptr_t retval = t->regs().syscall_result_signed();
 
@@ -1313,10 +1336,10 @@ void RecordSession::syscall_state_changed(RecordTask* t,
 
         /* TODO: is there any reason a restart_syscall can't
          * be interrupted by a signal and itself restarted? */
-        bool may_restart = !is_restart_syscall_syscall(syscallno, t->arch())
+        bool may_restart = !is_restart_syscall_syscall(syscallno, syscall_arch)
                            // SYS_pause is either interrupted or
                            // never returns.  It doesn't restart.
-                           && !is_pause_syscall(syscallno, t->arch()) &&
+                           && !is_pause_syscall(syscallno, syscall_arch) &&
                            t->regs().syscall_may_restart() &&
                            !return_normally_from_wait;
         /* no need to process the syscall in case its
@@ -1383,7 +1406,7 @@ void RecordSession::syscall_state_changed(RecordTask* t,
       step_state->continue_type = DONT_CONTINUE;
 
       if (!is_in_privileged_syscall(t)) {
-        maybe_trigger_emulated_ptrace_syscall_exit_stop(t);
+        maybe_trigger_emulated_ptrace_syscall_exit_stop(t, syscall_arch);
       }
       return;
     }
@@ -1868,6 +1891,9 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
         Event *prev_ev = t->prev_ev();
         if (can_switch == PREVENT_SWITCH && !has_other_signals && prev_ev &&
             EV_SYSCALL_INTERRUPTION == prev_ev->type()) {
+          // The interrupted syscall's arch, which may not be the task's
+          // (an x86-64 task can make i386 syscalls with int $0x80).
+          SupportedArch syscall_arch = prev_ev->Syscall().arch();
           switch (prev_ev->Syscall().regs.syscall_result_signed()) {
             case -ERESTARTNOHAND:
             case -ERESTARTSYS:
@@ -1875,7 +1901,7 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
               r.set_syscallno(r.original_syscallno());
               break;
             case -ERESTART_RESTARTBLOCK:
-              r.set_syscallno(syscall_number_for_restart_syscall(t->arch()));
+              r.set_syscallno(syscall_number_for_restart_syscall(syscall_arch));
               break;
           }
           // On aarch64, the kernel modifies the registers before the signal stop.
@@ -1883,7 +1909,7 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
           // before the syscall.
           // [1] https://github.com/torvalds/linux/blob/caffb99b6929f41a69edbb5aef3a359bf45f3315/arch/arm64/kernel/signal.c#L855-L862
           if (t->arch() != aarch64)
-            r.set_ip(r.ip().decrement_by_syscall_insn_length(t->arch()));
+            r.set_ip(r.ip().decrement_by_syscall_insn_length(syscall_arch));
           // Now that we've mucked with the registers, we can't switch tasks. That
           // could allow more signals to be generated, breaking our assumption
           // that we are the last signal.
@@ -2106,6 +2132,7 @@ static bool is_ptrace_any_sysemu(SupportedArch arch, int command)
 bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
                                           RecordResult* step_result,
                                           SupportedArch syscall_arch) {
+  Task::SyscallArchScope scope(t, syscall_arch);
   if (const RecordTask::StashedSignal* sig = t->stashed_sig_not_synthetic_SIGCHLD()) {
     // The only four cases where we allow a stashed signal to be pending on
     // syscall entry are:
@@ -2135,7 +2162,7 @@ bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
   }
 
   // We just entered a syscall.
-  if (!maybe_restart_syscall(t)) {
+  if (!maybe_restart_syscall(t, syscall_arch)) {
     if (syscall_seccomp_ordering_ == PTRACE_SYSCALL_BEFORE_SECCOMP_UNKNOWN &&
         t->seccomp_bpf_enabled) {
       // We received a PTRACE_SYSCALL notification before the seccomp
@@ -2172,6 +2199,7 @@ bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
         t->emulated_ptrace_cont_command)) &&
       !is_in_privileged_syscall(t)) {
     t->ev().Syscall().state = ENTERING_SYSCALL_PTRACE;
+    t->emulated_stop_syscall_arch = t->ev().Syscall().arch();
     t->emulate_ptrace_stop(WaitStatus::for_syscall(t), SYSCALL_ENTRY_STOP);
     t->record_current_event();
 

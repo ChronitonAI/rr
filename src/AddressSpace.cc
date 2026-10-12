@@ -2370,8 +2370,8 @@ MemoryRange AddressSpace::get_global_exclusion_range(const RecordSession* sessio
 
 static const remote_ptr<void> addr_space_start(0x40000);
 
-remote_ptr<void> AddressSpace::chaos_mode_find_free_memory(RecordTask* t,
-                                                           size_t len, remote_ptr<void> hint) {
+remote_ptr<void> AddressSpace::chaos_mode_find_free_memory(
+    RecordTask* t, size_t len, remote_ptr<void> hint, SupportedArch arch) {
   if (is_all_memory_excluded(t->session())) {
     return nullptr;
   }
@@ -2395,7 +2395,8 @@ remote_ptr<void> AddressSpace::chaos_mode_find_free_memory(RecordTask* t,
     // randomly chosen existing mapping.
     if (random() % 2) {
       uint64_t r = ((uint64_t)(uint32_t)random() << 32) | (uint32_t)random();
-      start = floor_page_size(remote_ptr<void>(r & ((uint64_t(1) << addr_bits(t->arch())) - 1)));
+      start = floor_page_size(
+          remote_ptr<void>(r & ((uint64_t(1) << addr_bits(arch)) - 1)));
     } else {
       ASSERT(t, !mem.empty());
       int map_index = random() % mem.size();
@@ -2413,7 +2414,7 @@ remote_ptr<void> AddressSpace::chaos_mode_find_free_memory(RecordTask* t,
   // to allocate something there.
   uint64_t reserve_area_for_monkeypatching = 3 * page_size();
   remote_ptr<void> addr_space_end =
-    usable_address_space_end(t->arch()) - reserve_area_for_monkeypatching;
+      usable_address_space_end(arch) - reserve_area_for_monkeypatching;
   // Clamp start so that we're in the usable address space.
   start = max(start, addr_space_start);
   start = min(start, addr_space_end - len);

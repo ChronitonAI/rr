@@ -1145,6 +1145,16 @@ set(BASIC_TESTS
   x86/hlt
   inotify
   int3
+  x86/int80_args
+  x86/int80_fork
+  x86/int80_mmap
+  x86/int80_ptrace_syscall_info
+  x86/int80_ptrace_wait
+  x86/int80_regs
+  x86/int80_restart
+  x86/int80_robust_list
+  x86/int80_seccomp
+  x86/int80_sigaction
   intr_futex_wait_restart
   intr_poll
   intr_ppoll
@@ -1352,6 +1362,7 @@ set(BASIC_TESTS
   redzone_integrity
   rename
   rlimit
+  robust_futex_clone
   rseq_cpu_id_reset
   rusage
   samask
@@ -1800,6 +1811,7 @@ set(TESTS_WITHOUT_PROGRAM
   get_thread_list
   hardlink_mmapped_files
   hbreak
+  x86/int80_mmap_chaos
   interrupt_after_exit
   interrupt_while_stopped
   large_file
@@ -2101,7 +2113,7 @@ if(BUILD_TESTS)
                                   PROPERTIES COMPILE_FLAGS "-m32 ${RR_TEST_FLAGS}")
     endforeach(test)
 
-    foreach(file x86/cpuid_loop.S x86/util.h)
+    foreach(file x86/cpuid_loop.S x86/util.h x86/int80_util.h)
       configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/test/${file}"
                      "${CMAKE_CURRENT_BINARY_DIR}/32/${file}"
                      COPYONLY)
