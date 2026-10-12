@@ -1710,6 +1710,7 @@ set(TESTS_WITH_PROGRAM
   ttyname
   unexpected_stack_growth
   unicode
+  unshare_files_exit
   user_ignore_sig
   vdso_clock_gettime_stack
   vdso_gettimeofday_stack

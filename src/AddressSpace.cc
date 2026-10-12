@@ -2554,7 +2554,7 @@ bool AddressSpace::is_stap_semaphore(remote_ptr<uint16_t> addr) {
   return stap_semaphores.find(addr) != stap_semaphores.end();
 }
 
-void AddressSpace::fd_tables_changed() {
+void AddressSpace::fd_tables_changed(Task* exiting) {
   if (!session()->is_recording()) {
     // All modifications are recorded during record
     return;
@@ -2564,15 +2564,19 @@ void AddressSpace::fd_tables_changed() {
   }
   DEBUG_ASSERT(task_set().size() != 0);
   uint8_t fdt_uniform = true;
-  RecordTask* rt = static_cast<RecordTask*>(first_running_task());
-  if (!rt) {
-    return;
-  }
-  auto fdt = rt->fd_table();
+  RecordTask* rt = nullptr;
   for (auto* t : task_set()) {
-    if (t->fd_table() != fdt) {
+    if (t == exiting || t->already_exited() || t->seen_ptrace_exit_event()) {
+      continue;
+    }
+    if (!rt) {
+      rt = static_cast<RecordTask*>(t);
+    } else if (t->fd_table() != rt->fd_table()) {
       fdt_uniform = false;
     }
+  }
+  if (!rt) {
+    return;
   }
   auto addr = REMOTE_PTR_FIELD(rt->preload_globals, fdt_uniform);
   bool ok = true;
