@@ -1437,6 +1437,7 @@ set(BASIC_TESTS
   sigaltstack
   sigchld_interrupt_signal
   sigchld_nocldstop
+  sigchld_siginfo
   sigcont
   sigcont_then_sigstop
   sigcont_threaded
