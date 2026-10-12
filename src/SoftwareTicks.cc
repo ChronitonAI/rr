@@ -124,11 +124,10 @@ static const uint8_t tick_arm64[] = {
   0x80, 0x6a, 0x2a, 0xd4  // brk #0x5354
 };
 
-bool is_software_tick_trap(Task* t) {
+bool is_software_tick_trap(Task* t, const siginfo_t& si) {
   const uint8_t* seq;
   size_t len;
   size_t trap_len;
-  const siginfo_t& si = t->get_siginfo();
   switch (t->arch()) {
     case x86_64:
       seq = tick_x64;
