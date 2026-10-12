@@ -1,0 +1,38 @@
+source `dirname $0`/util.sh
+
+if [[ "$bitness" == "_32" ]] || is_rr_32_bit; then
+  # In a 32-bit process (as all are with a 32-bit rr), that's an ordinary
+  # signal handler.
+  compare_test EXIT-SUCCESS
+  exit 0
+fi
+
+# Before Linux 4.9, the kernel ran such a handler in 64-bit mode.
+kernel=$(uname -r)
+major=${kernel%%.*}
+minor=${kernel#*.}
+minor=${minor%%[!0-9]*}
+if (( major < 4 || (major == 4 && minor < 9) )); then
+  echo NOTE: Skipping "'$TESTNAME'" because Linux is older than 4.9
+  exit 0
+fi
+
+# rr doesn't support signal handlers that the kernel runs in 32-bit
+# compatibility mode. The recording must stop at the signal with an error
+# message, leaving a trace that replays up to there.
+record $TESTNAME
+status=$?
+if [[ $status != 1 ]]; then
+  failed "recording exited with status $status"
+elif ! grep -q "would run it in 32-bit compatibility mode" record.err; then
+  failed "no error message about the handler"
+  cat record.err
+else
+  replay
+  if [[ $? != 0 || -s replay.err ]]; then
+    failed "the partial trace doesn't replay"
+    cat replay.err
+  else
+    passed
+  fi
+fi
