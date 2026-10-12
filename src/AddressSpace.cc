@@ -350,23 +350,35 @@ void AddressSpace::map_rr_page(AutoRemoteSyscalls& remote) {
     ASSERT(t, page.is_open()) << "Failed to open rrpage library " << path;
     int child_fd = remote.infallible_send_fd_if_alive(page);
     if (child_fd >= 0) {
+      // If the task dies (e.g. it's SIGKILLed), only note the mappings that
+      // were actually created.
+      bool mapped_vdso_page = false;
       if (t->session().is_recording()) {
-        remote.infallible_mmap_syscall_if_alive(rr_page_start() - offset_bytes, offset_bytes, prot, flags,
-                                                child_fd, 0);
+        mapped_vdso_page = !remote.infallible_mmap_syscall_if_alive(
+            rr_page_start() - offset_bytes, offset_bytes, prot, flags,
+            child_fd, 0).is_null();
       }
-      remote.infallible_mmap_syscall_if_alive(rr_page_start(), PRELOAD_LIBRARY_PAGE_SIZE, prot, flags,
-                                              child_fd, offset_bytes);
+      bool mapped_rr_page = !remote.infallible_mmap_syscall_if_alive(
+          rr_page_start(), PRELOAD_LIBRARY_PAGE_SIZE, prot, flags, child_fd,
+          offset_bytes).is_null();
 
-      struct stat fstat = t->stat_fd(child_fd);
-      string file_name = t->file_name_of_fd(child_fd);
+      struct stat fstat;
+      memset(&fstat, 0, sizeof(fstat));
+      string file_name;
+      if (mapped_rr_page || mapped_vdso_page) {
+        fstat = t->stat_fd(child_fd);
+        file_name = t->file_name_of_fd(child_fd);
+      }
 
       remote.infallible_close_syscall_if_alive(child_fd);
 
-      map(t, rr_page_start(), PRELOAD_LIBRARY_PAGE_SIZE, prot, flags,
-          offset_bytes, file_name,
-          fstat.st_dev, fstat.st_ino);
-      mapping_flags_of(rr_page_start()) = Mapping::IS_RR_PAGE;
-      if (t->session().is_recording()) {
+      if (mapped_rr_page) {
+        map(t, rr_page_start(), PRELOAD_LIBRARY_PAGE_SIZE, prot, flags,
+            offset_bytes, file_name,
+            fstat.st_dev, fstat.st_ino);
+        mapping_flags_of(rr_page_start()) = Mapping::IS_RR_PAGE;
+      }
+      if (mapped_vdso_page) {
         map(t, rr_page_start() - offset_bytes, offset_bytes, prot, flags,
             0, file_name,
             fstat.st_dev, fstat.st_ino);
@@ -377,9 +389,13 @@ void AddressSpace::map_rr_page(AutoRemoteSyscalls& remote) {
 
   if (t->session().is_recording()) {
     // brk() will not have been called yet so the brk area is empty.
-    brk_start = brk_end =
-        remote.infallible_syscall(syscall_number_for_brk(arch), 0);
-    ASSERT(t, !brk_end.is_null());
+    remote_ptr<void> brk =
+        remote.infallible_syscall_if_alive(syscall_number_for_brk(arch), 0);
+    // If the task died, it never runs again, so we don't need its brk.
+    if (!t->is_exiting()) {
+      brk_start = brk_end = brk;
+      ASSERT(t, !brk_end.is_null());
+    }
   }
 }
 
@@ -651,11 +667,14 @@ void AddressSpace::post_exec_syscall(Task* t) {
   // us traced and untraced syscall instructions at known, fixed addresses.
   map_rr_page(remote);
   // Set up the preload_thread_locals shared area.
-  t->session().create_shared_mmap(remote, PRELOAD_THREAD_LOCALS_SIZE,
-                                  preload_thread_locals_start(),
-                                  "preload_thread_locals");
-  mapping_flags_of(preload_thread_locals_start()) |=
-      AddressSpace::Mapping::IS_THREAD_LOCALS;
+  KernelMapping thread_locals = t->session().create_shared_mmap(
+      remote, PRELOAD_THREAD_LOCALS_SIZE, preload_thread_locals_start(),
+      "preload_thread_locals");
+  // If the task died (e.g. it was SIGKILLed), there's no mapping.
+  if (thread_locals.size()) {
+    mapping_flags_of(preload_thread_locals_start()) |=
+        AddressSpace::Mapping::IS_THREAD_LOCALS;
+  }
 }
 
 void AddressSpace::brk(Task* t, remote_ptr<void> addr, int prot) {
