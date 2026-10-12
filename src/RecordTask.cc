@@ -209,6 +209,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       held_at_emulated_ptrace_event(false),
       emulated_ptrace_SIGCHLD_pending(false),
       emulated_SIGCHLD_pending(false),
+      emulated_stop_holds_signal(false),
       emulated_ptrace_seized(false),
       in_wait_type(WAIT_TYPE_NONE),
       in_wait_pid(0),
@@ -269,15 +270,8 @@ RecordTask::~RecordTask() {
           << "PTRACE_O_TRACEEXIT only supported for stable exits for now";
     }
   }
-  for (RecordTask* t : emulated_ptrace_tracees) {
-    // XXX emulate PTRACE_O_EXITKILL
-    ASSERT(this, t->emulated_ptracer == this);
-    t->emulated_ptracer = nullptr;
-    t->emulated_ptrace_options = 0;
-    t->emulated_stop_pending = false;
-    t->emulated_stop_type = NOT_STOPPED;
-    t->cancel_pending_singlestep();
-  }
+  // Normally we did this when we processed our exit.
+  detach_emulated_ptrace_tracees();
 
   // We expect tasks to usually exit by a call to exit() or
   // exit_group(), so it's not helpful to warn about that.
@@ -973,6 +967,8 @@ void RecordTask::force_emulate_ptrace_stop(WaitStatus status, EmulatedStopType s
   emulated_stop_type = stop_type;
   emulated_stop_code = status;
   emulated_stop_pending = true;
+  // Callers that report a dequeued signal set this afterwards.
+  emulated_stop_holds_signal = false;
   emulated_ptrace_SIGCHLD_pending = true;
 
   emulated_ptracer->send_synthetic_SIGCHLD_if_necessary();
@@ -1018,6 +1014,78 @@ void RecordTask::end_job_control_stop_if_process_exited() {
       rt->emulated_stop_pending = false;
     }
   }
+}
+
+void RecordTask::detach_emulated_ptrace_tracees() {
+  for (RecordTask* t : emulated_ptrace_tracees) {
+    // XXX emulate PTRACE_O_EXITKILL
+    ASSERT(this, t->emulated_ptracer == this);
+    // A single-step that we deferred ends without a SIGTRAP.
+    t->cancel_pending_singlestep();
+    // If we're holding |t| in the middle of its syscall, at a ptrace event
+    // that we reported to its ptracer, resume it from there, as
+    // prepare_ptrace_cont does. The scheduler deals with other emulated
+    // stops.
+    bool resume =
+        t->held_at_emulated_ptrace_event && !t->seen_ptrace_exit_event();
+    bool stop_again = t->should_stop_again_after_ptrace_detach();
+    // Linux delivers the signal of a signal-delivery-stop that the ptracer
+    // hasn't waited for (only its wait clears the signal).
+    int undelivered_sig = 0;
+    if (t->emulated_stop_type == SIGNAL_DELIVERY_STOP &&
+        t->emulated_stop_holds_signal && t->emulated_stop_pending &&
+        !t->seen_ptrace_exit_event()) {
+      undelivered_sig = t->emulated_stop_code.stop_sig();
+    }
+    t->emulated_ptracer = nullptr;
+    t->emulated_ptrace_seized = false;
+    t->emulated_ptrace_options = 0;
+    t->emulated_ptrace_cont_command = 0;
+    if (stop_again) {
+      t->stop_again_after_ptrace_detach();
+      continue;
+    }
+    t->emulated_stop_pending = false;
+    t->emulated_stop_type = NOT_STOPPED;
+    if (undelivered_sig) {
+      // As prepare_ptrace_cont does for a PTRACE_CONT with a signal.
+      siginfo_t si = t->take_ptrace_signal_siginfo(undelivered_sig);
+      t->push_event(Event(EV_SIGNAL,
+                          SignalEvent(si, NONDETERMINISTIC_SIG,
+                                      t->sig_resolved_disposition(
+                                          si.si_signo, NONDETERMINISTIC_SIG))));
+    }
+    if (resume) {
+      t->resume_execution(RESUME_SYSCALL, RESUME_NONBLOCKING, RESUME_NO_TICKS);
+    }
+  }
+  emulated_ptrace_tracees.clear();
+}
+
+bool RecordTask::should_stop_again_after_ptrace_detach() {
+  // A signal has stopped our process, so Linux puts us into the group-stop
+  // until a SIGCONT (__ptrace_unlink sets JOBCTL_STOP_PENDING), whatever stop
+  // we were in, or even if our ptracer had resumed us. But if we're in the
+  // middle of a syscall, Linux finishes the syscall first (or skips it, after
+  // a PTRACE_SYSEMU stop). We can't stop a task that we hold at a ptrace
+  // event in the middle of its syscall, or at a syscall-entry stop that we
+  // haven't processed yet (the scheduler would resume it from there on a
+  // SIGCONT, running the syscall behind our back). We let those go on.
+  return thread_group()->stopping_signal && !seen_ptrace_exit_event() &&
+         !held_at_emulated_ptrace_event &&
+         !(ev().is_syscall_event() &&
+           ev().Syscall().state == ENTERING_SYSCALL_PTRACE);
+}
+
+void RecordTask::stop_again_after_ptrace_detach() {
+  // If we're running, the scheduler interrupts us, as for a
+  // PTRACE_INTERRUPT. Whether the real parent can still wait for the stop
+  // is up to ThreadGroup::stop_report_signal.
+  LOG(debug) << "Stopping " << tid << " again after ptrace detach";
+  emulated_stop_type = GROUP_STOP;
+  emulated_stop_code =
+      WaitStatus::for_group_sig(thread_group()->stopping_signal, this);
+  emulated_stop_pending = false;
 }
 
 void RecordTask::did_reach_zombie() {
@@ -1183,9 +1251,22 @@ void RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
     }
   }
 
-  from_task->set_siginfo_for_waited_task<NativeArch>(
-      reinterpret_cast<NativeArch::siginfo_t*>(si));
-  si->si_value.sival_int = 0;
+  if (from_task->emulated_ptracer &&
+      from_task->emulated_ptracer->thread_group() != thread_group()) {
+    // This SIGCHLD is for the real parent, about a group-stop of the
+    // process, which its ptracer sees as a ptrace stop (see
+    // signal_delivered).
+    auto native_si = reinterpret_cast<NativeArch::siginfo_t*>(si);
+    native_si->si_code = CLD_STOPPED;
+    native_si->_sifields._sigchld.si_pid_ = from_task->tgid();
+    native_si->_sifields._sigchld.si_uid_ = getuid();
+    native_si->_sifields._sigchld.si_status_ =
+        from_task->thread_group()->stopping_signal;
+  } else {
+    from_task->set_siginfo_for_waited_task<NativeArch>(
+        reinterpret_cast<NativeArch::siginfo_t*>(si));
+    si->si_value.sival_int = 0;
+  }
 }
 
 bool RecordTask::is_waiting_for_ptrace(RecordTask* t) {
@@ -1525,6 +1606,7 @@ bool RecordTask::only_spurious_signals_pending() {
 
 void RecordTask::emulate_SIGCONT() {
   thread_group()->stopping_signal = 0;
+  thread_group()->stop_report_signal = 0;
   // All threads in the process are resumed, but SIGCONT doesn't end ptrace
   // stops (see prepare_signal() in kernel/signal.c).
   for (Task* t : thread_group()->task_set()) {
@@ -1555,14 +1637,36 @@ void RecordTask::signal_delivered(int sig) {
   }
 
   if (is_sig_stopping(sig)) {
+    bool new_stop = !thread_group()->stopping_signal;
     thread_group()->stopping_signal = sig;
+    if (new_stop) {
+      thread_group()->stop_report_signal = sig;
+    }
     // All threads in the process are stopped.
+    bool all_traced = true;
+    bool traced_by_other_than_parent = false;
     for (Task* t : thread_group()->task_set()) {
       auto rt = static_cast<RecordTask*>(t);
       rt->apply_group_stop(sig);
+      if (!rt->emulated_ptracer) {
+        all_traced = false;
+      } else if (rt->emulated_ptracer->thread_group().get() !=
+                 thread_group()->parent()) {
+        traced_by_other_than_parent = true;
+      }
     }
     // apply_group_stop calls send_synthetic_SIGCHLD_if_necessary(). Don't
-    // do it again.
+    // do it again. But for a thread that is traced, it notifies only the
+    // ptracer. Linux also notifies the real parent, unless that's the
+    // ptracer's process. (If some thread isn't traced, apply_group_stop
+    // already did.)
+    if (new_stop && all_traced && traced_by_other_than_parent) {
+      emulated_SIGCHLD_pending = true;
+      RecordTask* parent = session().find_task(get_parent_pid());
+      if (parent) {
+        parent->send_synthetic_SIGCHLD_if_necessary();
+      }
+    }
     needs_SIGCHLD = false;
   } else if (sig == SIGCONT && !is_sig_ignored(sig)) {
     emulate_SIGCONT();

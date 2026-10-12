@@ -139,6 +139,22 @@ public:
    * If necessary, signal the ptracer that this task has exited.
    */
   void do_ptrace_exit_stop(WaitStatus exit_status);
+  /**
+   * This task, a ptracer, has exited. Detach its emulated ptrace tracees,
+   * as Linux does.
+   */
+  void detach_emulated_ptrace_tracees();
+  /**
+   * Return true if, when our emulated ptracer detaches from us, we should go
+   * back into the group-stop, because our process is stopped.
+   */
+  bool should_stop_again_after_ptrace_detach();
+  /**
+   * Our emulated ptracer has just detached from us, and
+   * should_stop_again_after_ptrace_detach() said so: put us back into the
+   * group-stop.
+   */
+  void stop_again_after_ptrace_detach();
 
   void record_exit_trace_event(WaitStatus exit_status);
   /**
@@ -868,6 +884,11 @@ public:
   // true if this task needs to send a SIGCHLD to its parent for its
   // emulated stop
   bool emulated_SIGCHLD_pending;
+  // True if the emulated stop is a signal-delivery-stop for a signal that
+  // the task has dequeued (or Linux would have), which the ptracer may pass
+  // on or suppress. Other emulated stops that we label SIGNAL_DELIVERY_STOP
+  // (the group-stops of a tracee that wasn't seized) hold no signal.
+  bool emulated_stop_holds_signal;
   // tracer attached via PTRACE_SEIZE
   bool emulated_ptrace_seized;
   WaitType in_wait_type;

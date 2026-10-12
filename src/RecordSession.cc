@@ -317,6 +317,8 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
   t->record_exit_trace_event(exit_status);
   t->record_exit_event(
     (!t->was_reaped() && !may_wait_exit) ? RecordTask::WRITE_CHILD_TID : RecordTask::KERNEL_WRITES_CHILD_TID);
+  // Linux detaches a ptracer's tracees before the ptracer becomes a zombie.
+  t->detach_emulated_ptrace_tracees();
   if (!t->was_reaped()) {
     t->proceed_to_exit(may_wait_exit);
   }
@@ -1334,6 +1336,7 @@ static void maybe_trigger_emulated_ptrace_syscall_exit_stop(
     // syscall.
     t->emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGTRAP), SIGNAL_DELIVERY_STOP, nullptr,
                            SI_KERNEL);
+    t->emulated_stop_holds_signal = true;
   }
 }
 
