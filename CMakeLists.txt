@@ -1342,6 +1342,7 @@ set(BASIC_TESTS
   readv
   record_replay_subject
   recvfrom
+  recvmsg_short_namelen
   redzone_integrity
   rename
   rlimit
