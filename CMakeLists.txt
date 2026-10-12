@@ -1339,6 +1339,7 @@ set(BASIC_TESTS
   ptrace_sigchld_blocked
   ptrace_signal_during_clone
   ptrace_signals
+  ptrace_skip_restarted_syscall
   ptrace_singlestep
   ptrace_singlestep_forced_sigtrap
   ptrace_singlestep_interrupted_syscallbuf
