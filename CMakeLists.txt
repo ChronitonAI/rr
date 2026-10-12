@@ -1325,6 +1325,7 @@ set(BASIC_TESTS
   arm/ptrace_hw_watch_syscallbuf
   ptrace_exec
   x86/ptrace_exec32
+  ptrace_exitkill
   ptrace_group_stop
   ptrace_group_stop_real_parent
   ptrace_interrupt_syscall_stops
