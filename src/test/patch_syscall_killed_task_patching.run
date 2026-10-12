@@ -1,0 +1,16 @@
+source `dirname $0`/util.sh
+# See patch_syscall_killed_task.run.
+skip_if_no_syscall_buf
+skip_if_test_32_bit
+skip_if_rr_32_bit
+# Make rr SIGKILL the child after taking it out of its exit_group syscall,
+# just before patching the syscall instruction, and wait for its
+# PTRACE_EVENT_EXIT stop.
+RR_KILL_TASK_AT_SYSCALL_PATCH=exit_group/patch \
+  record patch_syscall_killed_task$bitness
+replay
+if ! grep -q "child was killed" record.out; then
+  failed ": the child wasn't killed"
+else
+  check EXIT-SUCCESS
+fi
