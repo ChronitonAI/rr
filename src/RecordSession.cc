@@ -1533,8 +1533,7 @@ static const size_t CONSERVATIVE_SIGFRAME_MEM = 0x10000;
 // the sigframe is going to be, so we just try to ensure we have 64K
 // available. Should be harmless to allocate more than we strictly need.
 // If something's in the way we just allocate as much as we can.
-static void maybe_grow_stack_for_sigframe(RecordTask* t) {
-  auto sp = t->regs().sp();
+static void maybe_grow_stack_for_sigframe(RecordTask* t, remote_ptr<void> sp) {
   AddressSpace& vm = *t->vm();
   if (!vm.has_mapping(sp)) {
     return;
@@ -1574,13 +1573,105 @@ static void maybe_grow_stack_for_sigframe(RecordTask* t) {
 }
 
 /**
+ * If |t| is in a syscallbuf stub that switched to rr's stack for stubs (the
+ * outermost one does; see assembly_templates.py and syscall_hook.S), returns
+ * the stack pointer the application had when it entered the stub. Otherwise
+ * returns null.
+ */
+template <typename Arch>
+static remote_ptr<void> syscallbuf_stub_app_sp_arch(RecordTask* t) {
+  remote_ptr<void> alt_stack = t->syscallbuf_alt_stack();
+  remote_ptr<void> sp = t->regs().sp();
+  if (alt_stack.is_null() || sp < t->scratch_ptr || sp >= alt_stack) {
+    return nullptr;
+  }
+  // The stub saved it at the top of that stack: on x86 it pushed it first,
+  // on aarch64 it stored it 16 bytes into the 48 it reserved.
+  auto saved = (alt_stack - (Arch::arch() == aarch64
+                                 ? 32
+                                 : sizeof(typename Arch::unsigned_word)))
+                   .template cast<typename Arch::unsigned_word>();
+  bool ok = true;
+  remote_ptr<void> app_sp = t->read_mem(saved, &ok);
+  return ok ? app_sp : nullptr;
+}
+
+static remote_ptr<void> syscallbuf_stub_app_sp(RecordTask* t) {
+  RR_ARCH_FUNCTION(syscallbuf_stub_app_sp_arch, t->arch(), t);
+}
+
+/**
+ * At the entry of the handler of |sig|, the address of the stack pointer
+ * saved in its signal frame.
+ */
+static remote_ptr<void> sigframe_saved_sp_addr(RecordTask* t, int sig) {
+  remote_ptr<void> sp = t->regs().sp();
+  switch (t->arch()) {
+    case x86:
+      if (t->signal_handler_takes_siginfo(sig)) {
+        // struct rt_sigframe_ia32: pretcode, sig, pinfo and puc, the
+        // siginfo, then the ucontext, whose uc_mcontext follows uc_flags,
+        // uc_link and uc_stack.
+        return sp + 4 * 4 + sizeof(X86Arch::siginfo_t) + 2 * 4 +
+               sizeof(X86Arch::stack_t) + offsetof(X86Arch::sigcontext, sp);
+      }
+      // struct sigframe_ia32: pretcode and sig, then the sigcontext.
+      return sp + 2 * 4 + offsetof(X86Arch::sigcontext, sp);
+    case x86_64:
+      // struct rt_sigframe: pretcode, then the ucontext.
+      return sp + 8 + 2 * 8 + sizeof(X64Arch::stack_t) +
+             offsetof(X64Arch::sigcontext, sp);
+    case aarch64:
+      return sp + offsetof(ARM64Arch::rt_sigframe, uc) +
+             offsetof(ARM64Arch::ucontext, uc_mcontext) +
+             offsetof(ARM64Arch::sigcontext, regs) +
+             offsetof(ARM64Arch::user_pt_regs, sp);
+    default:
+      DEBUG_ASSERT(0 && "Add the signal frame layout for your architecture here");
+      return nullptr;
+  }
+}
+
+/**
+ * At the entry of the handler of |sig|, replace the stack pointer saved in
+ * its signal frame, |old_sp|, with |new_sp|.
+ */
+template <typename Arch>
+static void set_sigframe_saved_sp_arch(RecordTask* t, int sig,
+                                       remote_ptr<void> old_sp,
+                                       remote_ptr<void> new_sp) {
+  auto addr = sigframe_saved_sp_addr(t, sig)
+                  .template cast<typename Arch::unsigned_word>();
+  ASSERT(t, t->read_mem(addr) == old_sp.as_int())
+      << "Expected the saved stack pointer " << old_sp << " at " << addr;
+  t->write_mem(addr, (typename Arch::unsigned_word)new_sp.as_int());
+}
+
+static void set_sigframe_saved_sp(RecordTask* t, int sig,
+                                  remote_ptr<void> old_sp,
+                                  remote_ptr<void> new_sp) {
+  RR_ARCH_FUNCTION(set_sigframe_saved_sp_arch, t->arch(), t, sig, old_sp,
+                   new_sp);
+}
+
+/**
  * Returns true if the signal should be delivered.
  * Returns false if this signal should not be delivered because another signal
  * occurred during delivery or there was a premature exit.
  * Must call t->stashed_signal_processed() once we're ready to unmask signals.
  */
 static bool inject_handled_signal(RecordTask* t) {
-  maybe_grow_stack_for_sigframe(t);
+  // In a syscallbuf stub on rr's stack for stubs (e.g. in a blocking buffered
+  // syscall), the kernel would place the signal frame relative to that stack
+  // instead of the application's. With SA_ONSTACK, that puts it at the top of
+  // the alternate signal stack even when the application is running on it
+  // already, e.g. in a handler blocked in that syscall, over the frames there.
+  // So have the kernel place it relative to the application's stack pointer,
+  // as without rr, and then put the stub's stack pointer in the frame, for
+  // the sigreturn.
+  remote_ptr<void> app_sp = syscallbuf_stub_app_sp(t);
+  remote_ptr<void> stub_sp;
+  maybe_grow_stack_for_sigframe(t, app_sp.is_null() ? t->regs().sp() : app_sp);
 
   if (!preinject_signal(t)) {
     // Task prematurely exited.
@@ -1589,6 +1680,13 @@ static bool inject_handled_signal(RecordTask* t) {
   // If there aren't any more stashed signals, it's OK to stop blocking all
   // signals.
   t->stashed_signal_processed();
+
+  if (!app_sp.is_null()) {
+    Registers r = t->regs();
+    stub_sp = r.sp();
+    r.set_sp(app_sp);
+    t->set_regs(r);
+  }
 
   int sig = t->ev().Signal().siginfo.si_signo;
   int stop_sig;
@@ -1630,6 +1728,11 @@ static bool inject_handled_signal(RecordTask* t) {
   }
 
   if (stop_sig == SIGSEGV) {
+    if (!stub_sp.is_null()) {
+      Registers r = t->regs();
+      r.set_sp(stub_sp);
+      t->set_regs(r);
+    }
     // Constructing the signal handler frame must have failed. Stash the signal
     // to deliver it later.
     t->stash_sig();
@@ -1652,6 +1755,10 @@ static bool inject_handled_signal(RecordTask* t) {
       << t->ip()
       << "; actual signal mask=" << HEX(t->read_sigmask_from_process())
       << " (cached " << HEX(t->get_sigmask()) << ")";
+
+  if (!stub_sp.is_null()) {
+    set_sigframe_saved_sp(t, sig, app_sp, stub_sp);
+  }
 
   if (t->signal_handler_takes_siginfo(sig)) {
     // The kernel copied siginfo into userspace so it can pass a pointer to

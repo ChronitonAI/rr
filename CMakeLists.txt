@@ -1389,6 +1389,7 @@ set(BASIC_TESTS
   shm_unmap
   sigaction_old
   sigaltstack
+  sigaltstack_blocking_syscall
   sigchld_interrupt_signal
   sigcont
   sigcont_threaded
