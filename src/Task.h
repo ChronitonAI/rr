@@ -856,10 +856,12 @@ public:
   /**
    * Open /proc/[tid]/mem fd for our AddressSpace, closing the old one
    * first. If necessary we force the tracee to open the file
-   * itself and smuggle the fd back to us.
-   * Returns false if the process no longer exists.
+   * itself and smuggle the fd back to us, unless |allow_remote_open| is
+   * false.
+   * Returns false if the process no longer exists or we couldn't open
+   * the file.
    */
-  bool open_mem_fd();
+  bool open_mem_fd(bool allow_remote_open = true);
 
   /**
    * Calls open_mem_fd if this task's AddressSpace doesn't already have one.

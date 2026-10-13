@@ -1611,6 +1611,7 @@ set(TESTS_WITH_PROGRAM
   elapsed_time
   exclusion_region
   exec_failed
+  exec_killed_before_post_exec
   exec_killed_before_scratch
   exec_many
   exec_shared_as
