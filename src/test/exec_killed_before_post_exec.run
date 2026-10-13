@@ -1,0 +1,16 @@
+source `dirname $0`/util.sh
+# rr reads the vdso only at the first exec of each architecture, so the child
+# has to exec a program for the other architecture.
+if [[ $bitness == _32 ]]; then
+  other=simple
+else
+  other=simple_32
+fi
+if [[ ! -f "$OBJDIR/bin/$other" && ! -f "$RESOURCE_PATH/bin/$other" ]]; then
+  echo NOTE: Skipping "'$TESTNAME'" because $other is not built
+  exit 0
+fi
+save_exe $other
+record $TESTNAME "$PWD/$other-$nonce"
+replay
+check EXIT-SUCCESS
