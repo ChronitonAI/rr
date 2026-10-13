@@ -4447,9 +4447,9 @@ void Task::os_exec(SupportedArch exec_arch, std::string filename)
   regs.set_ip(vm()->traced_syscall_ip());
   remote_ptr<void> remote_mem = floor_page_size(regs.sp());
 
-  // Determine how much memory we'll need (upper bound): see
-  // setup_exec_args_arch.
-  size_t total_size = filename.size() + 1 + 3 * sizeof(uint64_t);
+  // Determine how much memory we'll need: setup_exec_args_arch writes three
+  // words of our arch's size, then the file name.
+  size_t total_size = 3 * word_size(arch()) + filename.size() + 1;
   if (memory_task != this) {
     saved_data = read_mem(remote_mem.cast<uint8_t>(), total_size);
   }
