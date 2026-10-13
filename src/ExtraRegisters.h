@@ -105,6 +105,8 @@ public:
   /**
    * Like |Registers::read_register()|, except attempts to read
    * the value of an "extra register" (floating point / vector).
+   * If we don't know the registers' values (format NONE), the register is
+   * undefined, but its size is still returned.
    */
   size_t read_register(uint8_t* buf, GdbServerRegister regno, bool* defined) const;
 

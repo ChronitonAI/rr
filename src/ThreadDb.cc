@@ -68,7 +68,7 @@ ps_err_e ps_lgetregs(struct ps_prochandle* h, lwpid_t rec_tid,
   rr::Task* task = h->thread_group->session()->find_task(rec_tid);
   DEBUG_ASSERT(task != nullptr);
 
-  NativeArch::user_regs_struct regs = task->regs().get_ptrace();
+  NativeArch::user_regs_struct regs = task->regs_for_debugger().get_ptrace();
   memcpy(result, static_cast<void*>(&regs), sizeof(regs));
   LOG(debug) << "ps_lgetregs OK";
   return PS_OK;
@@ -121,10 +121,10 @@ ps_err_e ps_get_thread_area(const struct ps_prochandle* h, lwpid_t rec_tid,
     uintptr_t result;
     switch (val) {
       case _REG_FS:
-        result = task->regs().fs_base();
+        result = task->regs_for_debugger().fs_base();
         break;
       case _REG_GS:
-        result = task->regs().gs_base();
+        result = task->regs_for_debugger().gs_base();
         break;
       default:
         LOG(debug) << "ps_get_thread_area PS_BADADDR";
@@ -134,6 +134,13 @@ ps_err_e ps_get_thread_area(const struct ps_prochandle* h, lwpid_t rec_tid,
     *base = reinterpret_cast<psaddr_t>(result);
     return PS_OK;
   } else if (task->arch() == aarch64) {
+    if (!task->is_stopped()) {
+      // Our emergency debugger can ask about a task that's blocked in a
+      // syscall. We can only read its TLS register with ptrace while it's
+      // stopped.
+      LOG(debug) << "ps_get_thread_area: task " << rec_tid << " isn't stopped";
+      return PS_ERR;
+    }
     uintptr_t result;
     if (!task->read_aarch64_tls_register(&result)) {
       LOG(error) << "Task was dead";
