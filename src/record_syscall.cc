@@ -6469,6 +6469,10 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
   // Patch LD_PRELOAD and VDSO after saving the mappings. Replay will apply
   // patches to the saved mappings.
   t->vm()->monkeypatcher().patch_after_exec(t);
+  // Save the auxv as the tracee sees it (with the VDSO patched), as replay
+  // does, for debuggers (e.g. our emergency debugger) to find the shared
+  // libraries.
+  t->vm()->save_auxv(t);
 
   init_scratch_memory(t, FIXED_ADDRESS);
 }
