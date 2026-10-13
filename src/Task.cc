@@ -3036,7 +3036,7 @@ long Task::fallible_ptrace(int request, remote_ptr<void> addr, void* data) {
   return ptrace(_ptrace_request(request), tid, addr, data);
 }
 
-bool Task::open_mem_fd() {
+bool Task::open_mem_fd(bool allow_remote_open) {
   // Use ptrace to read/write during open_mem_fd
   as->set_mem_fd(ScopedFd());
 
@@ -3060,7 +3060,7 @@ bool Task::open_mem_fd() {
   }
 
   ScopedFd fd = ScopedFd::openat(dir_fd, "mem", O_RDWR | O_CLOEXEC);
-  if (!fd.is_open() && !is_exiting()) {
+  if (!fd.is_open() && allow_remote_open && !is_exiting()) {
     LOG(debug) << "Falling back to the remote fd dance";
     AutoRemoteSyscalls remote(this);
     int remote_mem_dir_fd = remote.send_fd(dir_fd);
