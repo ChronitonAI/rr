@@ -1415,6 +1415,7 @@ set(BASIC_TESTS
   sigqueueinfo
   sigtrap_process_group
   x86/sigreturn
+  x86/sigreturn_without_handler
   sigreturn_reg
   sigreturnmask
   sigrt

@@ -1272,8 +1272,13 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         t->record_current_event();
         t->pop_syscall();
 
-        // We've finished processing this signal now.
-        t->pop_signal_handler();
+        // We've finished processing this signal now. But a sigreturn need
+        // not end a handler we delivered: a program can build a signal frame
+        // itself, or copy one, and sigreturn on it (DynamoRIO does that to
+        // deliver signals to the application's handler).
+        if (EV_SIGNAL_HANDLER == t->ev().type()) {
+          t->pop_signal_handler();
+        }
         t->invalidate_sigmask();
 
         maybe_discard_syscall_interruption(t, retval);
