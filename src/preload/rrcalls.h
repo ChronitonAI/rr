@@ -152,8 +152,9 @@ enum rrcall_kill_point {
      between the steps of rr's handling of one (e.g. after rr has recorded a
      syscall's exit, before it resumes the task). rr waits for the task to
      reach its PTRACE_EVENT_EXIT stop, and then handles its exit. A test
-     program can't arm this, since it only runs after that execve; the
-     undocumented `rr record --kill-before-initial-exec=<n>` does. */
+     program can arm this, but the arming has no effect, since the program
+     only runs after that execve; the undocumented
+     `rr record --kill-before-initial-exec=<n>` option arms it in time. */
   RRCALL_KILL_BEFORE_INITIAL_EXEC,
 
   /* clone(), fork() and vfork() */
