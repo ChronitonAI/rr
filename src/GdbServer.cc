@@ -175,6 +175,21 @@ static WatchType watchpoint_type(GdbRequestType req) {
   }
 }
 
+/**
+ * The extra registers of |t| to show the debugger. If |t| isn't stopped, or we
+ * can't read them, they're unknown, and the debugger sees them as unavailable
+ * (except for those that don't depend on the task; see
+ * ExtraRegisters::read_register()).
+ */
+static ExtraRegisters debugger_extra_regs(Task* t) {
+  if (t->stopped_or_unexpected_exit()) {
+    if (const ExtraRegisters* extra_regs = t->extra_regs_fallible()) {
+      return *extra_regs;
+    }
+  }
+  return ExtraRegisters(t->arch());
+}
+
 static void maybe_singlestep_for_event(Task* t, GdbRequest* req) {
   ReplayTask* rt = t->as_replay();
   if (!rt) {
@@ -284,21 +299,19 @@ void GdbServer::maybe_intercept_mem_request(Task* target, const GdbRequest& req,
    * handle cases where the top-of-stack word is contained in a larger range.
    */
   size_t size = word_size(target->arch());
-  if (target->regs().sp().as_int() >= req.mem_.addr &&
-      target->regs().sp().as_int() + size <= req.mem_.addr + result->size() &&
-      is_in_patch_stubs(target, target->ip())) {
-    memset(result->data() + target->regs().sp().as_int() - req.mem_.addr, 0,
-           size);
+  const Registers& regs = target->regs_for_debugger();
+  if (regs.sp().as_int() >= req.mem_.addr &&
+      regs.sp().as_int() + size <= req.mem_.addr + result->size() &&
+      is_in_patch_stubs(target, regs.ip())) {
+    memset(result->data() + regs.sp().as_int() - req.mem_.addr, 0, size);
   }
 }
 
 static vector<GdbServerConnection::ThreadInfo> thread_info(const Session& session) {
   vector<GdbServerConnection::ThreadInfo> threads;
   for (auto& kv : session.tasks()) {
-    threads.push_back({
-      extended_task_id(kv.second),
-      kv.second->regs().ip().register_value()
-    });
+    threads.push_back({ extended_task_id(kv.second),
+                        kv.second->regs_for_debugger().ip().register_value() });
   }
   return threads;
 }
@@ -631,12 +644,14 @@ void GdbServer::dispatch_debugger_request(Session& session,
     }
     case DREQ_GET_REG: {
       GdbServerRegisterValue reg =
-          get_reg(target->regs(), *target->extra_regs_fallible(), req.reg().name);
+          get_reg(target->regs_for_debugger(), debugger_extra_regs(target),
+                  req.reg().name);
       dbg->reply_get_reg(reg);
       return;
     }
     case DREQ_GET_REGS: {
-      dispatch_regs_request(target->regs(), *target->extra_regs_fallible());
+      dispatch_regs_request(target->regs_for_debugger(),
+                            debugger_extra_regs(target));
       return;
     }
     case DREQ_SET_REG: {
@@ -760,8 +775,8 @@ void GdbServer::dispatch_debugger_request(Session& session,
         ++state_index;
       }
       SavedRegisters& regs = saved_register_states[state_index];
-      regs.regs = target->regs();
-      regs.extra_regs = *target->extra_regs_fallible();
+      regs.regs = target->regs_for_debugger();
+      regs.extra_regs = debugger_extra_regs(target);
       dbg->reply_save_register_state(true, state_index);
       return;
     }

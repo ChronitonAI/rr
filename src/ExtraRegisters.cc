@@ -260,8 +260,73 @@ static uint64_t* xsave_features(vector<uint8_t>& data) {
              : reinterpret_cast<uint64_t*>(data.data() + xsave_header_offset);
 }
 
+/**
+ * The size of extra register |regno| of |arch|, or 0 if it isn't one.
+ */
+static size_t extra_register_size(SupportedArch arch, GdbServerRegister regno) {
+  if (arch == aarch64) {
+    if (DREG_V0 <= regno && regno <= DREG_V31) {
+      return 16;
+    }
+    switch (regno) {
+      case DREG_FPSR:
+      case DREG_FPCR:
+        return sizeof(uint32_t);
+      case DREG_PAUTH_DMASK:
+      case DREG_PAUTH_CMASK:
+      case DREG_TPIDR:
+        return sizeof(uint64_t);
+      default:
+        return 0;
+    }
+  }
+  return xsave_register_data(arch, regno).size;
+}
+
+/**
+ * If |regno| is one of aarch64's pointer authentication masks, write it to
+ * |buf| and return its size, otherwise return 0. The masks are the same for
+ * every task, so we can compute them here even when we don't know the task's
+ * extra registers.
+ */
+static size_t read_pauth_mask(SupportedArch arch, GdbServerRegister regno,
+                              uint8_t* buf) {
+#ifdef __aarch64__
+  if (arch == aarch64 &&
+      (regno == DREG_PAUTH_DMASK || regno == DREG_PAUTH_CMASK)) {
+    uint64_t ptr = 1ULL << 55;
+    // The XPAC instruction will copy bit 55 of the argument into the PAC mask
+    // bits, so ptr will be set to the mask plus bit 55.
+    if (regno == DREG_PAUTH_DMASK) {
+      __asm__ __volatile__("xpacd %0" : "+r"(ptr));
+    } else {
+      __asm__ __volatile__("xpaci %0" : "+r"(ptr));
+    }
+    uint64_t mask = ptr & ~(1ULL << 55);
+    memcpy(buf, &mask, sizeof(mask));
+    return sizeof(mask);
+  }
+#else
+  (void)arch;
+  (void)regno;
+  (void)buf;
+#endif
+  return 0;
+}
+
 size_t ExtraRegisters::read_register(uint8_t* buf, GdbServerRegister regno,
                                      bool* defined) const {
+  if (size_t size = read_pauth_mask(arch(), regno, buf)) {
+    *defined = true;
+    return size;
+  }
+  if (format_ == NONE) {
+    // We don't know the value. Return the register's size anyway, so that a
+    // register file that includes the register (a gdb 'g' reply) keeps its
+    // layout.
+    *defined = false;
+    return extra_register_size(arch(), regno);
+  }
   if (format_ == AARCH64_FPR) {
     if (arch() != aarch64) {
       *defined = false;
@@ -278,21 +343,6 @@ size_t ExtraRegisters::read_register(uint8_t* buf, GdbServerRegister regno,
     } else if (regno == DREG_FPCR) {
       reg_data = RegData(offsetof(ARM64Arch::user_fpsimd_state, fpcr),
                          sizeof(uint32_t));
-#ifdef __aarch64__
-    } else if (regno == DREG_PAUTH_DMASK || regno == DREG_PAUTH_CMASK) {
-      uint64_t ptr = 1ULL << 55;
-      // The XPAC instruction will copy bit 55 of the argument into the PAC mask
-      // bits, so ptr will be set to the mask plus bit 55.
-      if (regno == DREG_PAUTH_DMASK) {
-        __asm__ __volatile__("xpacd %0" : "+r"(ptr));
-      } else {
-        __asm__ __volatile__("xpaci %0" : "+r"(ptr));
-      }
-      uint64_t mask = ptr & ~(1ULL << 55);
-      *defined = true;
-      memcpy(buf, &mask, sizeof(mask));
-      return sizeof(mask);
-#endif
     } else if (regno == DREG_TPIDR) {
       reg_data = RegData(sizeof(ARM64Arch::user_fpsimd_state),
                          sizeof(uint64_t));

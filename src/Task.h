@@ -508,6 +508,15 @@ public:
   /** Return the current regs of this. */
   const Registers& regs() const;
 
+  /**
+   * Like regs(), but this also works when the task isn't stopped, which our
+   * emergency debugger can ask about during recording, e.g. for a task that's
+   * blocked in a syscall. Then these are the registers it had when it last
+   * stopped, which it still has if it's blocked in a syscall, but not if it's
+   * running. So this is only for debuggers.
+   */
+  const Registers& regs_for_debugger() const { return registers; }
+
   /** Return the extra registers of this, or null if the task died. */
   const ExtraRegisters* extra_regs_fallible();
 

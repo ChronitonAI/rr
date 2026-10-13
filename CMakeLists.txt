@@ -1587,6 +1587,7 @@ set(TESTS_WITH_PROGRAM
   dlopen
   early_error
   elapsed_time
+  emergency_debugger_threads
   exclusion_region
   exec_failed
   exec_many
