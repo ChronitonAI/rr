@@ -653,7 +653,14 @@ void AddressSpace::read_mm_map(Task* t, NativeArch::prctl_mm_map* map) {
 }
 
 void AddressSpace::post_exec_syscall(Task* t) {
-  // First locate a syscall instruction we can use for remote syscalls.
+  // Open the mem fd first if we can do that without remote syscalls (they
+  // need the syscall instruction we're about to look for). Reading the vdso
+  // through it works even if the task has been SIGKILLed since its exec;
+  // PTRACE_PEEKDATA fails with ESRCH then, until the task reaches its
+  // PTRACE_EVENT_EXIT stop.
+  t->open_mem_fd(false);
+
+  // Locate a syscall instruction we can use for remote syscalls.
   traced_syscall_ip_ = find_syscall_instruction_in_vdso(t);
   privileged_traced_syscall_ip_ = nullptr;
 
@@ -661,8 +668,8 @@ void AddressSpace::post_exec_syscall(Task* t) {
   stopping_breakpoint_table_ = nullptr;
   stopping_breakpoint_table_entry_size_ = 0;
 
-  // Now remote syscalls work, we can open_mem_fd.
-  t->open_mem_fd();
+  // Now remote syscalls work, we can open_mem_fd if we couldn't before.
+  t->open_mem_fd_if_needed();
 
   // Set up AutoRemoteSyscalls again now that the mem-fd is open.
   AutoRemoteSyscalls remote(t);
