@@ -110,3 +110,18 @@
  * memory location given by the first argument. RAX returns 0.
  */
 #define SYS_rrcall_rdtsc (RR_CALL_BASE + 12)
+/**
+ * For rr's tests: makes rr fail an assertion while it records the calling
+ * thread's entry to this syscall, as if rr had a bug there. rr then reports
+ * the failure and starts its emergency debugger as for any other assertion
+ * failure, so this tests what happens then. Use as
+ *
+ *   syscall(SYS_rrcall_fail_assertion, (long)0, (long)0, (long)0, (long)0,
+ *           (long)0, (long)0)
+ *
+ * (syscall() reads its arguments as longs.) It doesn't return while rr is
+ * recording, and the recording ends there.
+ * If any argument isn't 0, it returns -EINVAL instead, and replay treats
+ * that as a no-op. Without rr, it fails with ENOSYS.
+ */
+#define SYS_rrcall_fail_assertion (RR_CALL_BASE + 14)

@@ -1666,6 +1666,7 @@ set(TESTS_WITH_PROGRAM
   # Not called ps, because that interferes with using real 'ps' in tests
   rr_ps
   rr_ps_ns
+  rrcall_fail_assertion
   rseq
   rseq_syscallbuf
   rseq_cpu_id_reset_longrunning

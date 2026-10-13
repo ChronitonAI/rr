@@ -5641,6 +5641,23 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       return PREVENT_SWITCH;
     }
 
+    case SYS_rrcall_fail_assertion: {
+      // This is purely for testing purposes. See rrcalls.h.
+      Registers r = t->regs();
+      bool arguments_are_zero = true;
+      for (int i = 1; i <= 6; ++i) {
+        arguments_are_zero &= r.arg(i) == 0;
+      }
+      if (!arguments_are_zero) {
+        syscall_state.emulate_result((uintptr_t)-EINVAL);
+        syscall_state.expect_errno = ENOSYS;
+        return PREVENT_SWITCH;
+      }
+      ASSERT(t, false) << "Failing as the tracee asked with "
+                          "SYS_rrcall_fail_assertion";
+      return PREVENT_SWITCH; // Not reached
+    }
+
     case Arch::brk:
     case Arch::munmap:
     case Arch::process_vm_readv:
