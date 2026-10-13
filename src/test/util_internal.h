@@ -32,4 +32,11 @@ int rr_arm_kill(int point, long arg, int flags) {
   return ret == 0;
 }
 
+/* Makes rr fail an assertion; see SYS_rrcall_fail_assertion. Returns only if
+   we're not being recorded by rr. */
+void rr_fail_assertion(void) {
+  syscall(SYS_rrcall_fail_assertion, (long)0, (long)0, (long)0, (long)0,
+          (long)0, (long)0);
+}
+
 #endif /* RRUTIL_INTERNAL_H */

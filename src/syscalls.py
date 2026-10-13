@@ -1779,6 +1779,7 @@ rrcall_arm_time_slice = IrregularEmulatedSyscall(all=1010)
 rrcall_freeze_tid = IrregularEmulatedSyscall(all=1011)
 rrcall_rdtsc = IrregularEmulatedSyscall(all=1012)
 rrcall_arm_kill = IrregularEmulatedSyscall(all=1013)
+rrcall_fail_assertion = IrregularEmulatedSyscall(all=1014)
 
 # These syscalls also appear under `socketcall` on x86.
 socket = EmulatedSyscall(x86=359, x64=41, generic=198)
