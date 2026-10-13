@@ -58,6 +58,11 @@ int main(int argc, __attribute__((unused)) char** argv) {
     return 0;
   }
 
+  /* Get our own syscall buffer now. rr creates it at our first intercepted
+     syscall, which, depending on the libc, may not have happened yet; then
+     the child's buffer would take the place where ours is created later. */
+  read_maps();
+
   if (0 == (child = vfork())) {
     /* Our first syscalls set up our syscall buffer. */
     read_maps();
