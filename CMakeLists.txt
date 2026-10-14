@@ -1139,6 +1139,7 @@ set(BASIC_TESTS
   grandchild_threads_main_running
   grandchild_threads_thread_running
   grandchild_threads_parent_alive
+  group_stop_restarted_syscall
   group_stop_thundering_herd
   x86/hle
   x86/hlt
@@ -1804,6 +1805,7 @@ set(TESTS_WITHOUT_PROGRAM
   fork_exec_info_thr
   gdb_bare_qsupported
   get_thread_list
+  group_stop_restarted_signalfd
   hardlink_mmapped_files
   hbreak
   interrupt_after_exit

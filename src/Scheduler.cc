@@ -355,7 +355,31 @@ bool Scheduler::is_task_runnable(RecordTask* t, WaitAggregator& wait_aggregator,
       t->do_ptrace_interrupt();
       // Wait on the task to get the kernel to kick it into the group stop.
       // If it died, we can deal with it later.
-      return t->wait();
+      if (!t->wait()) {
+        return false;
+      }
+      if (t->is_ptrace_seccomp_event() && t->ev().is_syscall_event() &&
+          t->ev().Syscall().state == PROCESSING_SYSCALL) {
+        // The task reported the PTRACE_EVENT_SECCOMP that follows the entry
+        // of the syscall it's in.
+        if (t->get_ptrace_eventmsg_seccomp_data() == SECCOMP_RET_DATA) {
+          // Like handle_seccomp_traced_syscall, skip it: continue to the
+          // syscall's exit. The seccomp stop cleared the pending interrupt,
+          // so interrupt again; otherwise a syscall that recomputes whether
+          // a signal is pending before it blocks (e.g. a signalfd read)
+          // would block.
+          LOGM(debug) << "  skipping PTRACE_EVENT_SECCOMP of " << t->ev();
+          t->do_ptrace_interrupt();
+          return t->resume_execution(RESUME_SYSCALL, RESUME_WAIT,
+                                     RESUME_NO_TICKS);
+        }
+        // The stop reports what a tracee seccomp filter decided for the
+        // syscall, e.g. an error or SIGSYS. Let handle_ptrace_event process
+        // it.
+        *by_waitpid = true;
+        must_run_task = t;
+      }
+      return true;
     }
   }
 

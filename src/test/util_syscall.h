@@ -25,13 +25,14 @@ static inline uintptr_t unbufferable_syscall(uintptr_t syscall, uintptr_t arg1,
                    "cmp $0x77,%%rax\n\t"
                    : "=a"(ret)
                    : "a"(syscall), "D"(arg1), "S"(arg2), "d"(arg3)
-                   : "rcx", "r11", "flags");
+                   : "rcx", "r11", "flags", "memory");
 #elif defined(__i386__)
   __asm__ volatile("xchg %%esi,%%edi\n\t"
                    "int $0x80\n\t"
                    "xchg %%esi,%%edi\n\t"
                    : "=a"(ret)
-                   : "a"(syscall), "b"(arg1), "c"(arg2), "d"(arg3));
+                   : "a"(syscall), "b"(arg1), "c"(arg2), "d"(arg3)
+                   : "memory");
 #elif defined(__aarch64__)
   register long x8 __asm__("x8") = syscall;
   register long x0 __asm__("x0") = (long)arg1;
@@ -42,7 +43,8 @@ static inline uintptr_t unbufferable_syscall(uintptr_t syscall, uintptr_t arg1,
                    "1:\n\t"
                    "svc #0\n\t"
                    : "+r"(x0)
-                   : "r"(x1), "r"(x2), "r"(x8));
+                   : "r"(x1), "r"(x2), "r"(x8)
+                   : "memory");
   ret = x0;
 #else
 #error define syscall here
