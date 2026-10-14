@@ -1574,6 +1574,92 @@ static void maybe_grow_stack_for_sigframe(RecordTask* t) {
 }
 
 /**
+ * The signals that delivering |sig| to its handler adds to the mask: its
+ * sa_mask, and |sig| itself unless SA_NODEFER.
+ */
+template <typename Arch>
+static sig_set_t blocked_on_delivery_arch(RecordTask* t, int sig) {
+  sig_set_t mask = signal_bit(sig);
+  const vector<uint8_t>& sa = t->signal_action(sig);
+  if (sa.size() >= sizeof(typename Arch::kernel_sigaction)) {
+    auto ksa = reinterpret_cast<const typename Arch::kernel_sigaction*>(sa.data());
+    sig_set_t sa_mask = 0;
+    memcpy(&sa_mask, &ksa->sa_mask, min(sizeof(sa_mask), sizeof(ksa->sa_mask)));
+    mask = sa_mask | ((ksa->sa_flags & SA_NODEFER) ? 0 : signal_bit(sig));
+  }
+  return mask & ~(signal_bit(SIGKILL) | signal_bit(SIGSTOP));
+}
+
+/**
+ * At the entry of the handler of |sig|, set the signal mask saved in its
+ * frame, which sigreturn restores, to |mask|.
+ */
+template <typename Arch>
+static void set_sigframe_saved_sigmask_arch(RecordTask* t, int sig,
+                                            sig_set_t mask) {
+  remote_ptr<void> sp = t->regs().sp();
+  // The ucontext starts with uc_flags, uc_link and uc_stack, then the
+  // sigcontext, then uc_sigmask.
+  size_t sigcontext_offset_in_ucontext =
+      2 * sizeof(typename Arch::unsigned_word) + sizeof(typename Arch::stack_t);
+  remote_ptr<void> sigcontext;
+  if (Arch::arch() == x86 && !t->signal_handler_takes_siginfo(sig)) {
+    // struct sigframe_ia32: pretcode and sig, the sigcontext (whose oldmask
+    // holds the low word), the unused 624-byte struct _fpstate_32, then
+    // extramask[0], the high word.
+    sigcontext = sp + 2 * 4;
+    t->write_mem((sigcontext + sizeof(typename Arch::sigcontext) + 624)
+                     .cast<uint32_t>(),
+                 uint32_t(mask >> 32));
+  } else {
+    remote_ptr<void> uc;
+    if (Arch::arch() == x86) {
+      // struct rt_sigframe_ia32: pretcode, sig, pinfo, puc, ...
+      uc = t->read_mem(sp.cast<uint32_t>() + 3);
+    } else {
+      // struct rt_sigframe: pretcode, uc, ...
+      uc = sp + 8;
+    }
+    sigcontext = uc + sigcontext_offset_in_ucontext;
+    t->write_mem((sigcontext + sizeof(typename Arch::sigcontext)).cast<sig_set_t>(),
+                 mask);
+  }
+  auto oldmask = REMOTE_PTR_FIELD(sigcontext.cast<typename Arch::sigcontext>(), oldmask);
+  t->write_mem(oldmask, (typename Arch::unsigned_word)mask);
+}
+
+template <>
+void set_sigframe_saved_sigmask_arch<ARM64Arch>(RecordTask* t, int,
+                                                sig_set_t mask) {
+  t->write_mem((t->regs().sp() + offsetof(ARM64Arch::rt_sigframe, uc) +
+                offsetof(ARM64Arch::ucontext, uc_sigmask))
+                   .cast<sig_set_t>(),
+               mask);
+}
+
+/**
+ * We injected |sig| while other stashed signals kept all signals blocked
+ * (stashed_signals_blocking_more_signals), so the kernel saved that mask in
+ * the signal frame, for sigreturn to restore, and blocked everything in the
+ * handler. Put back what delivering |sig| does with the application's mask
+ * |app_mask|: save that in the frame, and block |sig|'s sa_mask (and |sig|
+ * unless SA_NODEFER) on top of it for the handler.
+ */
+template <typename Arch>
+static void fix_sigmask_after_stashed_injection_arch(RecordTask* t, int sig,
+                                                     sig_set_t app_mask) {
+  set_sigframe_saved_sigmask_arch<Arch>(t, sig, app_mask);
+  t->set_sigmask(app_mask | blocked_on_delivery_arch<Arch>(t, sig));
+  t->invalidate_sigmask();
+}
+
+static void fix_sigmask_after_stashed_injection(RecordTask* t, int sig,
+                                                sig_set_t app_mask) {
+  RR_ARCH_FUNCTION(fix_sigmask_after_stashed_injection_arch, t->arch(), t, sig,
+                   app_mask);
+}
+
+/**
  * Returns true if the signal should be delivered.
  * Returns false if this signal should not be delivered because another signal
  * occurred during delivery or there was a premature exit.
@@ -1589,6 +1675,7 @@ static bool inject_handled_signal(RecordTask* t) {
   // If there aren't any more stashed signals, it's OK to stop blocking all
   // signals.
   t->stashed_signal_processed();
+  sig_set_t app_mask = t->get_sigmask();
 
   int sig = t->ev().Signal().siginfo.si_signo;
   int stop_sig;
@@ -1652,6 +1739,12 @@ static bool inject_handled_signal(RecordTask* t) {
       << t->ip()
       << "; actual signal mask=" << HEX(t->read_sigmask_from_process())
       << " (cached " << HEX(t->get_sigmask()) << ")";
+
+  if (t->stashed_signals_blocking_more_signals) {
+    // More stashed signals remain, so will_resume_execution blocked all
+    // signals for the injection.
+    fix_sigmask_after_stashed_injection(t, sig, app_mask);
+  }
 
   if (t->signal_handler_takes_siginfo(sig)) {
     // The kernel copied siginfo into userspace so it can pass a pointer to
