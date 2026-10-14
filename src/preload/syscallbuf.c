@@ -723,6 +723,23 @@ static int open_desched_event_counter(pid_t tid) {
 }
 
 /**
+ * Publish our syscall entry for code that executes system calls where rr
+ * can't patch them (RR_SOFTTICKS_SYSCALL_OFFSET in include/rr/softticks.h).
+ * The thread-locals page starts zeroed at an exec and in a fork child, so this
+ * runs when the process initializes and at each thread's first syscall_hook.
+ */
+static void publish_syscall_entry(void) {
+  _Static_assert(SOFTWARE_TICKS_SYSCALL_ADDR ==
+                    PRELOAD_THREAD_LOCALS_ADDR + RR_SOFTTICKS_SYSCALL_OFFSET,
+                "SOFTWARE_TICKS_SYSCALL_ADDR");
+#if defined(__x86_64__) || defined(__i386__)
+  extern RR_HIDDEN long _syscallbuf_softticks_syscall(long no, const long* args);
+  *(long (**)(long, const long*))SOFTWARE_TICKS_SYSCALL_ADDR =
+      _syscallbuf_softticks_syscall;
+#endif
+}
+
+/**
  * Initialize thread-local buffering state, if enabled and not already
  * initialized.
  */
@@ -739,6 +756,8 @@ static void init_thread(void) {
   if (!buffer_enabled || globals.in_diversion) {
     return;
   }
+
+  publish_syscall_entry();
 
   /* NB: we want this setup emulated during replay. */
   thread_locals->desched_counter_fd =
@@ -1163,6 +1182,7 @@ static void __attribute__((constructor)) init_process(void) {
   }
 
   process_inited = 1;
+  publish_syscall_entry();
 }
 
 /**

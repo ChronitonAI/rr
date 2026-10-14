@@ -182,6 +182,51 @@ _syscall_hook_trampoline:
         .cfi_endproc
         .size _syscall_hook_trampoline, .-_syscall_hook_trampoline
 
+/**
+ * long _syscallbuf_softticks_syscall(long no, const long args[6]): the syscall
+ * entry that init_process publishes in the thread-locals page
+ * (RR_SOFTTICKS_SYSCALL_OFFSET in include/rr/softticks.h), for code that
+ * executes system calls where we can't patch them. A C function for its
+ * callers: it packages the arguments as the trampoline does and leaves through
+ * _syscallbuf_final_exit_instruction like the hooks, so that rr can deliver
+ * the signals it deferred while the thread was in syscallbuf code.
+ */
+        .global _syscallbuf_softticks_syscall
+        .hidden _syscallbuf_softticks_syscall
+        .type _syscallbuf_softticks_syscall, @function
+_syscallbuf_softticks_syscall:
+        .cfi_startproc
+        /* A struct syscall_info, and 12 bytes to align the stack for the call */
+        sub $40,%esp
+        .cfi_adjust_cfa_offset 40
+        mov 44(%esp),%eax       /* no */
+        mov %eax,(%esp)
+        mov 48(%esp),%ecx       /* args */
+        mov (%ecx),%eax
+        mov %eax,4(%esp)
+        mov 4(%ecx),%eax
+        mov %eax,8(%esp)
+        mov 8(%ecx),%eax
+        mov %eax,12(%esp)
+        mov 12(%ecx),%eax
+        mov %eax,16(%esp)
+        mov 16(%ecx),%eax
+        mov %eax,20(%esp)
+        mov 20(%ecx),%eax
+        mov %eax,24(%esp)
+        mov %esp,%eax
+        pushl %eax
+        .cfi_adjust_cfa_offset 4
+        call syscall_hook
+        add $44,%esp
+        .cfi_adjust_cfa_offset -44
+        pop (stub_scratch_1)
+        .cfi_adjust_cfa_offset -4
+        REG_AT_ADDR32(0x08 /* %eip */, stub_scratch_1)
+        jmp _syscallbuf_final_exit_instruction
+        .cfi_endproc
+        .size _syscallbuf_softticks_syscall, .-_syscallbuf_softticks_syscall
+
 #define SYSCALLHOOK_START(name) \
        .global name;            \
        .hidden name;            \
@@ -364,6 +409,48 @@ _syscall_hook_trampoline:
         ret
         .cfi_endproc
         .size _syscall_hook_trampoline, . - _syscall_hook_trampoline
+
+/**
+ * long _syscallbuf_softticks_syscall(long no, const long args[6]): the syscall
+ * entry that init_process publishes in the thread-locals page
+ * (RR_SOFTTICKS_SYSCALL_OFFSET in include/rr/softticks.h), for code that
+ * executes system calls where we can't patch them. A C function for its
+ * callers: it packages the arguments as the trampoline does and leaves through
+ * _syscallbuf_final_exit_instruction like the hooks, so that rr can deliver
+ * the signals it deferred while the thread was in syscallbuf code.
+ */
+        .p2align 4
+        .global _syscallbuf_softticks_syscall
+        .hidden _syscallbuf_softticks_syscall
+        .type _syscallbuf_softticks_syscall, @function
+_syscallbuf_softticks_syscall:
+        .cfi_startproc
+        /* A struct syscall_info, and 8 bytes to align the stack for the call */
+        sub $72,%rsp
+        .cfi_adjust_cfa_offset 72
+        mov %rdi,(%rsp)
+        mov (%rsi),%rax
+        mov %rax,8(%rsp)
+        mov 8(%rsi),%rax
+        mov %rax,16(%rsp)
+        mov 16(%rsi),%rax
+        mov %rax,24(%rsp)
+        mov 24(%rsi),%rax
+        mov %rax,32(%rsp)
+        mov 32(%rsi),%rax
+        mov %rax,40(%rsp)
+        mov 40(%rsi),%rax
+        mov %rax,48(%rsp)
+        mov %rsp,%rdi
+        callq syscall_hook
+        add $72,%rsp
+        .cfi_adjust_cfa_offset -72
+        pop (stub_scratch_1)
+        .cfi_adjust_cfa_offset -8
+        REG_AT_ADDR32(0x10 /* %rip */, stub_scratch_1)
+        jmp _syscallbuf_final_exit_instruction
+        .cfi_endproc
+        .size _syscallbuf_softticks_syscall, .-_syscallbuf_softticks_syscall
 
 _syscallbuf_final_exit_instruction:
         jmp *(stub_scratch_1)

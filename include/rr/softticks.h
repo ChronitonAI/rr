@@ -72,6 +72,24 @@
  * (144, plus 1040 on aarch64). */
 #define RR_SOFTTICKS_COUNTDOWN_OFFSET 0x800
 
+/* The offset of the syscall entry in the preload thread-locals page, after the
+ * countdown: a pointer (4 bytes on i386, 8 elsewhere) to a function
+ *
+ *   long fn(long no, const long args[6]);
+ *
+ * with the C calling convention, which makes system call |no| with the arguments
+ * args[0] to args[5] through the tracer's syscall buffer when it can (as a traced
+ * system call otherwise), and returns what the system call instruction would (a
+ * negative errno on failure). It is for code that executes a program's system calls
+ * where the tracer cannot patch them, such as a binary translator running the program
+ * from a code cache. It is 0 when there is none: without a tracer, before the tracer's
+ * preload library has initialized in the process (the page starts zeroed at an exec,
+ * and in a fork child until the child's first buffered system call), when the syscall
+ * buffer is disabled, and on aarch64 for now. It is equivalent to the instruction only
+ * for system calls that need nothing else from the caller: not those that change the
+ * stack or the control flow (clone, fork, vfork, execve, exit, rt_sigreturn, ...). */
+#define RR_SOFTTICKS_SYSCALL_OFFSET 0x808
+
 /* The priority of the page-mapping initializer: before every user constructor
  * (101 and up) and every other initializer of the implementation. */
 #define RR_SOFTTICKS_INIT_PRIORITY 1
@@ -134,6 +152,7 @@
 
 #define RR_SOFTTICKS_X86_PAGE_ADDR 0x70001000
 #define RR_SOFTTICKS_X86_COUNTDOWN_ADDR 0x70001800
+#define RR_SOFTTICKS_X86_SYSCALL_ADDR 0x70001808
 
 /* x86-64: 11 bytes; clobbers the flags only. */
 #define RR_SOFTTICKS_X64_TICK_ASM                                              \
@@ -214,6 +233,7 @@
 /* PRELOAD_LIBRARY_PAGE_SIZE is 64 KiB on aarch64. */
 #define RR_SOFTTICKS_ARM64_PAGE_ADDR 0x70010000
 #define RR_SOFTTICKS_ARM64_COUNTDOWN_ADDR 0x70010800
+#define RR_SOFTTICKS_ARM64_SYSCALL_ADDR 0x70010808
 
 /* aarch64: 28 bytes; clobbers x16 and x17 (the intra-procedure-call scratch
  * registers), not the flags. x17 holds the countdown only inside the sequence: it is
@@ -261,16 +281,19 @@
 #define RR_SOFTTICKS_TICK_ASM RR_SOFTTICKS_X64_TICK_ASM
 #define RR_SOFTTICKS_INIT_ASM RR_SOFTTICKS_X64_INIT_ASM
 #define RR_SOFTTICKS_COUNTDOWN_ADDR RR_SOFTTICKS_X86_COUNTDOWN_ADDR
+#define RR_SOFTTICKS_SYSCALL_ADDR RR_SOFTTICKS_X86_SYSCALL_ADDR
 #define RR_SOFTTICKS_TICK_CLOBBERS "cc"
 #elif defined(__i386__)
 #define RR_SOFTTICKS_TICK_ASM RR_SOFTTICKS_X86_TICK_ASM
 #define RR_SOFTTICKS_INIT_ASM RR_SOFTTICKS_X86_INIT_ASM
 #define RR_SOFTTICKS_COUNTDOWN_ADDR RR_SOFTTICKS_X86_COUNTDOWN_ADDR
+#define RR_SOFTTICKS_SYSCALL_ADDR RR_SOFTTICKS_X86_SYSCALL_ADDR
 #define RR_SOFTTICKS_TICK_CLOBBERS "cc"
 #elif defined(__aarch64__)
 #define RR_SOFTTICKS_TICK_ASM RR_SOFTTICKS_ARM64_TICK_ASM
 #define RR_SOFTTICKS_INIT_ASM RR_SOFTTICKS_ARM64_INIT_ASM
 #define RR_SOFTTICKS_COUNTDOWN_ADDR RR_SOFTTICKS_ARM64_COUNTDOWN_ADDR
+#define RR_SOFTTICKS_SYSCALL_ADDR RR_SOFTTICKS_ARM64_SYSCALL_ADDR
 #define RR_SOFTTICKS_TICK_CLOBBERS "x16", "x17"
 #endif
 

@@ -161,6 +161,10 @@ static inline const char* extract_file_name(const char* s) {
  * Instrumented code addresses it absolutely, so it must not move, and
  * struct preload_thread_locals must stay below it. */
 #define SOFTWARE_TICKS_COUNTDOWN_ADDR (PRELOAD_THREAD_LOCALS_ADDR + 0x800)
+/* After it, the pointer to the preload library's syscall entry
+ * (RR_SOFTTICKS_SYSCALL_OFFSET in include/rr/softticks.h), 8 bytes (4 used on
+ * i386), which the preload library writes. */
+#define SOFTWARE_TICKS_SYSCALL_ADDR (PRELOAD_THREAD_LOCALS_ADDR + 0x808)
 
 #include "rrcalls.h"
 

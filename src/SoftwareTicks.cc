@@ -290,8 +290,10 @@ uint64_t software_ticks_slot_for(Task* t, uint64_t remaining) {
 }
 
 size_t software_ticks_thread_locals_size() {
+  // Through the syscall entry's pointer, after the countdown: the shared memory
+  // must hold it (bytes of the page past the end of the file are not kept).
   return std::max<size_t>(PRELOAD_THREAD_LOCALS_SIZE,
-                          SOFTWARE_TICKS_COUNTDOWN_ADDR -
+                          SOFTWARE_TICKS_SYSCALL_ADDR -
                               PRELOAD_THREAD_LOCALS_ADDR + sizeof(uint64_t));
 }
 
