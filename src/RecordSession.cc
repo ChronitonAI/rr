@@ -826,17 +826,6 @@ static void debug_exec_state(const char* msg, RecordTask* t) {
   LOG(debug) << msg << ": status=" << t->status();
 }
 
-template <typename Arch>
-static bool is_ptrace_any_singlestep_arch(int command) {
-  return command >= 0 &&
-    (command == PTRACE_SINGLESTEP || command == Arch::PTRACE_SYSEMU_SINGLESTEP);
-}
-
-static bool is_ptrace_any_singlestep(SupportedArch arch, int command)
-{
-  RR_ARCH_FUNCTION(is_ptrace_any_singlestep_arch, arch, command);
-}
-
 void RecordSession::task_continue(const StepState& step_state) {
   RecordTask* t = scheduler().current();
 
@@ -1809,6 +1798,18 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
 
         t->ev().transform(EV_SIGNAL_HANDLER);
         t->signal_delivered(sig);
+        if (is_x86ish(t->arch()) &&
+            is_ptrace_any_singlestep(t->arch(),
+                                     t->emulated_ptrace_cont_command)) {
+          // On x86, Linux stops single-stepping a task when it sets up a
+          // signal frame (handle_signal() calls user_disable_single_step()).
+          // If we have a ptracer, it still gets a stop for the step.
+          if (t->emulated_ptracer) {
+            t->emulated_ptrace_step_entered_handler = true;
+          } else {
+            t->emulated_ptrace_cont_command = 0;
+          }
+        }
         // We already continued! Don't continue now, and allow switching.
         step_state->continue_type = DONT_CONTINUE;
         last_task_switchable = ALLOW_SWITCH;

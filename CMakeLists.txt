@@ -1332,6 +1332,7 @@ set(BASIC_TESTS
   ptracer_death
   ptracer_death_multithread
   ptracer_death_multithread_peer
+  x86/ptracer_death_singlestep
   # pivot_root ... disabled because it fails when run as root and does nothing otherwise
   quotactl
   x86/rdtsc
