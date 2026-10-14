@@ -903,6 +903,34 @@ static void guard_unexpected_signal(ReplayTask* t) {
   }
 }
 
+/**
+ * When an aarch64 syscall returns a -ERESTART* error, the kernel sets x0 back
+ * to orig_x0 and moves pc back to the syscall instruction before it looks for
+ * a signal to deliver, i.e. before any signal stop (see
+ * arch_do_signal_or_restart() in arch/arm64/kernel/signal.c). Return |regs|
+ * with those changes applied.
+ */
+static Registers aarch64_syscall_restart_regs(const Registers& regs) {
+  Registers r = regs;
+  r.set_arg1(r.orig_arg1());
+  r.set_ip(r.ip().decrement_by_syscall_insn_length(r.arch()));
+  return r;
+}
+
+/**
+ * Replay applies the changes above when it processes the syscall exit, but
+ * the recorder can record an event while the task is still at the
+ * syscall-exit stop, e.g. a SCHED when it handles a time-slice signal it had
+ * deferred. The recorded registers are then from before the changes.
+ * Return true if |rec_regs| are such registers for the replay registers
+ * |regs|.
+ */
+static bool is_before_aarch64_syscall_restart(const Registers& regs,
+                                              const Registers& rec_regs) {
+  return rec_regs.arch() == aarch64 && rec_regs.syscall_may_restart() &&
+         regs.matches(aarch64_syscall_restart_regs(rec_regs));
+}
+
 static bool is_same_execution_point(ReplayTask* t, const Registers& rec_regs,
                                     const ExtraRegisters& rec_extra_regs,
                                     Ticks ticks_left,
@@ -930,7 +958,8 @@ static bool is_same_execution_point(ReplayTask* t, const Registers& rec_regs,
       *mismatched_regs_ptr = mismatched_regs;
       return false;
     }
-  } else if (!t->regs().matches(rec_regs)) {
+  } else if (!t->regs().matches(rec_regs) &&
+             !is_before_aarch64_syscall_restart(t->regs(), rec_regs)) {
     if (IS_LOGGING(debug)) {
       LOG(debug) << "  not same execution point: regs differ (@" << rec_regs.ip()
                  << ") replay vs rec: " << t->regs().compare_with(rec_regs);
@@ -2006,10 +2035,7 @@ ReplayTask* ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
             // On x86, there are none, but on aarch64, we need to restore arg1
             // and pc.
             // [1] https://github.com/torvalds/linux/blob/caffb99b6929f41a69edbb5aef3a359bf45f3315/arch/arm64/kernel/signal.c#L855-L862
-            Registers r = t->regs();
-            r.set_arg1(r.orig_arg1());
-            r.set_ip(r.ip().decrement_by_syscall_insn_length(t->arch()));
-            t->set_regs(r);
+            t->set_regs(aarch64_syscall_restart_regs(t->regs()));
           }
         }
       }
