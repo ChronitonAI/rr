@@ -63,6 +63,11 @@ struct SyscallbufCodeLayout {
 enum SignalDisposition { SIGNAL_DEFAULT, SIGNAL_IGNORE, SIGNAL_HANDLER };
 
 /**
+ * Return true if |command| is PTRACE_SINGLESTEP or PTRACE_SYSEMU_SINGLESTEP.
+ */
+bool is_ptrace_any_singlestep(SupportedArch arch, int command);
+
+/**
  * Every Task owned by a RecordSession is a RecordTask. Functionality that
  * only applies during recording belongs here.
  */
@@ -802,9 +807,18 @@ public:
   WaitStatus emulated_stop_code;
   // Always zero while no ptracer is attached.
   int emulated_ptrace_options;
-  // One of PTRACE_CONT, PTRACE_SYSCALL --- or 0 if the tracee has not been
-  // continued by its ptracer yet, or has no ptracer.
+  // The request with which our ptracer last resumed us: PTRACE_CONT,
+  // PTRACE_SYSCALL, PTRACE_SINGLESTEP, PTRACE_SYSEMU or
+  // PTRACE_SYSEMU_SINGLESTEP --- or 0 if the ptracer hasn't resumed us yet,
+  // or we have no ptracer. But when the ptracer exits, a tracee that is still
+  // single-stepping keeps PTRACE_SINGLESTEP. (Without a ptracer, a step over
+  // a syscall then traps one instruction late: Linux sends the step's
+  // SIGTRAP at the syscall's exit.)
   int emulated_ptrace_cont_command;
+  // True if |emulated_ptrace_cont_command| is a single-step that has entered
+  // a signal handler on x86, where Linux single-steps no further (it still
+  // reports the step to the ptracer).
+  bool emulated_ptrace_step_entered_handler;
   // true when a ptracer/waiter wait() can return |emulated_stop_code|.
   bool emulated_stop_pending;
   // true when we've left the task stopped in the middle of a syscall, at a

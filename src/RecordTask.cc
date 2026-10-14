@@ -172,6 +172,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       emulated_ptrace_event_msg(0),
       emulated_ptrace_options(0),
       emulated_ptrace_cont_command(0),
+      emulated_ptrace_step_entered_handler(false),
       emulated_stop_pending(false),
       held_at_emulated_ptrace_event(false),
       emulated_ptrace_SIGCHLD_pending(false),
@@ -222,6 +223,17 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
     sighandlers.swap(sh);
     own_namespace_rec_tid = _tid;
   }
+}
+
+template <typename Arch>
+static bool is_ptrace_any_singlestep_arch(int command) {
+  return command >= 0 &&
+    (command == PTRACE_SINGLESTEP || command == Arch::PTRACE_SYSEMU_SINGLESTEP);
+}
+
+bool is_ptrace_any_singlestep(SupportedArch arch, int command)
+{
+  RR_ARCH_FUNCTION(is_ptrace_any_singlestep_arch, arch, command);
 }
 
 RecordTask::~RecordTask() {
@@ -907,6 +919,17 @@ void RecordTask::detach_emulated_ptrace_tracees() {
     t->emulated_ptracer = nullptr;
     t->emulated_ptrace_seized = false;
     t->emulated_ptrace_options = 0;
+    // Linux turns off syscall tracing and, since 5.3, syscall emulation (see
+    // __ptrace_unlink(); older kernels left PTRACE_SYSEMU in effect, but we
+    // follow current kernels), but leaves the tracee single-stepping, if it
+    // still is.
+    if (is_ptrace_any_singlestep(t->arch(), t->emulated_ptrace_cont_command) &&
+        !t->emulated_ptrace_step_entered_handler) {
+      t->emulated_ptrace_cont_command = PTRACE_SINGLESTEP;
+    } else {
+      t->emulated_ptrace_cont_command = 0;
+    }
+    t->emulated_ptrace_step_entered_handler = false;
     if (stop_again) {
       t->stop_again_after_ptrace_detach();
       continue;
