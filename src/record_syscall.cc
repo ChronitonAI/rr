@@ -4582,7 +4582,8 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
     case Arch::close_range:
     case Arch::clone3:
     case Arch::io_uring_setup:
-    case Arch::io_setup: {
+    case Arch::io_setup:
+    case Arch::io_destroy: {
       // Prevent the various syscalls that we don't support from being used by
       // applications and fake an ENOSYS return.
       Registers r = regs;
@@ -7550,6 +7551,7 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::futex_time64:
     case Arch::futex:
     case Arch::ioctl:
+    case Arch::io_destroy:
     case Arch::io_setup:
     case Arch::io_uring_setup:
     case Arch::memfd_create:

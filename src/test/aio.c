@@ -3,8 +3,10 @@
 #include "util.h"
 
 int main(void) {
-  aio_context_t ctx;
+  aio_context_t ctx = 0;
   int ret = syscall(__NR_io_setup, 1, &ctx);
+  test_assert(ret < 0 && errno == ENOSYS);
+  ret = syscall(__NR_io_destroy, ctx);
   test_assert(ret < 0 && errno == ENOSYS);
 
   atomic_puts("EXIT-SUCCESS");
