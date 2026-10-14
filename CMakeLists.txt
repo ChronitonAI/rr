@@ -1092,6 +1092,8 @@ set(BASIC_TESTS
   exec_from_other_thread
   exec_stopsig
   execveat
+  exit_group_at_seccomp_stop
+  exit_group_restarted_syscalls
   exit_with_syscallbuf_signal
   fadvise
   fatal_init_signal

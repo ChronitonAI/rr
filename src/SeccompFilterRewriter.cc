@@ -128,15 +128,12 @@ void SeccompFilterRewriter::install_patched_seccomp_filter(RecordTask* t) {
                    result_to_index, index_to_result);
 }
 
-bool SeccompFilterRewriter::map_filter_data_to_real_result(RecordTask* t,
-                                                           uint16_t value,
-                                                           uint32_t* result) {
-  if (value < BASE_CUSTOM_DATA) {
-    return false;
-  }
-  ASSERT(t, value < BASE_CUSTOM_DATA + index_to_result.size());
-  *result = index_to_result[value - BASE_CUSTOM_DATA];
-  return true;
+uint32_t SeccompFilterRewriter::map_filter_data_to_real_result(
+    RecordTask* t, uint16_t value) {
+  ASSERT(t, value >= BASE_CUSTOM_DATA &&
+                value < BASE_CUSTOM_DATA + index_to_result.size())
+      << "Unknown seccomp data " << value;
+  return index_to_result[value - BASE_CUSTOM_DATA];
 }
 
 } // namespace rr

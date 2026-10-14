@@ -45,16 +45,14 @@ public:
   void install_patched_seccomp_filter(RecordTask* t);
 
   /**
-   * Returns false if the input value is not valid. In this case a
-   * PTRACE_EVENT_EXIT probably got in the way.
+   * Returns the result of the tracee's filter that |value|, the
+   * SECCOMP_RET_DATA of a PTRACE_EVENT_SECCOMP stop from a patched filter,
+   * stands for.
    */
-  bool map_filter_data_to_real_result(RecordTask* t, uint16_t value,
-                                      uint32_t* result);
+  uint32_t map_filter_data_to_real_result(RecordTask* t, uint16_t value);
 
   /**
-   * Start numbering custom data values from here. This avoids overlapping
-   * values that might be returned from a PTRACE_EVENT_EXIT, so we can
-   * distinguish unexpected exits from real results of PTRACE_GETEVENTMSG.
+   * Start numbering custom data values from here.
    */
   enum { BASE_CUSTOM_DATA = 0x100 };
 

@@ -114,7 +114,9 @@
  * For rr's tests: makes rr SIGKILL a task at a particular point in rr's
  * handling of it, as if a SIGKILL that rr doesn't control (from another
  * process, or from a pid namespace being torn down) had arrived right then.
- * This makes races with such SIGKILLs deterministic. Use as
+ * This makes races with such SIGKILLs deterministic. (At
+ * RRCALL_KILL_EXIT_GROUP_FROM_SECCOMP_STOP, rr instead lets the task's own
+ * exit_group() kill it.) Use as
  *
  *   syscall(SYS_rrcall_arm_kill, point, arg, flags, 0, 0, 0)
  *
@@ -136,9 +138,9 @@
  * at its PTRACE_EVENT_EXIT stop).
  *
  * Returns 0, or -EINVAL for an unknown point or flag, or if arguments 4-6
- * aren't 0. The SIGKILL is real, so the trace records it like any other
- * SIGKILL from outside, and replay treats this syscall as a no-op. Without
- * rr, it fails with ENOSYS.
+ * aren't 0. The kill is real, so the trace records it like any other
+ * kill that rr doesn't control, and replay treats this syscall as a no-op.
+ * Without rr, it fails with ENOSYS.
  */
 #define SYS_rrcall_arm_kill (RR_CALL_BASE + 13)
 #define RRCALL_ARM_KILL_INHERIT 1
@@ -254,6 +256,19 @@ enum rrcall_kill_point {
      syscalls that patching can make the task do. rr waits until it knows
      the task is dying. */
   RRCALL_KILL_BEFORE_SYSCALL_PATCH,
+
+  /* Seccomp */
+
+  /* A task at its PTRACE_EVENT_SECCOMP stop for exit_group(), when rr
+     handles the stop, just before rr reads the stop's seccomp data with
+     PTRACE_GETEVENTMSG. Instead of sending a SIGKILL, rr resumes the task
+     without handling the stop, so that its exit_group() kills it, and waits
+     until the task has reached its PTRACE_EVENT_EXIT stop (or has exited),
+     without collecting that stop. PTRACE_GETEVENTMSG then returns the
+     exit_group() status << 8, as when another thread's exit_group() kills
+     a task at its PTRACE_EVENT_SECCOMP stop (a SIGKILL would make it
+     return the signal number instead). */
+  RRCALL_KILL_EXIT_GROUP_FROM_SECCOMP_STOP,
 
   RRCALL_KILL_NUM_POINTS
 };

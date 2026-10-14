@@ -647,6 +647,32 @@ void RecordSession::handle_seccomp_errno(RecordTask* t,
   step_state->continue_type = RecordSession::DONT_CONTINUE;
 }
 
+/**
+ * This is purely for testing purposes. See
+ * RRCALL_KILL_EXIT_GROUP_FROM_SECCOMP_STOP. `t` is at a
+ * PTRACE_EVENT_SECCOMP stop that we're handling.
+ */
+static void maybe_exit_group_from_seccomp_stop(RecordTask* t) {
+  if (!is_exit_group_syscall(t->regs().original_syscallno(), t->arch()) ||
+      !t->take_armed_kill(RRCALL_KILL_EXIT_GROUP_FROM_SECCOMP_STOP)) {
+    return;
+  }
+  // Let the exit_group() run without us.
+  t->ptrace_if_stopped(PTRACE_CONT, nullptr, nullptr);
+  // Wait until it has reached its PTRACE_EVENT_EXIT stop (or exited), but
+  // leave that for later.
+  WaitOptions options(t->tid);
+  options.consume = false;
+  WaitResult result;
+  do {
+    result = WaitManager::wait_stop_or_exit(options);
+  } while (result.code == WAIT_NO_STATUS);
+  ASSERT(t, result.code == WAIT_OK) << "Task disappeared";
+  ASSERT(t, result.status.ptrace_event() == PTRACE_EVENT_EXIT ||
+                result.status.reaped())
+      << "exit_group() didn't end the task: " << result.status;
+}
+
 bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
                                         StepState* step_state,
                                         RecordResult* result,
@@ -676,13 +702,15 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
         syscall_seccomp_ordering_ = SECCOMP_BEFORE_PTRACE_SYSCALL;
       }
 
-      int seccomp_data = t->get_ptrace_eventmsg_seccomp_data();
       // We need to set the orig_* values before we let the process continue to exit
       // since the handler for the exit event will need them.
       // See `handle_ptrace_exit_event` above.
       t->apply_syscall_entry_regs();
+      maybe_exit_group_from_seccomp_stop(t);
+      int seccomp_data = t->get_ptrace_eventmsg_seccomp_data();
       if (seccomp_data < 0) {
         // Process just died. Urk. Just wait for the exit event and pretend this stop never happened!
+        t->did_leave_stop_unexpectedly();
         last_task_switchable = ALLOW_SWITCH;
         step_state->continue_type = DONT_CONTINUE;
         return true;
@@ -696,14 +724,9 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
         // Note that we make no attempt to patch the syscall site when the
         // user handle does not return ALLOW. Apart from the ERRNO case,
         // handling these syscalls is necessarily slow anyway.
-        uint32_t real_result;
-        if (!seccomp_filter_rewriter().map_filter_data_to_real_result(
-                t, seccomp_data, &real_result)) {
-          LOG(debug)
-              << "Process terminated unexpectedly during PTRACE_GETEVENTMSG";
-          step_state->continue_type = RecordSession::CONTINUE;
-          break;
-        }
+        uint32_t real_result =
+            seccomp_filter_rewriter().map_filter_data_to_real_result(
+                t, seccomp_data);
         uint16_t real_result_data = real_result & SECCOMP_RET_DATA;
         switch (real_result & SECCOMP_RET_ACTION) {
           case SECCOMP_RET_TRAP:
@@ -2030,7 +2053,7 @@ bool RecordSession::handle_signal_event(RecordTask* t, StepState* step_state) {
                               &dummy_did_enter_syscall);
           ASSERT(t, !dummy_did_enter_syscall);
         }
-        if (t->ptrace_event() == PTRACE_EVENT_EXIT) {
+        if (!t->is_stopped() || t->ptrace_event() == PTRACE_EVENT_EXIT) {
           // Tracee was nuked (probably SIGKILL) during desched processing.
           return true;
         }
