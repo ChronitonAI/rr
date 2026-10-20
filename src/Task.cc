@@ -418,6 +418,13 @@ string Task::file_name_of_fd(int fd) {
   return path;
 }
 
+void Task::did_leave_stop_unexpectedly() {
+  LOG(debug) << "Task " << tid << " left its stop " << status()
+             << " unexpectedly";
+  set_stopped(false);
+  in_unexpected_exit = true;
+}
+
 pid_t Task::get_ptrace_eventmsg_pid() {
   unsigned long msg = 0;
   if (!ptrace_if_stopped(PTRACE_GETEVENTMSG, nullptr, &msg)) {
@@ -1119,6 +1126,7 @@ void Task::post_exec(const string& exe_file) {
   preload_globals = nullptr;
   rseq_state = nullptr;
   thread_group()->execed = true;
+  thread_group()->exit_group_task = TaskUid();
 
   thread_areas_.clear();
   memset(&thread_locals, 0, sizeof(thread_locals));

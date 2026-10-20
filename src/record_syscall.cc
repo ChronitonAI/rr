@@ -4220,6 +4220,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         prepare_exit(t);
         return ALLOW_SWITCH;
       }
+      t->thread_group()->exit_group_task = t->tuid();
       return PREVENT_SWITCH;
 
     case Arch::execve:

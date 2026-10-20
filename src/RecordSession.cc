@@ -698,13 +698,22 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
         syscall_seccomp_ordering_ = SECCOMP_BEFORE_PTRACE_SYSCALL;
       }
 
-      int seccomp_data = t->get_ptrace_eventmsg_seccomp_data();
       // We need to set the orig_* values before we let the process continue to exit
       // since the handler for the exit event will need them.
       // See `handle_ptrace_exit_event` above.
       t->apply_syscall_entry_regs();
+      // If another thread of t's thread group has entered exit_group(), that
+      // kills t: t has left this stop for its PTRACE_EVENT_EXIT stop, where
+      // PTRACE_GETEVENTMSG returns its exit status, or the SIGKILL will take
+      // it there.
+      ThreadGroup* tg = t->thread_group().get();
+      bool killed_by_exit_group = tg->exit_group_task != TaskUid() &&
+                                  tg->exit_group_task != t->tuid();
+      int seccomp_data =
+          killed_by_exit_group ? -1 : t->get_ptrace_eventmsg_seccomp_data();
       if (seccomp_data < 0) {
         // Process just died. Urk. Just wait for the exit event and pretend this stop never happened!
+        t->did_leave_stop_unexpectedly();
         last_task_switchable = scheduler().wait_for_killed_task(t) ?
             PREVENT_SWITCH : ALLOW_SWITCH;
         step_state->continue_type = DONT_CONTINUE;
@@ -726,6 +735,11 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
               << "Process terminated unexpectedly during PTRACE_GETEVENTMSG";
           step_state->continue_type = RecordSession::CONTINUE;
           break;
+        }
+        if (tg->exit_group_task == t->tuid()) {
+          // t's own seccomp filter doesn't let t run the exit_group() whose
+          // entry we handled at its syscall-entry stop.
+          tg->exit_group_task = TaskUid();
         }
         uint16_t real_result_data = real_result & SECCOMP_RET_DATA;
         switch (real_result & SECCOMP_RET_ACTION) {
