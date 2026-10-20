@@ -318,6 +318,8 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
 static void note_entering_syscall(RecordTask* t) {
   ASSERT(t, EV_SYSCALL == t->ev().type());
   t->ev().Syscall().state = ENTERING_SYSCALL;
+  // The task has made a syscall, so any restart that rr set up is done.
+  t->syscall_restart_set_up.reset();
   if (!t->ev().Syscall().is_restart) {
     /* Save a copy of the arg registers so that we
      * can use them to detect later restarted
@@ -1775,6 +1777,34 @@ static size_t aarch64_sigframe_size(RecordTask* t) {
 }
 
 /**
+ * On x86, rr sets up the restart of a syscall that a signal without a
+ * handler interrupted at that signal's delivery stop (see
+ * EV_SIGNAL_DELIVERY in RecordSession::signal_state_changed()). |t| is
+ * about to be delivered a signal with a handler. If it hasn't executed an
+ * instruction since rr set up the restart (rr hasn't processed a syscall
+ * entry since, and its tick count and registers are the same), give it
+ * back the registers it had then, so that the kernel fails the syscall
+ * with EINTR, or restarts it as SA_RESTART says, as it does for a signal
+ * with a handler that interrupts a syscall. The task may have returned to
+ * the syscall instruction and stopped there before executing it, which
+ * leaves orig_rax -1.
+ */
+static void undo_syscall_restart_set_up(RecordTask* t) {
+  if (!t->syscall_restart_set_up) {
+    return;
+  }
+  RecordTask::SyscallRestartSetUp restart = *t->syscall_restart_set_up;
+  t->syscall_restart_set_up.reset();
+  Registers r = t->regs();
+  r.set_original_syscallno(restart.regs_after.original_syscallno());
+  if (t->tick_count() == restart.ticks && r == restart.regs_after) {
+    LOG(debug) << "  undoing the syscall restart set up at "
+               << restart.regs_after.ip();
+    t->set_regs(restart.regs_before);
+  }
+}
+
+/**
  * |t| is being delivered a signal, and its state changed.
  * Must call t->stashed_signal_processed() once we're ready to unmask signals.
  */
@@ -1794,6 +1824,9 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
         LOG(debug) << "  " << t->tid << ": " << signal_name(sig)
                    << " has user handler";
 
+        // The event we just recorded has the task's registers, which replay
+        // reaches. Replay sets up the signal frame from the recorded memory.
+        undo_syscall_restart_set_up(t);
         if (!inject_handled_signal(t)) {
           // Signal delivery isn't happening. Prepare to process the new
           // signal that aborted signal delivery.
@@ -1892,18 +1925,34 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
       // We didn't record this event above, so do that now.
       // NB: If there is no handler, and we interrupted a syscall, and there are
       // no more actionable signals, the kernel sets us up for a syscall
-      // restart. But it does that *after* the ptrace trap. To replay this
-      // correctly we need to fake those changes here. But we don't do this
-      // if we're going to switch away at the ptrace trap, and for the moment,
-      // 'can_switch' is actually 'will_switch'.
-      // This is essentially copied from do_signal in arch/x86/kernel/signal.c
+      // restart once the task leaves this ptrace stop. We record the event
+      // with the registers of the restarted syscall, and on x86 we make those
+      // changes here ourselves (see below). We don't do this if we're going
+      // to switch away at the ptrace trap, and for the moment, 'can_switch' is
+      // actually 'will_switch'.
+      // This is essentially copied from arch_do_signal_or_restart in
+      // arch/x86/kernel/signal.c
       bool has_other_signals = t->has_any_actionable_signal();
       auto r = t->regs();
       if (!is_fatal) {
         Event *prev_ev = t->prev_ev();
         if (can_switch == PREVENT_SWITCH && !has_other_signals && prev_ev &&
-            EV_SYSCALL_INTERRUPTION == prev_ev->type()) {
-          switch (prev_ev->Syscall().regs.syscall_result_signed()) {
+            EV_SYSCALL_INTERRUPTION == prev_ev->type() &&
+            (t->arch() == aarch64 ||
+             (r.original_syscallno() >= 0 && r.syscall_may_restart()))) {
+          // On x86 the kernel decides from the task's registers: a syscall
+          // number in orig_rax and -ERESTART* in the result register. Once
+          // we've set up the restart at an earlier signal stop (see below),
+          // the result register holds a syscall number instead. On aarch64
+          // the kernel has already decided, before the first signal stop,
+          // that the task came from a syscall, and replaced the result with
+          // the syscall's first argument (do_signal()), so use the result
+          // saved at the syscall's exit.
+          intptr_t result =
+              t->arch() == aarch64
+                  ? prev_ev->Syscall().regs.syscall_result_signed()
+                  : r.syscall_result_signed();
+          switch (result) {
             case -ERESTARTNOHAND:
             case -ERESTARTSYS:
             case -ERESTARTNOINTR:
@@ -1918,10 +1967,24 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
           // syscall-exit stop yet. So we should not decrement the pc again or
           // we'll rerun the instruction before the syscall.
           // [1] https://github.com/torvalds/linux/blob/caffb99b6929f41a69edbb5aef3a359bf45f3315/arch/arm64/kernel/signal.c#L855-L862
-          if (t->arch() != aarch64)
+          if (t->arch() != aarch64) {
             r.set_ip(r.ip().decrement_by_syscall_insn_length(t->arch()));
-          // Now that we've mucked with the registers, we can't switch tasks. That
-          // could allow more signals to be generated, breaking our assumption
+            // The task can stop again before the kernel would make these
+            // changes: for a signal that arrives after
+            // has_any_actionable_signal(), or for a PTRACE_INTERRUPT from
+            // the scheduler. Such a stop must report the registers we record
+            // here, so make the changes ourselves. The kernel then finds no
+            // syscall to restart. If the task stops for a signal with a
+            // handler before it executes an instruction,
+            // undo_syscall_restart_set_up() undoes them.
+            t->syscall_restart_set_up =
+                RecordTask::SyscallRestartSetUp{ t->regs(), r,
+                                                 t->tick_count() };
+            t->set_regs(r);
+          }
+          // Now that we've mucked with the registers, we don't switch tasks.
+          // On aarch64 that could allow more signals to be generated before
+          // the kernel has set up a restart_syscall, breaking our assumption
           // that we are the last signal.
         } else {
           // But if we didn't touch the registers switching here is ok.
@@ -1931,7 +1994,9 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
 
       t->record_event(t->ev(), RecordTask::FLUSH_SYSCALLBUF,
                       RecordTask::ALLOW_RESET_SYSCALLBUF, &r);
-      // Don't actually set_regs(r), the kernel does these modifications.
+      // On aarch64 we leave the registers to the kernel: it decides between
+      // restarting and EINTR from the result it saved before this stop, and
+      // sets a restart_syscall's syscall number only once it has decided.
 
       if (t->is_container_init() && is_fatal) {
         // Nondeterministic signals were already filtered out.

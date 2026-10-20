@@ -3,6 +3,8 @@
 #ifndef RR_RECORD_TASK_H_
 #define RR_RECORD_TASK_H_
 
+#include <optional>
+
 #include "ContextSwitchEvent.h"
 #include "Registers.h"
 #include "Task.h"
@@ -747,6 +749,18 @@ public:
   std::unique_ptr<TaskSyscallStateBase> syscall_state;
   Ticks ticks_at_last_recorded_syscall_exit;
   remote_code_ptr ip_at_last_recorded_syscall_exit;
+
+  // On x86, the restart of an interrupted syscall that rr set up at a
+  // signal-delivery stop (see RecordSession::signal_state_changed()): the
+  // task's registers before, the registers rr set, and the tick count.
+  // Cleared when rr processes a syscall entry or delivers a signal with a
+  // handler.
+  struct SyscallRestartSetUp {
+    Registers regs_before;
+    Registers regs_after;
+    Ticks ticks;
+  };
+  std::optional<SyscallRestartSetUp> syscall_restart_set_up;
 
   // Scheduler state
 

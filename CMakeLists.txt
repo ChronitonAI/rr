@@ -1141,8 +1141,10 @@ set(BASIC_TESTS
   grandchild_threads_thread_running
   grandchild_threads_parent_alive
   group_stop_thundering_herd
+  x86/handled_signal_restart_race
   x86/hle
   x86/hlt
+  ignored_signal_restart_race
   inotify
   int3
   intr_futex_wait_restart
