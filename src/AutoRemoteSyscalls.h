@@ -318,6 +318,9 @@ private:
   remote_code_ptr initial_ip;
   remote_ptr<void> initial_sp;
   bool initial_at_seccomp;
+  // If initial_at_seccomp, the arch of the syscall at that seccomp stop
+  // (an x86-64 task can make i386 syscalls with int $0x80)
+  SupportedArch seccomp_syscall_arch;
   remote_ptr<void> fixed_sp;
   std::vector<uint8_t> replaced_bytes;
   WaitStatus restore_wait_status;

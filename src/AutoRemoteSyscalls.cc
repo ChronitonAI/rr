@@ -93,6 +93,7 @@ AutoRemoteSyscalls::AutoRemoteSyscalls(Task* t,
       initial_ip(t->ip()),
       initial_sp(t->regs().sp()),
       initial_at_seccomp(t->ptrace_event() == PTRACE_EVENT_SECCOMP),
+      seccomp_syscall_arch(t->arch()),
       restore_wait_status(t->status()),
       new_tid_(-1),
       scratch_mem_was_mapped(false),
@@ -105,6 +106,9 @@ AutoRemoteSyscalls::AutoRemoteSyscalls(Task* t,
     // This should only ever happen during recording - we don't use the
     // seccomp traps during replay.
     ASSERT(t, t->session().is_recording());
+    get_syscall_instruction_arch(
+        t, initial_ip.decrement_by_syscall_insn_length(t->arch()),
+        &seccomp_syscall_arch);
   }
   // We support two paths for syscalls:
   // -- a fast path using a privileged untraced syscall and PTRACE_SINGLESTEP.
@@ -432,6 +436,17 @@ long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
     LOG(debug) << "Disabling singlestep path due to SIGTRAP sigaction";
     setup_path(false);
     callregs.set_ip(initial_regs.ip());
+  }
+
+  if (initial_at_seccomp && t->ptrace_event() == PTRACE_EVENT_SECCOMP &&
+      seccomp_syscall_arch != arch) {
+    // Resuming from this seccomp stop would make the kernel run our syscall
+    // as a syscall of seccomp_syscall_arch, so leave that syscall first.
+    // restore_state_to() gets back to the seccomp stop.
+    if (!t->exit_syscall_and_prepare_restart(seccomp_syscall_arch)) {
+      ASSERT(t, t->stopped_or_unexpected_exit()) << "Couldn't exit syscall";
+      return -ESRCH;
+    }
   }
 
   callregs.set_original_syscallno(syscallno);
