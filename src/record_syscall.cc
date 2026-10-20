@@ -51,6 +51,7 @@
 #include <sys/mman.h>
 #include <sys/quota.h>
 #include <sys/resource.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
@@ -91,6 +92,7 @@
 #include "RecordSession.h"
 #include "RecordTask.h"
 #include "Scheduler.h"
+#include "SignalfdMonitor.h"
 #include "StdioMonitor.h"
 #include "SysCpuMonitor.h"
 #include "TraceStream.h"
@@ -101,6 +103,7 @@
 #include "kernel_metadata.h"
 #include "kernel_supplement.h"
 #include "log.h"
+#include "record_signal.h"
 #include "util.h"
 
 // muslc defines those, but we want a typedef instead
@@ -535,6 +538,9 @@ struct TaskSyscallState : TaskSyscallStateBase {
   std::unique_ptr<TraceTaskEvent> exec_saved_event;
 
   RecordTask* emulate_wait_for_child;
+  /** For a read, pread64, readv, preadv or preadv2, whether its fd is a
+   *  signalfd */
+  bool read_from_signalfd;
 
   /** Saved syscall-entry registers, used by code paths that modify the
    *  registers temporarily.
@@ -576,6 +582,7 @@ struct TaskSyscallState : TaskSyscallStateBase {
   TaskSyscallState()
       : t(nullptr),
         emulate_wait_for_child(nullptr),
+        read_from_signalfd(false),
         expect_errno(0),
         should_emulate_result(false),
         preparation_done(false),
@@ -4110,6 +4117,11 @@ static Switchable maybe_emulate_proc_mem_write(RecordTask* t,
   return PREVENT_SWITCH;
 }
 
+static bool is_signalfd(RecordTask* t, int fd) {
+  FileMonitor* monitor = t->fd_table()->get_monitor(fd);
+  return monitor && monitor->type() == FileMonitor::Signalfd;
+}
+
 template <typename Arch>
 static Switchable rec_prepare_syscall_arch(RecordTask* t,
                                            TaskSyscallState& syscall_state,
@@ -4654,6 +4666,8 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       syscall_state.reg_parameter(
           2, ParamSize::from_syscall_result<typename Arch::ssize_t>(
                  (size_t)regs.arg3()));
+      // We may fix up synthetic SIGCHLDs read from a signalfd.
+      syscall_state.read_from_signalfd = is_signalfd(t, fd);
       return ALLOW_SWITCH;
     }
 
@@ -4841,8 +4855,11 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       syscall_state.reg_parameter<typename Arch::loff_t>(4, IN_OUT);
       int in_fd = (int)regs.arg1_signed();
       int out_fd = (int)regs.arg3_signed();
-      ASSERT(t, !t->fd_table()->is_monitoring(in_fd) &&
-             !t->fd_table()->is_monitoring(out_fd))
+      // The kernel fails it before it reads or writes anything if either fd
+      // is a signalfd, which isn't a regular file.
+      ASSERT(t, is_signalfd(t, in_fd) || is_signalfd(t, out_fd) ||
+             (!t->fd_table()->is_monitoring(in_fd) &&
+              !t->fd_table()->is_monitoring(out_fd)))
              << "copy_file_range for monitored fds not supported yet";
       return ALLOW_SWITCH;
     }
@@ -4882,6 +4899,8 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(iovecsp + i, iov_base),
                                         io_size.limit_size(iovecs[i].iov_len));
       }
+      // We may fix up synthetic SIGCHLDs read from a signalfd.
+      syscall_state.read_from_signalfd = is_signalfd(t, fd);
       return ALLOW_SWITCH;
     }
 
@@ -7254,6 +7273,150 @@ static void emulate_SIGCONT_sent_by_tracee(RecordTask* t) {
   }
 }
 
+/**
+ * The synthetic SIGCHLDs we send (see
+ * RecordTask::send_synthetic_SIGCHLD_if_necessary) carry none of the siginfo
+ * that the kernel fills in for a SIGCHLD. We fill it in when we deliver such a
+ * SIGCHLD to a handler (RecordTask::set_siginfo_for_synthetic_SIGCHLD). This
+ * does the same when the tracee takes it some other way. Returns false if |si|
+ * isn't a synthetic SIGCHLD, or if we can't tell what it's for.
+ */
+static bool fix_up_synthetic_SIGCHLD(RecordTask* t, siginfo_t* si) {
+  return si->si_signo == SIGCHLD && si->si_code == SI_QUEUE &&
+         si->si_value.sival_int == SIGCHLD_SYNTHETIC &&
+         t->set_siginfo_for_synthetic_SIGCHLD(si);
+}
+
+/**
+ * Fix up a synthetic SIGCHLD that the tracee took with rt_sigtimedwait().
+ */
+template <typename Arch>
+static void fix_up_synthetic_SIGCHLD_siginfo(
+    RecordTask* t, remote_ptr<typename Arch::siginfo_t> sip) {
+  if (sip.is_null()) {
+    // The tracee didn't ask for the siginfo, so there's nothing to fill in.
+    return;
+  }
+  auto tracee_si = t->read_mem(sip);
+  siginfo_t si;
+  memset(&si, 0, sizeof(si));
+  si.si_signo = tracee_si.si_signo;
+  si.si_errno = tracee_si.si_errno;
+  si.si_code = tracee_si.si_code;
+  si.si_value.sival_int = tracee_si._sifields._rt.si_sigval_.sival_int;
+  if (!fix_up_synthetic_SIGCHLD(t, &si)) {
+    return;
+  }
+  tracee_si.si_errno = 0;
+  tracee_si.si_code = si.si_code;
+  memset(&tracee_si._sifields, 0, sizeof(tracee_si._sifields));
+  tracee_si._sifields._sigchld.si_pid_ = si.si_pid;
+  tracee_si._sifields._sigchld.si_uid_ = si.si_uid;
+  tracee_si._sifields._sigchld.si_status_ = si.si_status;
+  t->write_mem(sip, tracee_si);
+}
+
+/**
+ * Fix up the synthetic SIGCHLDs that the tracee read from a signalfd. |ranges|
+ * hold the data it read, in order. A struct signalfd_siginfo may be split
+ * across ranges (readv() splits them on Linux 6.10 and later). The struct is
+ * the same for all architectures. Where ranges overlap, what the tracee read
+ * into the later one overwrote what it read into the earlier one, so we skip
+ * the records that include overwritten data.
+ * Returns true if the tracee read a SIGCHLD.
+ */
+static bool fix_up_synthetic_SIGCHLDs_from_signalfd(
+    RecordTask* t, const vector<FileMonitor::Range>& ranges) {
+  vector<uint8_t> data;
+  vector<bool> overwritten;
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    MemoryRange r(ranges[i].data, ranges[i].length);
+    size_t offset = data.size();
+    data.resize(offset + r.size());
+    overwritten.resize(offset + r.size());
+    t->read_bytes_helper(r.start(), r.size(), data.data() + offset);
+    for (size_t j = i + 1; j < ranges.size(); ++j) {
+      MemoryRange later(ranges[j].data, ranges[j].length);
+      if (r.intersects(later)) {
+        MemoryRange both = r.intersect(later);
+        auto begin = overwritten.begin() + offset + (both.start() - r.start());
+        fill(begin, begin + both.size(), true);
+      }
+    }
+  }
+  bool read_SIGCHLD = false;
+  bool fixed_up = false;
+  for (size_t offset = 0;
+       offset + sizeof(struct signalfd_siginfo) <= data.size();
+       offset += sizeof(struct signalfd_siginfo)) {
+    auto record = overwritten.begin() + offset;
+    auto record_end = record + sizeof(struct signalfd_siginfo);
+    if (find(record, record_end, true) != record_end) {
+      continue;
+    }
+    struct signalfd_siginfo ssi;
+    memcpy(&ssi, data.data() + offset, sizeof(ssi));
+    read_SIGCHLD = read_SIGCHLD || ssi.ssi_signo == SIGCHLD;
+    siginfo_t si;
+    memset(&si, 0, sizeof(si));
+    si.si_signo = ssi.ssi_signo;
+    si.si_errno = ssi.ssi_errno;
+    si.si_code = ssi.ssi_code;
+    si.si_value.sival_int = ssi.ssi_int;
+    if (!fix_up_synthetic_SIGCHLD(t, &si)) {
+      continue;
+    }
+    ssi.ssi_errno = 0;
+    ssi.ssi_code = si.si_code;
+    ssi.ssi_pid = si.si_pid;
+    ssi.ssi_uid = si.si_uid;
+    ssi.ssi_status = si.si_status;
+    ssi.ssi_int = 0;
+    ssi.ssi_ptr = 0;
+    ssi.ssi_utime = 0;
+    ssi.ssi_stime = 0;
+    memcpy(data.data() + offset, &ssi, sizeof(ssi));
+    fixed_up = true;
+  }
+  if (fixed_up) {
+    size_t offset = 0;
+    for (auto& r : ranges) {
+      t->write_bytes_helper(r.data, r.length, data.data() + offset);
+      offset += r.length;
+    }
+  }
+  return read_SIGCHLD;
+}
+
+/**
+ * The parts of the buffers of a read(), readv() or preadv2() that hold the
+ * |size| bytes it read, in order. These are the buffers that we gave the
+ * kernel at the syscall entry, when it copies the iovec array: the scratch
+ * buffers if we used scratch memory, otherwise the tracee's buffers as its
+ * iovecs described them at the syscall entry.
+ */
+static vector<FileMonitor::Range> ranges_read(
+    const TaskSyscallState& syscall_state, size_t size) {
+  vector<FileMonitor::Range> ranges;
+  for (auto& param : syscall_state.param_list) {
+    if (!size) {
+      break;
+    }
+    // The buffers are the OUT parameters (the iovec array is IN).
+    if (param.mode != OUT) {
+      continue;
+    }
+    size_t length = min(param.num_bytes.incoming_size, size);
+    if (length) {
+      ranges.push_back(FileMonitor::Range(
+          syscall_state.scratch_enabled ? param.scratch : param.dest,
+          length));
+      size -= length;
+    }
+  }
+  return ranges;
+}
+
 template <typename Arch>
 static void rec_process_syscall_arch(RecordTask* t,
                                      TaskSyscallState& syscall_state) {
@@ -7677,6 +7840,25 @@ static void rec_process_syscall_arch(RecordTask* t,
       break;
     }
 
+    // preadv2() with offset -1 reads a signalfd like readv().
+    case Arch::preadv2:
+    case Arch::read:
+    case Arch::readv: {
+      ssize_t result = t->regs().syscall_result_signed();
+      if (result > 0 && syscall_state.read_from_signalfd) {
+        // The data is still in the buffers we read into, which may be scratch
+        // memory. process_syscall_results copies it to the tracee's buffers
+        // and records it after this.
+        if (fix_up_synthetic_SIGCHLDs_from_signalfd(
+                t, ranges_read(syscall_state, result))) {
+          // The SIGCHLD carries the stops that we still owe the process
+          // SIGCHLDs for, as Linux would have merged them into it. (After a
+          // handler, signal_delivered sends another SIGCHLD for them.)
+          t->maybe_drop_pending_SIGCHLD_notifications();
+        }
+      }
+    }
+      RR_FALLTHROUGH;
     case Arch::clone3:
     case Arch::close_range:
     case Arch::close:
@@ -7692,11 +7874,8 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::pkey_mprotect:
     case Arch::pread64:
     case Arch::preadv:
-    case Arch::preadv2:
     case Arch::pwritev2:
     case Arch::ptrace:
-    case Arch::read:
-    case Arch::readv:
     case Arch::rseq:
     case Arch::sched_setaffinity:
     case Arch::userfaultfd: {
@@ -7734,6 +7913,19 @@ static void rec_process_syscall_arch(RecordTask* t,
         emulate_SIGCONT_sent_by_tracee(t);
       }
       break;
+
+    case Arch::rt_sigtimedwait_time64:
+    case Arch::rt_sigtimedwait: {
+      // As for read, this may be scratch memory.
+      remote_ptr<typename Arch::siginfo_t> sip = t->regs().arg2();
+      if (t->regs().syscall_result_signed() == SIGCHLD) {
+        fix_up_synthetic_SIGCHLD_siginfo<Arch>(t, sip);
+        // As for read, the SIGCHLD carries the stops that we still owe the
+        // process SIGCHLDs for.
+        t->maybe_drop_pending_SIGCHLD_notifications();
+      }
+      break;
+    }
 
     case Arch::waitpid:
     case Arch::wait4:

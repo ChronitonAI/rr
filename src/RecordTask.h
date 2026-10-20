@@ -153,14 +153,29 @@ public:
   };
   void record_exit_event(WriteChildTid write_child_tid = KERNEL_WRITES_CHILD_TID);
   /**
-   * Called when we're about to deliver a signal to this task. If it's a
-   * synthetic SIGCHLD and there's a ptraced task that needs to SIGCHLD,
-   * update the siginfo to reflect the status and note that that
-   * ptraced task has had its SIGCHLD sent.
+   * Called with the siginfo of a signal that this task takes: when we're
+   * about to deliver it to this task, and when this task takes it with
+   * rt_sigtimedwait() or reads it from a signalfd. If it's a synthetic
+   * SIGCHLD (see send_synthetic_SIGCHLD_if_necessary) and we owe this
+   * task's process a SIGCHLD for the stop of one of its tracees, or else of
+   * one of its children, update the siginfo to reflect that stop, and note
+   * that the process has had its SIGCHLD for the stops of all its tracees
+   * (or else children), which Linux merges into one SIGCHLD.
    * Note that we can't set the correct siginfo when we send the signal, because
    * it requires us to set information only the kernel has permission to set.
+   * Returns true if we filled in |si|.
    */
-  void set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si);
+  bool set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si);
+  /**
+   * Called when this process has taken a SIGCHLD some other way than in a
+   * handler (after a handler, signal_delivered sends another SIGCHLD for the
+   * stops we still owe it SIGCHLDs for), or when Linux has discarded its
+   * pending SIGCHLDs. The stops of its tracees and children that we still
+   * owe it SIGCHLDs for were merged into those SIGCHLDs, so this forgets
+   * them, unless a SIGCHLD is still pending for the process (or stashed by
+   * us), which can carry them.
+   */
+  void maybe_drop_pending_SIGCHLD_notifications();
   /**
    * Sets up |si| as if we're delivering a SIGCHLD/waitid for this waited task.
    */
