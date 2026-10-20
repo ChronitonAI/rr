@@ -114,7 +114,9 @@
  * For rr's tests: makes rr SIGKILL a task at a particular point in rr's
  * handling of it, as if a SIGKILL that rr doesn't control (from another
  * process, or from a pid namespace being torn down) had arrived right then.
- * This makes races with such SIGKILLs deterministic. Use as
+ * This makes races with such SIGKILLs deterministic. (At
+ * RRCALL_KILL_BY_EXIT_GROUP_AT_SECCOMP_STOP, another thread's exit_group()
+ * kills the task instead.) Use as
  *
  *   syscall(SYS_rrcall_arm_kill, point, arg, flags, 0, 0, 0)
  *
@@ -254,6 +256,20 @@ enum rrcall_kill_point {
      syscalls that patching can make the task do. rr waits until it knows
      the task is dying. */
   RRCALL_KILL_BEFORE_SYSCALL_PATCH,
+
+  /* Seccomp */
+
+  /* A task blocked in a syscall, which rr lets run while it runs other
+     tasks, when another thread of its thread group enters exit_group():
+     when rr handles that entry, before it lets the other thread run the
+     syscall. rr interrupts the task's syscall with PTRACE_INTERRUPT and
+     runs the task to the PTRACE_EVENT_SECCOMP stop of the restarted
+     syscall, which it collects without handling it, as when it collects a
+     restarted syscall's stop while running another task. The syscall must
+     be one that the kernel restarts then (e.g. pselect6()). Instead of a
+     SIGKILL, the other thread's exit_group() then kills the task, before
+     rr handles that stop. */
+  RRCALL_KILL_BY_EXIT_GROUP_AT_SECCOMP_STOP,
 
   RRCALL_KILL_NUM_POINTS
 };

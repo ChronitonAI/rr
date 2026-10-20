@@ -66,6 +66,15 @@ public:
   // couldn't push a signal handler frame. Only used during recording.
   bool received_sigframe_SIGSEGV;
 
+  // The task of this thread group that has entered exit_group() while the
+  // group had other threads, if any. exit_group() kills the other threads,
+  // so any stop of theirs that we haven't processed yet is one they're
+  // leaving for their PTRACE_EVENT_EXIT stop. This is cleared if the
+  // process's seccomp filter refuses the exit_group(), and by post_exec():
+  // if an execve() in another thread got there first, the exit_group() only
+  // ends the calling thread. Only used during recording.
+  TaskUid exit_group_task;
+
 private:
   ThreadGroup(const ThreadGroup&) = delete;
   ThreadGroup operator=(const ThreadGroup&) = delete;

@@ -1093,6 +1093,9 @@ set(BASIC_TESTS
   exec_killed_before_exit_event
   exec_stopsig
   execveat
+  exit_group_after_syscall_interruption
+  exit_group_pending_seccomp_stop
+  exit_group_restarted_syscalls
   exit_with_syscallbuf_signal
   fadvise
   fatal_init_signal

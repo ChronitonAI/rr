@@ -95,6 +95,7 @@
 #include "SysCpuMonitor.h"
 #include "TraceStream.h"
 #include "VirtualPerfCounterMonitor.h"
+#include "WaitManager.h"
 #include "cpp_supplement.h"
 #include "ftrace.h"
 #include "kernel_abi.h"
@@ -3460,6 +3461,41 @@ static bool send_signal_during_init_buffers() {
 }
 
 /**
+ * This is purely for testing purposes. See
+ * RRCALL_KILL_BY_EXIT_GROUP_AT_SECCOMP_STOP. `t` is entering exit_group()
+ * and has other threads.
+ */
+static void maybe_restart_blocked_syscalls_for_exit_group(RecordTask* t) {
+  for (Task* tt : t->thread_group()->task_set()) {
+    RecordTask* rt = static_cast<RecordTask*>(tt);
+    if (rt == t || rt->is_exiting() ||
+        !rt->take_armed_kill(RRCALL_KILL_BY_EXIT_GROUP_AT_SECCOMP_STOP)) {
+      continue;
+    }
+    ASSERT(rt, rt->may_be_blocked() && !rt->is_stopped())
+        << "Task isn't running in a syscall";
+    ASSERT(rt, 0 == rt->fallible_ptrace(PTRACE_INTERRUPT, nullptr, nullptr));
+    // The task stops for the interrupt (at the interrupted syscall's
+    // syscall-exit stop if we resumed it with PTRACE_SYSCALL, otherwise at a
+    // PTRACE_EVENT_STOP stop). Run it from there to the restarted syscall's
+    // PTRACE_EVENT_SECCOMP stop.
+    while (true) {
+      WaitResult result = WaitManager::wait_stop(WaitOptions(rt->tid));
+      ASSERT(rt, result.code == WAIT_OK) << "Task disappeared";
+      LOG(debug) << "  " << rt->tid << " stopped: " << result.status;
+      if (result.status.ptrace_event() == PTRACE_EVENT_SECCOMP) {
+        ASSERT(rt, rt->did_waitpid(result.status));
+        break;
+      }
+      ASSERT(rt, result.status.is_syscall() ||
+                     result.status.group_stop() == SIGTRAP)
+          << "Unexpected stop " << result.status;
+      ASSERT(rt, 0 == rt->fallible_ptrace(PTRACE_CONT, nullptr, nullptr));
+    }
+  }
+}
+
+/**
  * At thread exit time, undo the work that init_buffers() did.
  *
  * Call this when the tracee has already entered SYS_exit/SYS_exit_group. The
@@ -4218,6 +4254,8 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         prepare_exit(t);
         return ALLOW_SWITCH;
       }
+      t->thread_group()->exit_group_task = t->tuid();
+      maybe_restart_blocked_syscalls_for_exit_group(t);
       return PREVENT_SWITCH;
 
     case Arch::execve:
