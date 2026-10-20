@@ -7433,15 +7433,13 @@ static void rec_process_syscall_arch(RecordTask* t,
       break;
 
     case Arch::clock_nanosleep:
-    case Arch::nanosleep: {
-      /* If the sleep completes, the kernel doesn't
-       * write back to the remaining-time
-       * argument. */
-      if (!(int)t->regs().syscall_result_signed()) {
-        syscall_state.write_back = TaskSyscallState::NO_WRITE_BACK;
-      }
+    case Arch::clock_nanosleep_time64:
+    case Arch::nanosleep:
+      /* The kernel writes the remaining-time argument only when a signal
+       * interrupts a relative sleep, and rec_prepare_restart_syscall_arch
+       * copies it back then. */
+      syscall_state.write_back = TaskSyscallState::NO_WRITE_BACK;
       break;
-    }
 
     case Arch::perf_event_open:
       if (!t->regs().syscall_failed()) {
