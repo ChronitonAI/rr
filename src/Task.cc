@@ -2377,7 +2377,7 @@ static void kill_before_looking_at_stop_for_testing(Task* t) {
   t->tgkill(SIGKILL);
 }
 
-bool Task::wait(double interrupt_after_elapsed, bool warn_on_interrupt) {
+bool Task::wait(double interrupt_after_elapsed) {
   LOG(debug) << "going into blocking wait for " << tid << " ...";
   ASSERT(this, session().is_recording() || interrupt_after_elapsed == -1);
 
@@ -2417,19 +2417,9 @@ bool Task::wait(double interrupt_after_elapsed, bool warn_on_interrupt) {
   }
 
   if (sent_wait_interrupt) {
-    if (warn_on_interrupt) {
-      LOG(warn) << "Forced to PTRACE_INTERRUPT tracee";
-    } else {
-      LOG(debug) << "Forced to PTRACE_INTERRUPT tracee";
-    }
+    LOG(warn) << "Forced to PTRACE_INTERRUPT tracee";
     if (!is_signal_triggered_by_ptrace_interrupt(result.status.group_stop())) {
-      if (warn_on_interrupt) {
-        LOG(warn) << "  PTRACE_INTERRUPT raced with another event "
-                  << result.status;
-      } else {
-        LOG(debug) << "  PTRACE_INTERRUPT raced with another event "
-                   << result.status;
-      }
+      LOG(warn) << "  PTRACE_INTERRUPT raced with another event " << result.status;
     }
   }
   maybe_kill_task_after_stop(this, result.status);

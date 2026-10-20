@@ -93,10 +93,6 @@ static double high_priority_only_duration_step_factor = 2;
 static double high_priority_only_fraction = 0.2;
 static double start_high_priority_only_immediately_probability = 0.25;
 
-// How long a task we're delaying signals for may run before we interrupt it
-// (see RecordTask::delay_signal).
-static const double DELAYED_SIGNAL_MAX_WAIT = 0.01;
-
 static bool is_at_unhandled_exit_stop(Task* t) {
   return t->is_stopped() && t->ptrace_event() == PTRACE_EVENT_EXIT &&
          !t->handled_ptrace_exit_event();
@@ -745,9 +741,7 @@ bool Scheduler::may_use_unlimited_ticks() {
 
 void Scheduler::started_task(RecordTask* t) {
   LOGM(debug) << "Starting " << t->tid;
-  // While we're delaying signals for t, it must stop again soon (see
-  // RecordTask::delay_signal), so wait for it with a timeout.
-  if (may_use_unlimited_ticks() && !t->delayed_signals()) {
+  if (may_use_unlimited_ticks()) {
     unlimited_ticks_mode = true;
   }
   --ntasks_stopped;
@@ -885,14 +879,7 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
           timeout = elapsed > 0.05 ? 0.0 : 0.05 - elapsed;
           LOGM(debug) << "  But that's not our current task...";
         } else {
-          bool delaying_signals = current_->delayed_signals() != 0;
-          if (delaying_signals) {
-            // The task may not retire any ticks (e.g. a loop without
-            // conditional branches on x86), so interrupt it after a while.
-            timeout = min(timeout, DELAYED_SIGNAL_MAX_WAIT);
-          }
-          if (current_->wait(timeout, !delaying_signals) ||
-              wait_for_killed_task(current_)) {
+          if (current_->wait(timeout) || wait_for_killed_task(current_)) {
             result.by_waitpid = true;
             LOGM(debug) << "  new status is " << current_->status();
           } else {

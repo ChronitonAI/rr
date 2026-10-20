@@ -793,7 +793,7 @@ public:
    * Scheduler::wait_for_killed_task().
    * This can't reap the task.
    */
-  bool wait(double interrupt_after_elapsed = -1, bool warn_on_interrupt = true);
+  bool wait(double interrupt_after_elapsed = -1);
 
   /**
    * Currently we don't allow recording across uid changes, so we can

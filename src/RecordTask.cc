@@ -234,9 +234,6 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       termination_signal(0),
       tsc_mode(PR_TSC_ENABLE),
       cpuid_mode(1),
-      delayed_sigs(0),
-      sig_to_requeue(0),
-      ticks_at_last_sigreturn(0),
       stashed_signals_blocking_more_signals(false),
       stashed_group_stop(false),
       break_at_syscallbuf_traced_syscalls(false),
@@ -776,19 +773,6 @@ void RecordTask::will_resume_execution(ResumeRequest, WaitRequest,
   // accurate.
   get_sigmask();
 
-  // RecordSession::task_continue must resume us with the signal to requeue.
-  ASSERT(this, !sig_to_requeue);
-  if (!delayed_sigs && !has_stashed_sig()) {
-    // Clear the breakpoint request of a delay that ended (see
-    // delay_signal()). stash_sig() and stashed_signal_processed() take care of
-    // the other breakpoint requests.
-    break_at_syscallbuf_untraced_syscalls = false;
-  }
-  if (delayed_sigs) {
-    ASSERT(this, !stashed_signals_blocking_more_signals);
-    set_sigmask(blocked_sigs | delayed_sigs);
-  }
-
   if (stashed_signals_blocking_more_signals) {
     // A stashed signal we have already accepted for this task may
     // have a sigaction::sa_mask that would block the next signal to be
@@ -883,16 +867,6 @@ void RecordTask::did_wait() {
     // exec stop was reported for our tid; RecordSession's
     // PTRACE_EVENT_EXEC handling deals with that.
     post_exec();
-  }
-
-  if (delayed_sigs) {
-    if (is_delayable_signal_stop()) {
-      // Another timer signal arrived before the task ran: keep the delayed
-      // signals blocked and delay this one too (in handle_signal_event).
-      LOG(debug) << "Still delaying signals for " << tid;
-    } else {
-      end_signal_delay();
-    }
   }
 
   for (auto p : syscallbuf_syscall_entry_breakpoints()) {
@@ -2149,10 +2123,7 @@ sig_set_t RecordTask::get_sigmask() {
   if (blocked_sigs_dirty) {
     // Clear this first, read_sigmask_from_process might set it again.
     blocked_sigs_dirty = false;
-    // The task can't change its sigmask while we're delaying signals (it
-    // stops before it makes a syscall, which ends the delay), so the delayed
-    // signals are blocked only by us.
-    blocked_sigs = read_sigmask_from_process() & ~delayed_sigs;
+    blocked_sigs = read_sigmask_from_process();
     LOG(debug) << "Refreshed sigmask, now " << HEX(blocked_sigs);
   }
   return blocked_sigs;
@@ -2230,7 +2201,7 @@ void RecordTask::verify_signal_states() {
     return;
   }
   ASSERT(this, results.size() == 3);
-  sig_set_t blocked = strtoull(results[0].c_str(), NULL, 16) & ~delayed_sigs;
+  sig_set_t blocked = strtoull(results[0].c_str(), NULL, 16);
   sig_set_t ignored = strtoull(results[1].c_str(), NULL, 16);
   sig_set_t caught = strtoull(results[2].c_str(), NULL, 16);
   for (int sig = 1; sig < _NSIG; ++sig) {
@@ -2369,90 +2340,6 @@ void RecordTask::stashed_signal_processed() {
   break_at_syscallbuf_final_instruction =
       has_stashed_sig() || pending_singlestep_stop;
   syscallstub_exit_breakpoint = nullptr;
-}
-
-// Before Linux 5.17 (commit 5768d8906bc2, "signal: Requeue signals in the
-// appropriate queue"), ptrace_signal() requeued a signal that the tracer
-// blocked to the thread's own queue, even if it had been sent to the whole
-// process.
-static bool requeue_keeps_process_directed_signals() {
-  static int result = -1;
-  if (result < 0) {
-    struct utsname uname_buf;
-    unsigned int major = 0, minor = 0;
-    if (!uname(&uname_buf)) {
-      sscanf(uname_buf.release, "%u.%u", &major, &minor);
-    }
-    result = KERNEL_VERSION(major, minor, 0) >= KERNEL_VERSION(5, 17, 0);
-  }
-  return result;
-}
-
-bool RecordTask::is_delayable_signal_stop() {
-  int sig = stop_sig();
-  // The kernel sends these to the whole process for itimers and CPU time
-  // limits, with si_code SI_KERNEL. Like any standard signal, while one is
-  // blocked and pending, further ones merge with it.
-  if (sig != SIGALRM && sig != SIGVTALRM && sig != SIGPROF && sig != SIGXCPU) {
-    return false;
-  }
-  const siginfo_t& si = get_siginfo();
-  if (si.si_signo != sig || si.si_code != SI_KERNEL) {
-    return false;
-  }
-  if (!requeue_keeps_process_directed_signals() &&
-      thread_group()->task_set().size() > 1) {
-    // The requeued signal would be bound to this thread.
-    return false;
-  }
-  return !has_stashed_sig() && !emulated_ptracer &&
-         signal_has_user_handler(sig) && !ip_at_last_sigreturn.is_null() &&
-         ticks_at_last_sigreturn == tick_count() &&
-         ip_at_last_sigreturn == ip();
-}
-
-void RecordTask::delay_signal(int sig) {
-  ASSERT(this, !sig_to_requeue);
-  LOG(debug) << "Delaying " << signal_name(sig) << " until " << tid
-             << " has run";
-  delayed_sigs |= signal_bit(sig);
-  sig_to_requeue = sig;
-  // Stop the task before it makes an untraced syscall, in particular a
-  // sigprocmask that would see the signals we blocked. Traced syscalls stop
-  // at their entry anyway, and so does a buffered syscall that the task
-  // restarts (task_continue resumes it with PTRACE_SYSCALL, and
-  // will_resume_execution doesn't set these breakpoints then).
-  if (as->syscallbuf_enabled()) {
-    break_at_syscallbuf_untraced_syscalls = true;
-  }
-}
-
-void RecordTask::end_signal_delay() {
-  LOG(debug) << "Done delaying signals " << HEX(delayed_sigs) << " for " << tid
-             << " at " << status() << " ip " << ip();
-  sig_set_t mask;
-  if (fallible_ptrace(PTRACE_GETSIGMASK, remote_ptr<void>(8), &mask) < 0) {
-    // The tracee is on the exit path and its sigmask is irrelevant.
-    delayed_sigs = 0;
-    return;
-  }
-  // Start from the kernel's mask rather than our cached one: if a fault
-  // stopped the task, the kernel may have unblocked its signal (as
-  // force_sig_info does), and we must not block it again.
-  mask &= ~delayed_sigs;
-  if (stop_sig() == SIGTRAP && is_at_syscallbuf_syscall_entry_breakpoint() &&
-      (get_sigmask() & signal_bit(SIGTRAP))) {
-    // One of our breakpoints, which the task must not notice.
-    mask |= signal_bit(SIGTRAP);
-  }
-  delayed_sigs = 0;
-  // The task has run (maybe without retiring ticks: a loop without
-  // conditional branches on x86). Don't delay the next signal unless it
-  // follows another sigreturn.
-  ip_at_last_sigreturn = remote_code_ptr();
-  ptrace_if_stopped(PTRACE_SETSIGMASK, remote_ptr<void>(8), &mask);
-  // Keep the syscallbuf breakpoints set by delay_signal until we've handled
-  // this stop (it may be one of them); will_resume_execution clears them.
 }
 
 const RecordTask::StashedSignal* RecordTask::peek_stashed_sig_to_deliver()
