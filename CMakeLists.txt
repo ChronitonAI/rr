@@ -1310,6 +1310,7 @@ set(BASIC_TESTS
   ptrace_event_stop_sigcont
   ptrace_exec
   x86/ptrace_exec32
+  ptrace_fork_at_restart
   ptrace_group_stop
   ptrace_interrupt_syscall
   ptrace_kill_grandtracee
@@ -1325,6 +1326,7 @@ set(BASIC_TESTS
   ptrace_syscall
   ptrace_syscall_clone_untraced
   x86/ptrace_sysemu
+  ptrace_sysemu_at_restart
   ptrace_sysemu_syscall
   ptrace_trace_clone
   ptrace_trace_exit
@@ -1369,6 +1371,7 @@ set(BASIC_TESTS
   seccomp_cloning
   seccomp_clone_fail
   seccomp_desched
+  seccomp_errno_restarted_syscall
   seccomp_kill_exit
   seccomp_madvise
   seccomp_null
@@ -1378,6 +1381,9 @@ set(BASIC_TESTS
   x86/seccomp_stop_remote_syscall
   seccomp_tsync
   seccomp_veto_exec
+  seccomp_veto_exec_at_restart
+  seccomp_veto_exit
+  seccomp_veto_exit_at_restart
   self_shebang
   self_sigint
   sem

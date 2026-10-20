@@ -967,6 +967,10 @@ static void process_init_buffers(ReplayTask* t, ReplayTraceStep* step) {
 
 static int non_negative_syscall(int sys) { return sys < 0 ? INT32_MAX : sys; }
 
+static bool failed_during_preparation(ReplayTask* t) {
+  return t->current_trace_frame().event().Syscall().failed_during_preparation;
+}
+
 template <typename Arch>
 static void rep_after_enter_syscall_arch(ReplayTask* t) {
   switch (non_negative_syscall(t->regs().original_syscallno())) {
@@ -1023,11 +1027,15 @@ static void rep_after_enter_syscall_arch(ReplayTask* t) {
       /* Destroy buffers now to match when we destroyed them during recording.
          It's possible for another mapping to be created overlapping our
          buffers before this task truly exits, and we don't want to trash
-         that mapping by destroying our buffers then. */
-      t->destroy_buffers();
+         that mapping by destroying our buffers then. When the process's
+         seccomp filter refused the syscall, the buffers stay. */
+      if (!failed_during_preparation(t)) {
+        t->destroy_buffers();
+      }
       break;
     case Arch::exit_group:
-      if (t->thread_group()->task_set().size() == 1) {
+      if (t->thread_group()->task_set().size() == 1 &&
+          !failed_during_preparation(t)) {
         /* See above. */
         t->destroy_buffers();
       }
