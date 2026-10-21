@@ -1495,6 +1495,7 @@ set(BASIC_TESTS
   unexpected_exit_pid_ns
   unjoined_thread
   unshare
+  uprobe_create
   userfaultfd
   utimes
   v4l_dmabuf
@@ -1736,6 +1737,7 @@ set(TESTS_WITH_PROGRAM
   ttyname
   unexpected_stack_growth
   unicode
+  uprobe_from_outside
   user_ignore_sig
   vdso_clock_gettime_stack
   vdso_gettimeofday_stack

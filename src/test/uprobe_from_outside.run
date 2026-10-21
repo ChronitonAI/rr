@@ -1,0 +1,77 @@
+source `dirname $0`/util.sh
+
+# Uprobes created outside the recording. Recorded tasks can't attach to a
+# uprobe trace event, and rr exits with an error when it finds a uprobe
+# attached to a recorded process.
+
+save_exe $TESTNAME
+test_exe=$TESTNAME-$nonce
+
+# rr finds the [uprobes] mapping of a return probe when it compares the
+# kernel's mappings with its own (--check-cached-mmaps), and the trampoline
+# of a probe on a nop when it reads the kernel's mappings for the heap.
+check_options=$GLOBAL_OPTIONS
+if [[ $check_options != *--check-cached-mmaps* ]]; then
+  check_options="$check_options --check-cached-mmaps"
+fi
+no_check_options=${GLOBAL_OPTIONS/ --check-cached-mmaps/}
+GLOBAL_OPTIONS=$check_options
+
+tracefs=
+for dir in /sys/kernel/tracing /sys/kernel/debug/tracing; do
+  if [[ -w $dir/uprobe_events ]]; then
+    tracefs=$dir
+    break
+  fi
+done
+event=rr_test_$nonce/probe
+
+function delete_event {
+  echo "-:$event" >> $tracefs/uprobe_events
+}
+
+if [[ -n $tracefs ]] &&
+   echo "p:$event $PWD/$test_exe:0x$(./$test_exe offset)" >> $tracefs/uprobe_events; then
+  trap 'delete_event; onexit' EXIT
+  just_record ./$test_exe "tracepoint $(cat $tracefs/events/$event/id)"
+  replay
+  if just_check_record EXIT-SUCCESS && just_check_replay_err &&
+     just_check_record_replay_match; then
+    echo "Tracepoint refused"
+  fi
+  delete_event
+  trap onexit EXIT
+else
+  echo "NOTE: Skipping the tracepoint because we can't create a uprobe event"
+fi
+
+function record_with_uprobe { kind=$1
+  rm -f pid_fifo go_fifo
+  mkfifo pid_fifo go_fifo
+  ./$test_exe helper $kind pid_fifo go_fifo > helper.out 2>&1 &
+  helper=$!
+  just_record ./$test_exe "recorded $kind pid_fifo go_fifo"
+  # The helper waits for the recorded process, which may not have started.
+  kill $helper 2>/dev/null
+  wait $helper
+  if grep -q skip helper.out; then
+    echo "NOTE: Skipping the $kind uprobe:" $(cat helper.out)
+  elif grep -q "from outside the recording" record.err; then
+    echo "The $kind uprobe was reported"
+  else
+    failed "the $kind uprobe wasn't reported"
+    echo "record.err:"
+    cat record.err
+    echo "helper.out:"
+    cat helper.out
+  fi
+}
+
+record_with_uprobe uretprobe
+record_with_uprobe signal
+GLOBAL_OPTIONS=$no_check_options
+record_with_uprobe nop
+
+if [[ $test_passed == y ]]; then
+  passed
+fi

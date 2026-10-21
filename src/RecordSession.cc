@@ -2006,6 +2006,11 @@ bool RecordSession::handle_signal_event(RecordTask* t, StepState* step_state) {
     return true;
   }
 
+  if (!t->vm()->has_mapping(t->ip().to_data_ptr<void>())) {
+    // The task may be in a uprobe trampoline.
+    AddressSpace::check_for_uprobes(t);
+  }
+
   if (sig == SIGTRAP && handle_syscallbuf_breakpoint(t)) {
     return true;
   }

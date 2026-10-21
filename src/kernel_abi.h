@@ -1878,6 +1878,12 @@ struct BaseArch : public wordsize,
       __u32 info_len;
       __u64 info;
     } info;
+    struct { /* used by RR_BPF_LINK_CREATE */
+      __u32 prog_fd;
+      __u32 target_fd;
+      __u32 attach_type;
+      __u32 flags;
+    } link_create;
   };
 
   struct file_handle {

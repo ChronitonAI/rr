@@ -181,7 +181,19 @@ void KernelMapIterator::operator++() {
                      f, offset);
 }
 
-static KernelMapping read_kernel_mapping(pid_t tid, remote_ptr<void> addr) {
+static void check_for_uprobes_mapping(Task* t, const KernelMapping& km) {
+  if (km.is_uprobes() && t->session().is_recording()) {
+    CLEAN_FATAL() << "A uprobe was attached to recorded process " << t->tgid()
+                  << " from outside the recording (" << km.fsname()
+                  << " mapping at " << km.start()
+                  << "). rr can't record a process with uprobes.";
+  }
+}
+
+// When `t` is set, checks the mappings it reads with
+// check_for_uprobes_mapping().
+static KernelMapping read_kernel_mapping(pid_t tid, remote_ptr<void> addr,
+                                         Task* t) {
   MemoryRange range(addr, 1);
   bool ok;
   KernelMapIterator it(tid, &ok);
@@ -190,6 +202,9 @@ static KernelMapping read_kernel_mapping(pid_t tid, remote_ptr<void> addr) {
   }
   for (; !it.at_end(); ++it) {
     const KernelMapping& km = it.current();
+    if (t) {
+      check_for_uprobes_mapping(t, km);
+    }
     if (km.contains(range)) {
       return km;
     }
@@ -199,11 +214,12 @@ static KernelMapping read_kernel_mapping(pid_t tid, remote_ptr<void> addr) {
 
 KernelMapping AddressSpace::read_kernel_mapping(Task* t,
                                                 remote_ptr<void> addr) {
-  return rr::read_kernel_mapping(t->tid, addr);
+  return rr::read_kernel_mapping(t->tid, addr, t);
 }
 
 KernelMapping AddressSpace::read_local_kernel_mapping(uint8_t* addr) {
-  return rr::read_kernel_mapping(getpid(), remote_ptr<void>((uintptr_t)addr));
+  return rr::read_kernel_mapping(getpid(), remote_ptr<void>((uintptr_t)addr),
+                                 nullptr);
 }
 
 /**
@@ -214,6 +230,16 @@ void AddressSpace::print_process_maps(Task* t) {
     string line;
     it.current(&line);
     cerr << line << '\n';
+  }
+}
+
+void AddressSpace::check_for_uprobes(Task* t) {
+  if (!t->session().is_recording() || thread_group_in_exec(t)) {
+    return;
+  }
+  bool ok;
+  for (KernelMapIterator it(t, &ok); !it.at_end(); ++it) {
+    check_for_uprobes_mapping(t, it.current());
   }
 }
 
@@ -1698,6 +1724,7 @@ static void assert_segments_match(Task* t, const KernelMapping& input_m,
     err = "inodes differ";
   }
   if (err.size()) {
+    AddressSpace::check_for_uprobes(t);
     cerr << "cached mmap:" << endl;
     t->vm()->dump();
     cerr << "/proc/" << t->tid << "/mmaps:" << endl;
@@ -1809,6 +1836,9 @@ void AddressSpace::verify(Task* t) const {
     assert_segments_match(t, vm, km);
   }
 
+  if (!kernel_it.at_end() || mem_it != mem.end()) {
+    check_for_uprobes(t);
+  }
   ASSERT(t, kernel_it.at_end() && mem_it == mem.end());
 }
 

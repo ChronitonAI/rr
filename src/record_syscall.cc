@@ -63,6 +63,7 @@
 #include <sys/xattr.h>
 #include <termios.h>
 
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -2254,6 +2255,92 @@ template <typename Arch> static BpfMapMonitor* bpf_map_monitor(RecordTask* t,
   return static_cast<BpfMapMonitor*>(monitor);
 }
 
+// Returns the perf event type of the uprobe PMU, or -1 if there is none.
+static int64_t read_uprobe_pmu_type() {
+  ifstream file("/sys/bus/event_source/devices/uprobe/type");
+  int64_t type;
+  return file >> type ? type : -1;
+}
+
+// Returns true if `id` is the id of a uprobe trace event, i.e. an event in
+// tracefs's uprobe_events.
+static bool is_uprobe_trace_event(uint64_t id) {
+  for (string dir : { "/sys/kernel/tracing", "/sys/kernel/debug/tracing" }) {
+    ifstream events(dir + "/uprobe_events");
+    if (!events.good()) {
+      continue;
+    }
+    string line;
+    while (getline(events, line)) {
+      // Each line starts with "p:GROUP/EVENT " or "r:GROUP/EVENT ".
+      size_t start = line.find(':');
+      size_t end = line.find(' ');
+      if (start == string::npos || end == string::npos || end < start) {
+        continue;
+      }
+      string event = line.substr(start + 1, end - start - 1);
+      ifstream id_file(dir + "/events/" + event + "/id");
+      uint64_t event_id;
+      if (id_file >> event_id && event_id == id) {
+        return true;
+      }
+    }
+    return false;
+  }
+  return false;
+}
+
+// Refuses to open a perf event that creates a uprobe: one of the uprobe PMU,
+// or a tracepoint event of a uprobe trace event. We can't record a process
+// with uprobes. Returns true if we refused.
+static bool refuse_uprobe_perf_event(RecordTask* t,
+                                     TaskSyscallState& syscall_state) {
+  static const int64_t uprobe_pmu_type = read_uprobe_pmu_type();
+  auto attrp = remote_ptr<struct perf_event_attr>(t->regs().arg1());
+  bool ok = true;
+  uint32_t type = t->read_mem(REMOTE_PTR_FIELD(attrp, type), &ok);
+  if (!ok) {
+    return false;
+  }
+  int err;
+  if (type == uprobe_pmu_type) {
+    // What a kernel without the uprobe PMU returns
+    err = ENOENT;
+  } else if (type == PERF_TYPE_TRACEPOINT) {
+    uint64_t config = t->read_mem(REMOTE_PTR_FIELD(attrp, config), &ok);
+    if (!ok || !is_uprobe_trace_event(config)) {
+      return false;
+    }
+    // What a kernel without this tracepoint returns
+    err = EINVAL;
+  } else {
+    return false;
+  }
+  LOG(warn) << "Refusing to open a uprobe perf event";
+  // Make the syscall fail with EFAULT.
+  Registers r = t->regs();
+  r.set_arg1(0);
+  t->set_regs(r);
+  syscall_state.emulate_result(-err);
+  return true;
+}
+
+// Returns true if this BPF_LINK_CREATE attaches a program to uprobes.
+template <typename Arch> static bool creates_uprobe_link(RecordTask* t) {
+  auto attrp = remote_ptr<typename Arch::bpf_attr>(t->regs().arg2());
+  auto attach_type_p = REMOTE_PTR_FIELD(attrp, link_create.attach_type);
+  // The kernel reads the first arg3 bytes of the attributes.
+  size_t attr_size = t->regs().arg3();
+  if (!MemoryRange(attrp, attr_size)
+           .contains(MemoryRange(attach_type_p, sizeof(uint32_t)))) {
+    return false;
+  }
+  bool ok = true;
+  uint32_t attach_type = t->read_mem(attach_type_p, &ok);
+  return ok && (attach_type == RR_BPF_TRACE_UPROBE_MULTI ||
+                attach_type == RR_BPF_TRACE_UPROBE_SESSION);
+}
+
 template <typename Arch>
 static Switchable prepare_bpf(RecordTask* t,
                               TaskSyscallState& syscall_state) {
@@ -2359,6 +2446,20 @@ static Switchable prepare_bpf(RecordTask* t,
       syscall_state.mem_ptr_parameter(info_p, info_len);
       break;
     }
+    case RR_BPF_LINK_CREATE:
+      if (creates_uprobe_link<Arch>(t)) {
+        // We can't record a process with uprobes.
+        LOG(warn) << "Refusing to attach a BPF program to uprobes";
+        // Make the syscall fail with EINVAL, and return what a kernel
+        // without uprobes returns.
+        Registers r = t->regs();
+        r.set_arg1(-1);
+        t->set_regs(r);
+        syscall_state.emulate_result(-EOPNOTSUPP);
+      } else {
+        syscall_state.expect_errno = EINVAL;
+      }
+      break;
     default:
       syscall_state.expect_errno = EINVAL;
       break;
@@ -5026,6 +5127,9 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
     }
 
     case Arch::perf_event_open: {
+      if (refuse_uprobe_perf_event(t, syscall_state)) {
+        return PREVENT_SWITCH;
+      }
       RecordTask* target = t->session().find_task((pid_t)regs.arg2_signed());
       int cpu = regs.arg3_signed();
       unsigned long flags = regs.arg5();
@@ -7099,6 +7203,19 @@ static string handle_opened_file(RecordTask* t, int fd, int flags) {
   return pathname;
 }
 
+// Returns true if `fd` is open for writing one of the tracefs files that
+// define uprobe events.
+static bool is_writable_uprobe_events_file(RecordTask* t, int fd,
+                                           const string& pathname) {
+  const char* name = extract_file_name(pathname.c_str());
+  if (strcmp(name, "uprobe_events") && strcmp(name, "dynamic_events")) {
+    return false;
+  }
+  struct statfs buf;
+  return is_writable(t, fd) && !statfs(t->proc_fd_path(fd).c_str(), &buf) &&
+         buf.f_type == TRACEFS_MAGIC;
+}
+
 template <typename Arch>
 static void check_scm_rights_fd(RecordTask* t, typename Arch::msghdr& msg) {
   if (msg.msg_controllen < sizeof(typename Arch::cmsghdr)) {
@@ -7391,7 +7508,12 @@ static void rec_process_syscall_arch(RecordTask* t,
       break;
 
     case Arch::bpf:
-      if (!t->regs().syscall_failed()) {
+      if (syscall_state.should_emulate_result) {
+        // Restore the command we changed to refuse the syscall.
+        Registers r = t->regs();
+        r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
+        t->set_regs(r);
+      } else if (!t->regs().syscall_failed()) {
         switch ((int)t->regs().orig_arg1()) {
           case RR_BPF_MAP_CREATE: {
             int fd = t->regs().syscall_result_signed();
@@ -7417,7 +7539,12 @@ static void rec_process_syscall_arch(RecordTask* t,
     }
 
     case Arch::perf_event_open:
-      if (!t->regs().syscall_failed()) {
+      if (syscall_state.should_emulate_result) {
+        // Restore the attributes pointer we cleared to refuse the syscall.
+        Registers r = t->regs();
+        r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
+        t->set_regs(r);
+      } else if (!t->regs().syscall_failed()) {
         int fd = t->regs().syscall_result_signed();
         if (t->regs().original_syscallno() == Arch::inotify_init1) {
           Registers r = t->regs();
@@ -7491,7 +7618,8 @@ static void rec_process_syscall_arch(RecordTask* t,
 
         string pathname = handle_opened_file(t, fd, flags);
         bool gcrypt = is_gcrypt_deny_file(pathname.c_str());
-        if (gcrypt || is_blacklisted_filename(pathname.c_str())) {
+        if (gcrypt || is_blacklisted_filename(pathname.c_str()) ||
+            is_writable_uprobe_events_file(t, fd, pathname)) {
           {
             AutoRemoteSyscalls remote(t);
             remote.infallible_close_syscall_if_alive(fd);

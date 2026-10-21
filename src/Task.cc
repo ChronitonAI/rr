@@ -3521,6 +3521,10 @@ SupportedArch Task::detect_syscall_arch() {
   bool ok = get_syscall_instruction_arch(
       this, regs().ip().decrement_by_syscall_insn_length(arch()),
       &syscall_arch);
+  if (!ok) {
+    // The syscall may be in a uprobe trampoline.
+    AddressSpace::check_for_uprobes(this);
+  }
   ASSERT(this, ok);
   return syscall_arch;
 }

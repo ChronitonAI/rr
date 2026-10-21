@@ -154,6 +154,9 @@ public:
   bool is_vvar() const { return fsname() == "[vvar]"; }
   bool is_vvar_vclock() const { return fsname() == "[vvar_vclock]"; }
   bool is_vsyscall() const { return fsname() == "[vsyscall]"; }
+  bool is_uprobes() const {
+    return fsname() == "[uprobes]" || fsname() == "[uprobes-trampoline]";
+  }
   bool is_named_anonymous() const {
     return fsname().find("[anon:") == 0 || fsname().find("[anon_shmem:") == 0;
   }
@@ -814,6 +817,8 @@ public:
    * If performed on a file in a btrfs file system, this may return the
    * wrong device number! If you stick to anonymous or special file
    * mappings, this should be OK.
+   * When recording, exits with an error if a mapping it reads is one the
+   * kernel added for uprobes (see check_for_uprobes()).
    */
   KernelMapping read_kernel_mapping(Task* t, remote_ptr<void> addr);
 
@@ -872,6 +877,16 @@ public:
    * Print process maps.
    */
   static void print_process_maps(Task* t);
+
+  /**
+   * When recording, exits with an error if the kernel has added a mapping
+   * for uprobes to t's address space. We can't record a process with
+   * uprobes, and recorded tasks can't create them, so they were attached
+   * from outside the recording.
+   * Call this when t's mappings or ip don't match what we know about its
+   * address space.
+   */
+  static void check_for_uprobes(Task* t);
 
   void add_stap_semaphore_range(Task* t, MemoryRange range);
   void remove_stap_semaphore_range(Task* t, MemoryRange range);
