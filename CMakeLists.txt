@@ -1085,6 +1085,7 @@ set(BASIC_TESTS
   epoll_pwait_eintr_sigmask
   epoll_pwait2
   eventfd
+  exec_after_waking_readers
   exec_flags
   exec_no_env
   exec_self
