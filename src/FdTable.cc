@@ -209,8 +209,13 @@ void FdTable::update_syscallbuf_fds_disabled(int fd) {
           syscallbuf_fds_disabled_size);
       auto addr =
           REMOTE_PTR_FIELD(rt->preload_globals, syscallbuf_fd_class[0]) + fd;
-      rt->write_mem(addr, disable);
-      rt->record_local(addr, &disable);
+      bool ok = true;
+      rt->write_mem(addr, disable, &ok);
+      if (ok) {
+        rt->record_local(addr, &disable);
+      } else if (errno != ESRCH) {
+        LOG(warn) << "Can't write syscallbuf_fd_class of " << rt->tid;
+      }
     }
   }
 }

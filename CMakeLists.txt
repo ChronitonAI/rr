@@ -1642,6 +1642,7 @@ set(TESTS_WITH_PROGRAM
   invalid_interpreter
   invalid_jump
   jit_proc_mem
+  kill_threads_no_exit_events
   killed_task_exit_order
   link
   madvise_dontfork
@@ -1805,6 +1806,7 @@ set(TESTS_WITHOUT_PROGRAM
   deliver_async_signal_during_syscalls
   env_newline
   exec_deleted
+  exec_from_other_thread_warnings
   exec_stop
   execp
   explicit_checkpoint_clone

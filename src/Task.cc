@@ -3239,6 +3239,7 @@ ssize_t Task::read_bytes_fallible(remote_ptr<void> addr, ssize_t buf_size,
   }
 
   ssize_t all_read = 0;
+  bool reopened = false;
   while (all_read < buf_size) {
     errno = 0;
     ssize_t nread = pread64(as->mem_fd(), static_cast<uint8_t*>(buf) + all_read,
@@ -3251,9 +3252,20 @@ ssize_t Task::read_bytes_fallible(remote_ptr<void> addr, ssize_t buf_size,
     // before the exec and the second mem fd refers to the address
     // space after exec.
     if (0 == nread && 0 == all_read && 0 == errno) {
+      if (reopened || !is_stopped_) {
+        // No task uses the address space our mem fd refers to any more: they
+        // all exited or exec'd. We reopen the mem fd only through a stopped
+        // task, since a running task can exec at any time, and only once,
+        // since a 0 from the new mem fd means that this task's address space
+        // is gone too.
+        LOG(debug) << "Address space read through " << tid << " is gone";
+        errno = ESRCH;
+        return 0;
+      }
       if (!open_mem_fd()) {
         return 0;
       }
+      reopened = true;
       continue;
     }
     if (nread <= 0) {
@@ -3388,7 +3400,11 @@ ssize_t Task::write_bytes_helper_no_notifications(remote_ptr<void> addr, ssize_t
 
   errno = 0;
   ssize_t nwritten = safe_pwrite64(this, buf, buf_size, addr.as_int());
-  if (errno == EIO || (0 == nwritten && 0 == errno)) {
+  // As in read_bytes_fallible(), a 0 with errno 0 means that no task uses
+  // the address space our mem fd refers to any more, and we reopen the mem
+  // fd only through a stopped task.
+  bool address_space_gone = 0 == nwritten && 0 == errno;
+  if (errno == EIO || (address_space_gone && is_stopped_)) {
     // Reopen and try again.
     // For example when proc_mem_force_override=ptrace is in force and the
     // task we opened the mem-fd with exits, we're no longer ptracing it
@@ -3397,9 +3413,19 @@ ssize_t Task::write_bytes_helper_no_notifications(remote_ptr<void> addr, ssize_t
     if (open_mem_fd()) {
       errno = 0;
       nwritten = safe_pwrite64(this, buf, buf_size, addr.as_int());
+      address_space_gone = 0 == nwritten && 0 == errno;
     } else {
       return write_bytes_helper_no_notifications(addr, buf_size, buf, ok, flags);
     }
+  }
+  if (address_space_gone) {
+    // Nothing can observe this write.
+    LOG(debug) << "Address space written through " << tid << " is gone";
+    if (ok) {
+      *ok = false;
+    }
+    errno = ESRCH;
+    return 0;
   }
   if (errno == EPERM) {
     FATAL() << "Can't write to /proc/" << tid << "/mem\n"

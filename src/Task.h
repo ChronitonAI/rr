@@ -770,6 +770,8 @@ public:
   };
   /**
    * Write |val| to |child_addr|.
+   * If the write fails because the task or its address space is gone, errno
+   * is ESRCH.
    */
   template <typename T>
   void write_mem(remote_ptr<T> child_addr, const T& val, bool* ok = nullptr,

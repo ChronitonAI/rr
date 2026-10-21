@@ -2580,7 +2580,13 @@ void AddressSpace::fd_tables_changed() {
     if (!ok) {
       return;
     }
-    rt->write_mem(addr, fdt_uniform);
+    rt->write_mem(addr, fdt_uniform, &ok);
+    if (!ok) {
+      if (errno != ESRCH) {
+        LOG(warn) << "Can't write fdt_uniform of " << rt->tid;
+      }
+      return;
+    }
     // We can get here outside of any event for `rt` (e.g. when some task
     // reaches the zombie state), so the next frame might be a
     // SYSCALLBUF_FLUSH. Don't put our write ahead of the syscallbuf contents.
