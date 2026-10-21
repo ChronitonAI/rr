@@ -1372,6 +1372,7 @@ set(BASIC_TESTS
   seccomp_cloning
   seccomp_clone_fail
   seccomp_desched
+  x86/seccomp_ip_high_bits
   seccomp_kill_exit
   seccomp_madvise
   seccomp_null
