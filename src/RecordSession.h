@@ -259,7 +259,7 @@ private:
                               bool can_consume_wait_status);
   bool signal_state_changed(RecordTask* t, StepState* step_state);
   void syscall_state_changed(RecordTask* t, StepState* step_state);
-  void desched_state_changed(RecordTask* t);
+  bool desched_state_changed(RecordTask* t);
   bool prepare_to_inject_signal(RecordTask* t, StepState* step_state);
   void task_continue(const StepState& step_state);
 

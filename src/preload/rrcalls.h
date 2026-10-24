@@ -255,5 +255,16 @@ enum rrcall_kill_point {
      the task is dying. */
   RRCALL_KILL_BEFORE_SYSCALL_PATCH,
 
+  /* Buffered syscalls */
+
+  /* A task whose buffered syscall blocked and that rr let finish as a
+     traced syscall, when rr runs it on to the syscall buffer's ioctl that
+     disarms the desched signal once the syscall is over (e.g. from its
+     exit, or from the sigreturn of a signal handler that interrupted
+     it): right after waitid() has reported the first stop on the way,
+     before rr looks at it. rr doesn't wait. It first makes the task's
+     threads SCHED_IDLE, as for RRCALL_KILL_AFTER_SIGNAL_STOP_WAIT. */
+  RRCALL_KILL_AFTER_DESCHED_DISARM_STOP_WAIT,
+
   RRCALL_KILL_NUM_POINTS
 };
