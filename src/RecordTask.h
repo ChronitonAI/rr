@@ -658,11 +658,12 @@ public:
 
   /**
    * Called when this task is able to receive a SIGCHLD (e.g. because
-   * we completed delivery of a signal). Sends a new synthetic
-   * SIGCHLD to the task if there are still tasks that need a SIGCHLD
-   * sent for them.
-   * May queue signals for specific tasks. Interrupts the waits that Linux
-   * wakes up for an emulated stop that satisfies them.
+   * we completed delivery of a signal). If there are still tasks that need
+   * a SIGCHLD sent for them, sends a new synthetic SIGCHLD, for this task's
+   * tracees' stops to this task, or for a child's stop to the child's
+   * parent thread, if that thread is in a wait and doesn't block SIGCHLD,
+   * and otherwise to the process, with that thread tried first. Interrupts
+   * the waits that Linux wakes up for an emulated stop that satisfies them.
    */
   void send_synthetic_SIGCHLD_if_necessary();
 

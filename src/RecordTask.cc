@@ -923,78 +923,65 @@ void RecordTask::set_stopped(bool stopped) {
 }
 
 void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
-  RecordTask* wake_task = nullptr;
-  bool need_signal = false;
+  // Linux (do_notify_parent_cldstop(), complete_signal()) queues the SIGCHLD
+  // for the process and tries to deliver it to the ptracer thread first,
+  // for a tracee's stop, or to the child's parent thread, for a child's
+  // stop. Find that thread.
+  RecordTask* sigchld_thread = nullptr;
   for (RecordTask* tracee : emulated_ptrace_tracees) {
     if (tracee->emulated_ptrace_SIGCHLD_pending) {
-      need_signal = true;
-      // check to see if any thread in the ptracer process is in a waitpid that
-      // could read the status of 'tracee'. If it is, we should wake up that
-      // thread. Otherwise we send SIGCHLD to the ptracer thread.
-      for (Task* t : thread_group()->task_set()) {
-        auto rt = static_cast<RecordTask*>(t);
-        if (rt->is_waiting_for_ptrace(tracee)) {
-          wake_task = rt;
-          break;
+      sigchld_thread = this;
+      break;
+    }
+  }
+  for (ThreadGroup* child_tg : thread_group()->children()) {
+    if (sigchld_thread) {
+      break;
+    }
+    for (Task* child : child_tg->task_set()) {
+      if (static_cast<RecordTask*>(child)->emulated_SIGCHLD_pending) {
+        sigchld_thread = parent_thread_of(child_tg);
+        if (!sigchld_thread) {
+          sigchld_thread = this;
         }
-      }
-      if (wake_task) {
         break;
       }
     }
   }
-  if (!need_signal) {
-    for (ThreadGroup* child_tg : thread_group()->children()) {
-      for (Task* child : child_tg->task_set()) {
-        RecordTask* rchild = static_cast<RecordTask*>(child);
-        if (rchild->emulated_SIGCHLD_pending) {
-          need_signal = true;
-          // check to see if any thread in the ptracer process is in a waitpid
-          // that could read the status of 'tracee'. If it is, we should wake
-          // up that thread. Otherwise we send SIGCHLD to the ptracer thread.
-          for (Task* t : thread_group()->task_set()) {
-            auto rt = static_cast<RecordTask*>(t);
-            if (rt->is_waiting_for(rchild)) {
-              wake_task = rt;
-              break;
-            }
-          }
-          if (wake_task) {
-            break;
-          }
-        }
-      }
-    }
-  }
 
-  // ptrace events trigger SIGCHLD in the ptracer's wake_task.
-  // We can't set all the siginfo values to their correct values here, so
-  // we'll patch this up when the signal is received.
-  // If there's already a pending SIGCHLD, this signal will be ignored,
-  // but at some point the pending SIGCHLD will be delivered and then
-  // send_synthetic_SIGCHLD_if_necessary will be called again to deliver a new
-  // SIGCHLD if necessary.
   siginfo_t si;
   memset(&si, 0, sizeof(si));
-  si.si_code = SI_QUEUE;
   si.si_value.sival_int = SIGCHLD_SYNTHETIC;
   int ret;
-  if (wake_task) {
-    LOG(debug) << "Sending synthetic SIGCHLD to waiting tid " << wake_task->tid;
-    // We must use the raw SYS_rt_tgsigqueueinfo syscall here to ensure the
-    // signal is sent to the correct thread by tid.
-    ret = syscall(SYS_rt_tgsigqueueinfo, wake_task->tgid(), wake_task->tid,
-                  SIGCHLD, &si);
+  if (sigchld_thread) {
+    // We can't set all the siginfo values to their correct values here, so
+    // we'll patch this up when the signal is received.
+    // If there's already a pending SIGCHLD, this signal will be ignored,
+    // but at some point the pending SIGCHLD will be delivered and then
+    // send_synthetic_SIGCHLD_if_necessary will be called again to deliver a
+    // new SIGCHLD if necessary.
+    si.si_code = SI_QUEUE;
+    if (sigchld_thread->in_wait_type != WAIT_TYPE_NONE &&
+        !sigchld_thread->is_sig_blocked(SIGCHLD)) {
+      // sigchld_thread is in a wait, so Linux has it take the SIGCHLD. We
+      // send the SIGCHLD to sigchld_thread itself, because when we resume
+      // another thread from a ptrace stop first, that thread can take a
+      // signal pending for the process.
+      LOG(debug) << "Sending synthetic SIGCHLD to waiting tid "
+                 << sigchld_thread->tid;
+      ret = syscall(SYS_rt_tgsigqueueinfo, tgid(), sigchld_thread->tid,
+                    SIGCHLD, &si);
+    } else {
+      // Given a thread's tid, rt_sigqueueinfo() queues the SIGCHLD for the
+      // process and has the kernel try that thread first.
+      LOG(debug) << "Sending synthetic SIGCHLD to pid " << tgid() << ", tid "
+                 << sigchld_thread->tid << " first";
+      ret = syscall(SYS_rt_sigqueueinfo, sigchld_thread->tid, SIGCHLD, &si);
+    }
     ASSERT(this, ret == 0);
-  } else if (need_signal) {
-    // Send the signal to the process as a whole and let the kernel
-    // decide which thread gets it.
-    ret = syscall(SYS_rt_sigqueueinfo, tgid(), SIGCHLD, &si);
-    ASSERT(this, ret == 0);
-    LOG(debug) << "Sending synthetic SIGCHLD to pid " << tgid();
   }
 
-  // Linux wakes up the threads that wait for a child of the process
+  // Linux also wakes up the threads that wait for a child of the process
   // (__wake_up_parent(), pid_child_should_wake()), and a wait that a stop
   // satisfies returns it. Interrupt those waits with a TIME_SLICE_SIGNAL,
   // which the tracee can't block: we then emulate their results. We have to

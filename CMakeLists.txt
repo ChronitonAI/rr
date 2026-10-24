@@ -1039,6 +1039,7 @@ set(BASIC_TESTS
   capget
   chew_cpu
   x86/chew_cpu_cpuid
+  child_stop_sigchld_thread
   chmod
   chown
   clock
