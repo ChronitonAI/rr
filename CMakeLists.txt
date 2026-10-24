@@ -1588,6 +1588,7 @@ set(TESTS_WITH_PROGRAM
   # clone_share_vm
   clone_syscallbuf_cleanup_blocked
   clone_syscallbuf_cleanup_cpu
+  clone_thread_killed_at_clone_event
   clone_vfork
   concurrent_signals
   conditional_breakpoint_calls

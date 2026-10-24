@@ -3675,6 +3675,18 @@ static int ptrace_option_for_event(int ptrace_event) {
   }
 }
 
+/**
+ * Whether `tid` can be a task that `t` just created: one we're ptracing but
+ * don't know about yet.
+ */
+static bool is_new_tracee(RecordTask* t, pid_t tid) {
+  if (tid <= 0 || t->session().find_task(tid)) {
+    return false;
+  }
+  auto tracer = read_proc_status_fields(tid, "TracerPid");
+  return tracer.size() == 1 && atoi(tracer[0].c_str()) == getpid();
+}
+
 template <typename Arch>
 static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) {
   uintptr_t flags;
@@ -3707,7 +3719,10 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
 
   while (true) {
     if (!t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
-      // Tracee died unexpectedly during clone.
+      // Tracee died unexpectedly during clone, before reporting the event.
+      // A new thread (CLONE_THREAD) died with it before we heard about it,
+      // so it never ran and replay mustn't create it.
+      t->ev().Syscall().failed_during_preparation = true;
       return ALLOW_SWITCH;
     }
     // XXX handle stray signals?
@@ -3753,6 +3768,17 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
     t->tgkill(SIGKILL);
   }
   pid_t new_tid = t->get_ptrace_eventmsg_pid();
+  if (!is_new_tracee(t, new_tid)) {
+    // A SIGKILL took the task out of its PTRACE_EVENT_CLONE (etc) stop before
+    // we could read the new tid: PTRACE_GETEVENTMSG failed, or it reported
+    // the exit status of the PTRACE_EVENT_EXIT stop the task has moved on to.
+    // As above, replay mustn't create a new task. Get the PTRACE_EVENT_EXIT
+    // stop, unless waiting for it is unsafe.
+    LOG(debug) << "Task " << t->tid << " killed before we got its new tid";
+    t->ev().Syscall().failed_during_preparation = true;
+    return t->session().scheduler().wait_for_killed_task(t) ? PREVENT_SWITCH
+                                                            : ALLOW_SWITCH;
+  }
   RecordTask* new_task = static_cast<RecordTask*>(
       t->session().clone(t, clone_flags_to_task_flags(flags), params.stack,
                          params.tls, params.ctid, new_tid));
