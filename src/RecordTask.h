@@ -197,8 +197,10 @@ public:
   /**
    * Returns a tracee or child of this task's process with an emulated stop
    * pending that the waitpid or similar this task is in reports, or null.
+   * With |for_wakeup|, only one whose stop Linux wakes this task up for
+   * (pid_child_should_wake()).
    */
-  RecordTask* waited_task_with_emulated_stop();
+  RecordTask* waited_task_with_emulated_stop(bool for_wakeup = false);
   /**
    * Returns the thread of this task's process that forked |child_process|
    * or, once that thread is exiting, the first thread of this process that
@@ -659,7 +661,8 @@ public:
    * we completed delivery of a signal). Sends a new synthetic
    * SIGCHLD to the task if there are still tasks that need a SIGCHLD
    * sent for them.
-   * May queue signals for specific tasks.
+   * May queue signals for specific tasks. Interrupts the waits that Linux
+   * wakes up for an emulated stop that satisfies them.
    */
   void send_synthetic_SIGCHLD_if_necessary();
 
