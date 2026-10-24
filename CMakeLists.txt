@@ -1514,6 +1514,7 @@ set(BASIC_TESTS
   vsyscall_timeslice
   x86/x87env
   wait
+  wait_options_emulated_stop
   wait_sigstop
   write_race
   writev

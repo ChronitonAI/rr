@@ -339,6 +339,7 @@ Task* RecordTask::clone(CloneReason reason, int flags, remote_ptr<void> stack,
     }
     if (reason == TRACEE_CLONE) {
       rt->creator_tid = tid;
+      rt->forker = (flags & CLONE_SHARE_THREAD_GROUP) ? forker : tuid();
     }
   }
   return t;
@@ -402,6 +403,9 @@ void RecordTask::post_exec() {
   // Newly execed tasks always have non-faulting mode (from their point of
   // view, even if rr is secretly causing faults).
   cpuid_mode = 1;
+
+  // Linux makes SIGCHLD the exit signal of a task that execs (de_thread()).
+  termination_signal = SIGCHLD;
 }
 
 template <typename Arch> static void do_preload_init_arch(RecordTask* t) {
@@ -1087,6 +1091,16 @@ bool RecordTask::is_waiting_for(RecordTask* t) {
   if (t->thread_group()->parent() != thread_group().get()) {
     return false;
   }
+  // Without __WALL, a wait reports a child process whose exit signal isn't
+  // SIGCHLD only with __WCLONE, and other children only without __WCLONE
+  // (eligible_child()). A process's exit signal is its leader's.
+  if (!(in_wait_options & __WALL)) {
+    RecordTask* leader = session().find_task(t->tgid());
+    if ((leader ? leader : t)->is_clone_child() !=
+        !!(in_wait_options & __WCLONE)) {
+      return false;
+    }
+  }
   switch (in_wait_type) {
     case WAIT_TYPE_NONE:
       return false;
@@ -1102,6 +1116,84 @@ bool RecordTask::is_waiting_for(RecordTask* t) {
       ASSERT(this, false);
       return false;
   }
+}
+
+RecordTask* RecordTask::parent_thread_of(ThreadGroup* child_process) {
+  if (child_process->parent() != thread_group().get() ||
+      child_process->task_set().empty()) {
+    return nullptr;
+  }
+  // Linux makes the thread that forked a process its parent, and when that
+  // thread exits, the first thread of the process (in the order they were
+  // created) that isn't exiting (find_new_reaper()).
+  auto child = static_cast<RecordTask*>(*child_process->task_set().begin());
+  RecordTask* forker = session().find_task(child->forker);
+  if (forker && forker->thread_group() == thread_group() &&
+      !forker->is_exiting()) {
+    return forker;
+  }
+  RecordTask* parent = nullptr;
+  for (Task* t : thread_group()->task_set()) {
+    if (!t->is_exiting() &&
+        (!parent || t->tuid().serial() < parent->tuid().serial())) {
+      parent = static_cast<RecordTask*>(t);
+    }
+  }
+  return parent;
+}
+
+RecordTask* RecordTask::waited_task_with_emulated_stop() {
+  if (in_wait_type == WAIT_TYPE_NONE) {
+    return nullptr;
+  }
+
+  // With __WNOTHREAD, a thread waits only for its own tracees and for the
+  // children it is the parent of. When another thread of this process
+  // traces a child's leader, Linux reports the leader's ptrace stops to the
+  // child's parent thread too, also without WUNTRACED, if the wait reports
+  // that child (wait_consider_task()).
+  bool only_own = in_wait_options & __WNOTHREAD;
+  for (Task* thread : thread_group()->task_set()) {
+    for (RecordTask* tracee :
+         static_cast<RecordTask*>(thread)->emulated_ptrace_tracees) {
+      if (!tracee->emulated_stop_pending || !is_waiting_for_ptrace(tracee)) {
+        continue;
+      }
+      if (only_own && thread != this &&
+          (tracee->tid != tracee->tgid() ||
+           parent_thread_of(tracee->thread_group().get()) != this ||
+           !is_waiting_for(tracee))) {
+        continue;
+      }
+      return tracee;
+    }
+  }
+
+  for (ThreadGroup* child_process : thread_group()->children()) {
+    for (Task* child : child_process->task_set()) {
+      auto rchild = static_cast<RecordTask*>(child);
+      if (!rchild->emulated_stop_pending ||
+          rchild->emulated_stop_type == NOT_STOPPED) {
+        continue;
+      }
+      if (rchild->emulated_ptracer &&
+          rchild->emulated_ptracer->thread_group() == thread_group()) {
+        // We report the stops of a task that this process traces only as
+        // ptrace stops, above.
+        continue;
+      }
+      if (!(in_wait_options & WUNTRACED) &&
+          rchild->emulated_stop_type != CHILD_STOP) {
+        continue;
+      }
+      if (!is_waiting_for(rchild) ||
+          (only_own && parent_thread_of(child_process) != this)) {
+        continue;
+      }
+      return rchild;
+    }
+  }
+  return nullptr;
 }
 
 void RecordTask::save_ptrace_signal_siginfo(const siginfo_t& si) {
