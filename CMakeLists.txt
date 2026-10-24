@@ -1798,6 +1798,7 @@ set(TESTS_WITHOUT_PROGRAM
   checkpoint_simple
   checksum_block_open
   checksum_sanity_noclone
+  clone_killed_after_scratch
   comm
   cont_signal
   copy_all

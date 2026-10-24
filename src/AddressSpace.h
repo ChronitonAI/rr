@@ -880,6 +880,13 @@ public:
    */
   static void print_process_maps(Task* t);
 
+  /**
+   * Returns true if a task in t's thread-group other than t is doing an
+   * exec. Reading /proc/<tid>/maps for t can then deadlock in the kernel,
+   * so KernelMapIterator(Task*) refuses to.
+   */
+  static bool thread_group_in_exec(Task* t);
+
   void add_stap_semaphore_range(Task* t, MemoryRange range);
   void remove_stap_semaphore_range(Task* t, MemoryRange range);
   bool is_stap_semaphore(remote_ptr<uint16_t> addr);
