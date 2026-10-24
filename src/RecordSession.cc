@@ -148,10 +148,18 @@ static bool looks_like_syscall_entry(RecordTask* t) {
 }
 
 /**
- * Return true if we handle a ptrace exit event for task t. When this returns
- * true, t may have been deleted.
+ * Handle t's exit if t has reached its PTRACE_EVENT_EXIT stop or was reaped.
+ * If a SIGKILL or equivalent took t out of a stop before we read the stop,
+ * first wait for its PTRACE_EVENT_EXIT stop
+ * (Scheduler::wait_for_killed_task()). Returns true if t is exiting and must
+ * not be resumed: we handled its exit (t may have been deleted), or we
+ * couldn't wait for its PTRACE_EVENT_EXIT stop.
  */
 static bool handle_ptrace_exit_event(RecordTask* t) {
+  if (!t->was_reaped() && !t->is_stopped() && !t->seen_ptrace_exit_event() &&
+      !t->session().scheduler().wait_for_killed_task(t)) {
+    return true;
+  }
   if (t->was_reaped()) {
     if (t->handled_ptrace_exit_event()) {
       t->did_reach_zombie();
@@ -2061,7 +2069,7 @@ bool RecordSession::handle_signal_event(RecordTask* t, StepState* step_state) {
                               &dummy_did_enter_syscall);
           ASSERT(t, !dummy_did_enter_syscall);
         }
-        if (t->ptrace_event() == PTRACE_EVENT_EXIT) {
+        if (!t->is_stopped() || t->ptrace_event() == PTRACE_EVENT_EXIT) {
           // Tracee was nuked (probably SIGKILL) during desched processing.
           return true;
         }
