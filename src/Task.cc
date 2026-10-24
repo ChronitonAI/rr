@@ -2164,8 +2164,9 @@ bool Task::account_for_potential_ptrace_interrupt_stop(WaitStatus status) {
 }
 
 /**
- * This is purely for testing purposes. See RRCALL_KILL_AFTER_SIGNAL_STOP_WAIT
- * and RRCALL_KILL_AFTER_DESCHED_STOP_WAIT. waitid() has just reported
+ * This is purely for testing purposes. See RRCALL_KILL_AFTER_SIGNAL_STOP_WAIT,
+ * RRCALL_KILL_AFTER_DESCHED_STOP_WAIT and
+ * RRCALL_KILL_AFTER_DESCHED_DISARM_STOP_WAIT. waitid() has just reported
  * `status` for `t`. If we're to kill `t` now, do it before did_waitpid()
  * looks at the stop, as if the SIGKILL had arrived just after waitid()
  * returned.
@@ -2180,7 +2181,9 @@ static void maybe_kill_task_after_wait(Task* t, WaitStatus status) {
        rt->take_armed_kill(RRCALL_KILL_AFTER_SIGNAL_STOP_WAIT,
                            status.stop_sig())) ||
       (rt->in_desched_handling && status.ptrace_event() != PTRACE_EVENT_EXIT &&
-       rt->take_armed_kill(RRCALL_KILL_AFTER_DESCHED_STOP_WAIT));
+       rt->take_armed_kill(RRCALL_KILL_AFTER_DESCHED_STOP_WAIT)) ||
+      (rt->in_desched_disarm && status.ptrace_event() != PTRACE_EVENT_EXIT &&
+       rt->take_armed_kill(RRCALL_KILL_AFTER_DESCHED_DISARM_STOP_WAIT));
   if (!kill) {
     return;
   }

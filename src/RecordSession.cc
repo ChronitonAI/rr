@@ -965,16 +965,22 @@ void RecordSession::task_continue(const StepState& step_state) {
  * This allows the caller to deliver the signal after this returns.
  * (In reality the desched event will already have been disarmed before we
  * enter this function.)
+ * Returns false if |t| was killed.
  */
-static void advance_to_disarm_desched_syscall(RecordTask* t) {
+static bool advance_to_disarm_desched_syscall(RecordTask* t) {
   int old_sig = 0;
 
   LOG(debug) << "desched: DISARMING_DESCHED_EVENT";
   /* TODO: send this through main loop. */
   /* TODO: mask off signals and avoid this loop. */
   do {
-    if (!t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_UNLIMITED_TICKS)) {
-      return;
+    // See RRCALL_KILL_AFTER_DESCHED_DISARM_STOP_WAIT.
+    t->in_desched_disarm = true;
+    bool ok = t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT,
+                                  RESUME_UNLIMITED_TICKS);
+    t->in_desched_disarm = false;
+    if (!ok) {
+      return false;
     }
     if (t->status().is_syscall()) {
       t->apply_syscall_entry_regs();
@@ -1011,16 +1017,20 @@ static void advance_to_disarm_desched_syscall(RecordTask* t) {
     }
   } while (!t->is_disarm_desched_event_syscall());
 
-  // Exit the syscall. If this fails, that's fine, we can ignore it.
-  t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS);
+  // Exit the syscall.
+  return t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT,
+                             RESUME_NO_TICKS);
 }
 
 /**
  * |t| is at a desched event and some relevant aspect of its state
  * changed.  (For now, changes except the original desched'd syscall
  * being restarted.)
+ * Returns false if |t| was killed. Then the caller must not resume |t|,
+ * and must handle its exit before other tasks' events (see
+ * Scheduler::wait_for_killed_task()).
  */
-void RecordSession::desched_state_changed(RecordTask* t) {
+bool RecordSession::desched_state_changed(RecordTask* t) {
   LOG(debug) << "desched: IN_SYSCALL";
   /* We need to ensure that the syscallbuf code doesn't
    * try to commit the current record; we've already
@@ -1029,7 +1039,7 @@ void RecordSession::desched_state_changed(RecordTask* t) {
   t->write_mem(REMOTE_PTR_FIELD(t->syscallbuf_child, abort_commit), (uint8_t)1);
   t->record_event(Event::syscallbuf_abort_commit());
 
-  advance_to_disarm_desched_syscall(t);
+  bool alive = advance_to_disarm_desched_syscall(t);
 
   t->pop_desched();
 
@@ -1043,6 +1053,7 @@ void RecordSession::desched_state_changed(RecordTask* t) {
   t->write_mem(
       REMOTE_PTR_FIELD(t->syscallbuf_child, notify_on_syscall_hook_exit),
       (uint8_t)1);
+  return alive;
 }
 
 static void retry_syscall_patch(RecordTask* t, remote_code_ptr orig_syscall_ip)
@@ -1276,6 +1287,7 @@ void RecordSession::syscall_state_changed(RecordTask* t,
       SupportedArch syscall_arch = t->ev().Syscall().arch();
       int syscallno = t->ev().Syscall().number;
       intptr_t retval = t->regs().syscall_result_signed();
+      bool killed = false;
 
       if (t->desched_rec()) {
         // If we enabled the desched event above, disable it.
@@ -1318,7 +1330,7 @@ void RecordSession::syscall_state_changed(RecordTask* t,
           // return handler. Save that value into the syscall buf again so
           // replay will pick it up later.
           save_interrupted_syscall_ret_in_syscallbuf(t, retval);
-          desched_state_changed(t);
+          killed = !desched_state_changed(t);
         }
       } else {
         LOG(debug) << "  original_syscallno:" << t->regs().original_syscallno()
@@ -1399,7 +1411,7 @@ void RecordSession::syscall_state_changed(RecordTask* t,
           t->pop_syscall();
           if (EV_DESCHED == t->ev().type()) {
             LOG(debug) << "  exiting desched critical section";
-            desched_state_changed(t);
+            killed = !desched_state_changed(t);
           }
         } else {
           t->ev().transform(EV_SYSCALL_INTERRUPTION);
@@ -1414,7 +1426,12 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         }
       }
 
-      last_task_switchable = ALLOW_SWITCH;
+      if (killed) {
+        last_task_switchable = scheduler().wait_for_killed_task(t) ?
+            PREVENT_SWITCH : ALLOW_SWITCH;
+      } else {
+        last_task_switchable = ALLOW_SWITCH;
+      }
       step_state->continue_type = DONT_CONTINUE;
 
       if (!is_in_privileged_syscall(t)) {
@@ -2829,7 +2846,11 @@ RecordSession::RecordResult RecordSession::record_step() {
 
       switch (t->ev().type()) {
         case EV_DESCHED:
-          desched_state_changed(t);
+          if (!desched_state_changed(t)) {
+            last_task_switchable = scheduler().wait_for_killed_task(t) ?
+                PREVENT_SWITCH : ALLOW_SWITCH;
+            return result;
+          }
           break;
         case EV_SYSCALL:
           syscall_state_changed(t, &step_state);

@@ -919,6 +919,10 @@ public:
   // Set while handle_desched_event() runs this task on from a desched
   // signal. Used for testing (RRCALL_KILL_AFTER_DESCHED_STOP_WAIT).
   bool in_desched_handling;
+  // Set while advance_to_disarm_desched_syscall() runs this task to the
+  // ioctl that disarms the desched signal. Used for testing
+  // (RRCALL_KILL_AFTER_DESCHED_DISARM_STOP_WAIT).
+  bool in_desched_disarm;
 
 private:
   // See arm_kill().

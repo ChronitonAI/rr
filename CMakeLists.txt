@@ -1642,6 +1642,7 @@ set(TESTS_WITH_PROGRAM
   invalid_interpreter
   invalid_jump
   jit_proc_mem
+  killed_desched_exit_order
   killed_task_exit_order
   link
   madvise_dontfork
