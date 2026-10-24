@@ -2,10 +2,10 @@
 
 #include "util_internal.h"
 
-/* We have rr SIGKILL the child just before mapping its scratch memory,
-   before the child runs. The child shares our address space but isn't in our
-   thread group, so we survive and rr keeps checking that address space
-   (--check-cached-mmaps). */
+/* We have rr SIGKILL the child just before (or, with the argument "after",
+   just after) mapping its scratch memory, before the child runs. The child
+   shares our address space but isn't in our thread group, so we survive and
+   rr keeps checking that address space (--check-cached-mmaps). */
 
 static int do_child(__attribute__((unused)) void* p) { return 0; }
 
@@ -21,7 +21,7 @@ static void block_sigtrap(void) {
   test_assert(0 == sigprocmask(SIG_BLOCK, &set, NULL));
 }
 
-int main(void) {
+int main(int argc, char** argv) {
   const size_t stack_size = 1 << 16;
   char* stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -30,7 +30,10 @@ int main(void) {
 
   test_assert(stack != MAP_FAILED);
   block_sigtrap();
-  rr_arm_kill(RRCALL_KILL_BEFORE_CLONE_SCRATCH, 0, RRCALL_ARM_KILL_INHERIT);
+  rr_arm_kill(argc > 1 && !strcmp(argv[1], "after")
+                  ? RRCALL_KILL_AFTER_CLONE_SCRATCH
+                  : RRCALL_KILL_BEFORE_CLONE_SCRATCH,
+              0, RRCALL_ARM_KILL_INHERIT);
   child = clone(do_child, stack + stack_size, CLONE_VM | SIGCHLD, NULL);
   test_assert(child > 0);
   test_assert(child == waitpid(child, &status, 0));
