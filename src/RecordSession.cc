@@ -2177,6 +2177,15 @@ bool RecordSession::handle_signal_event(RecordTask* t, StepState* step_state) {
                               &dummy_did_enter_syscall);
           ASSERT(t, !dummy_did_enter_syscall);
         }
+        if (!t->is_stopped()) {
+          // A SIGKILL or equivalent took t out of a stop that handling the
+          // signal (e.g. handle_desched_event()) had waited for, before we
+          // read the stop.
+          last_task_switchable = scheduler().wait_for_killed_task(t) ?
+              PREVENT_SWITCH : ALLOW_SWITCH;
+          step_state->continue_type = DONT_CONTINUE;
+          return true;
+        }
         if (t->ptrace_event() == PTRACE_EVENT_EXIT) {
           // Tracee was nuked (probably SIGKILL) during desched processing.
           return true;
