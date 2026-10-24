@@ -1,0 +1,10 @@
+source `dirname $0`/util.sh
+record vfork_exec_scratch$bitness
+# The first execve is the parent's, the last one its vfork child's.
+execs=`rr --suppress-environment-warnings dump $workdir/latest-trace | \
+    grep "SYSCALL: execve' (state:EXITING_SYSCALL)"`
+pid=`echo "$execs" | head -n1 | sed -E 's/.* tid:([0-9]+).*/\1/'`
+event=`echo "$execs" | tail -n1 | sed -E 's/.*global_time:([0-9]+).*/\1/'`
+# Start debugging the parent at its first event after the child's exec, which
+# checkpoints the replay there, and restart from that checkpoint.
+debug_gdb_only restart_finish "-p $pid -g $event"

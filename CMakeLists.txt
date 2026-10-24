@@ -1889,6 +1889,7 @@ set(TESTS_WITHOUT_PROGRAM
   unwind_on_signal
   vfork_done_clone
   vfork_exec
+  vfork_exec_scratch_checkpoint
   vfork_break_parent
   vfork_checksum
   vsyscall_singlestep
