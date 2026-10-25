@@ -7763,12 +7763,17 @@ static void rec_process_syscall_arch(RecordTask* t,
         if (syscallno == Arch::waitid && (r.arg4() & WNOWAIT)) {
           // Leave the child in a waitable state
         } else {
-          if (tracee->emulated_ptracer == t) {
+          if (ptrace_stop) {
             tracee->emulated_stop_pending = false;
           } else {
+            // The wait takes the stop of the child process. The stops of the
+            // child's threads that this process traces are ptrace stops,
+            // which it leaves.
             for (Task* thread : tracee->thread_group()->task_set()) {
               auto rt = static_cast<RecordTask*>(thread);
-              rt->emulated_stop_pending = false;
+              if (!is_traced_by_process_of(rt, t)) {
+                rt->emulated_stop_pending = false;
+              }
             }
           }
           if (tracee->detached_proxy &&

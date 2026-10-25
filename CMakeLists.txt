@@ -1332,6 +1332,7 @@ set(BASIC_TESTS
   ptrace_trace_exit
   ptrace_traceme
   ptrace_traceme_thread
+  ptrace_wait_one_stop
   ptrace_waiter_thread
   ptrace_wnohang
   ptrace_wnohang_poll
