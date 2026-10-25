@@ -2366,6 +2366,14 @@ static Switchable prepare_bpf(RecordTask* t,
   return PREVENT_SWITCH;
 }
 
+/**
+ * Returns true if |tracee| is traced by a thread of |t|'s process.
+ */
+static bool is_traced_by_process_of(RecordTask* tracee, RecordTask* t) {
+  return tracee->emulated_ptracer &&
+         tracee->emulated_ptracer->thread_group() == t->thread_group();
+}
+
 static bool maybe_emulate_wait(RecordTask* t, TaskSyscallState& syscall_state) {
   RecordTask* child = t->waited_task_with_emulated_stop();
   if (!child) {
@@ -7727,9 +7735,15 @@ static void rec_process_syscall_arch(RecordTask* t,
 
       RecordTask* tracee = syscall_state.emulate_wait_for_child;
       if (tracee) {
-        // Finish emulation of ptrace result or stop-signal
+        // Finish emulation of ptrace result or stop-signal. We report the
+        // stops of a task that this process traces as ptrace stops (see
+        // RecordTask::waited_task_with_emulated_stop), which a wait returns
+        // with the task's tid. A wait returns the stop or exit of a child
+        // process with the child's pid.
+        bool ptrace_stop = is_traced_by_process_of(tracee, t);
+        pid_t pid = ptrace_stop ? tracee->tid : tracee->tgid();
         Registers r = t->regs();
-        r.set_syscall_result(syscallno == Arch::waitid ? 0 : tracee->tid);
+        r.set_syscall_result(syscallno == Arch::waitid ? 0 : pid);
         t->set_regs(r);
         if (syscallno == Arch::waitid) {
           remote_ptr<typename Arch::siginfo_t> sip = r.arg3();

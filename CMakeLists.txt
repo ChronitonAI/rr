@@ -1516,6 +1516,7 @@ set(BASIC_TESTS
   wait
   wait_options_emulated_stop
   wait_sigstop
+  wait_sigstop_threads
   write_race
   writev
   xattr
