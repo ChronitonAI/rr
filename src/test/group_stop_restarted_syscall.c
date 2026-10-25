@@ -1,0 +1,138 @@
+/* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
+
+#include "util.h"
+
+/* A thread's blocking read() is interrupted by a signal whose handler stops
+   the process with SIGSTOP, and restarts when the handler returns. rr
+   resumes the thread with PTRACE_SYSCALL, since the interrupted read() may
+   restart, and gets the restarted read()'s syscall-entry stop while it
+   brings the process into the group stop. The read() is made from a site rr
+   doesn't patch, so the restart is a traced syscall and a
+   PTRACE_EVENT_SECCOMP stop follows its syscall-entry stop. rr must record
+   the restarted read() and its exit. The race it tests only happens in some
+   recordings.
+   With the argument "signalfd", the thread reads a signalfd for SIGUSR2,
+   which the parent sends after the SIGCONT, instead of a pipe. Reading a
+   signalfd recomputes whether the thread has a signal pending before it
+   blocks. */
+
+#define NUM_ITERATIONS 20
+
+static int pipe_a[2];
+static int pipe_b[2];
+static int ack_fds[2];
+static int use_signalfd;
+static int sig_fd;
+static volatile pid_t main_tid;
+static pid_t reader_tid;
+
+static void handle_usr1(__attribute__((unused)) int sig) {
+  test_assert(0 == syscall(SYS_tgkill, getpid(), main_tid, SIGSTOP));
+}
+
+static void* reader_thread(__attribute__((unused)) void* p) {
+  struct sched_param param;
+  char ch;
+  int i;
+
+  /* Run this thread only when its CPU has nothing else to do. That lets rr
+     handle the SIGSTOP before this thread reaches the PTRACE_EVENT_SECCOMP
+     stop of its restarted read(). */
+  memset(&param, 0, sizeof(param));
+  sched_setscheduler(0, SCHED_IDLE, &param);
+
+  __atomic_store_n(&reader_tid, sys_gettid(), __ATOMIC_SEQ_CST);
+  for (i = 0; i < NUM_ITERATIONS; ++i) {
+    if (use_signalfd) {
+      struct signalfd_siginfo si;
+      test_assert(sizeof(si) == unbufferable_syscall(SYS_read, sig_fd,
+                                                     (uintptr_t)&si,
+                                                     sizeof(si)));
+      test_assert(si.ssi_signo == SIGUSR2);
+    } else {
+      test_assert(1 ==
+                  unbufferable_syscall(SYS_read, pipe_a[0], (uintptr_t)&ch, 1));
+      test_assert(ch == 'x');
+    }
+    test_assert(1 == write(ack_fds[1], "x", 1));
+  }
+  return NULL;
+}
+
+static int child_main(void) {
+  struct sigaction sa;
+  pthread_t thread;
+  pid_t reader;
+  char ch;
+  int i;
+
+  main_tid = sys_gettid();
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = handle_usr1;
+  sa.sa_flags = SA_RESTART;
+  test_assert(0 == sigaction(SIGUSR1, &sa, NULL));
+
+  if (use_signalfd) {
+    sigset_t sigs;
+    sigemptyset(&sigs);
+    sigaddset(&sigs, SIGUSR2);
+    test_assert(0 == sigprocmask(SIG_BLOCK, &sigs, NULL));
+    sig_fd = signalfd(-1, &sigs, 0);
+    test_assert(sig_fd >= 0);
+  }
+
+  test_assert(0 == pthread_create(&thread, NULL, reader_thread, NULL));
+  while (!(reader = __atomic_load_n(&reader_tid, __ATOMIC_SEQ_CST))) {
+    sched_yield();
+  }
+
+  for (i = 0; i < NUM_ITERATIONS; ++i) {
+    /* Wait until the reader thread is blocked in its read(). */
+    while (get_task_state(reader) != 'S') {
+      sched_yield();
+    }
+    /* Interrupt the read() with a signal whose handler stops the process and
+       returns; the read() restarts. */
+    test_assert(0 == syscall(SYS_tgkill, getpid(), reader, SIGUSR1));
+    test_assert(1 ==
+                unbufferable_syscall(SYS_read, pipe_b[0], (uintptr_t)&ch, 1));
+    test_assert(ch == 'x');
+    test_assert(1 == read(ack_fds[0], &ch, 1));
+  }
+  test_assert(0 == pthread_join(thread, NULL));
+  return 77;
+}
+
+int main(int argc, char* argv[]) {
+  pid_t child;
+  int status;
+  int i;
+
+  use_signalfd = argc > 1 && !strcmp(argv[1], "signalfd");
+  test_assert(0 == pipe(pipe_a));
+  test_assert(0 == pipe(pipe_b));
+  test_assert(0 == pipe(ack_fds));
+
+  child = fork();
+  if (!child) {
+    return child_main();
+  }
+  test_assert(child > 0);
+
+  for (i = 0; i < NUM_ITERATIONS; ++i) {
+    test_assert(child == waitpid(child, &status, WUNTRACED));
+    test_assert(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+    test_assert(0 == kill(child, SIGCONT));
+    if (use_signalfd) {
+      test_assert(0 == kill(child, SIGUSR2));
+    } else {
+      test_assert(1 == write(pipe_a[1], "x", 1));
+    }
+    test_assert(1 == write(pipe_b[1], "x", 1));
+  }
+  test_assert(child == waitpid(child, &status, 0));
+  test_assert(WIFEXITED(status) && WEXITSTATUS(status) == 77);
+
+  atomic_puts("EXIT-SUCCESS");
+  return 0;
+}
