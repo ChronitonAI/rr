@@ -239,6 +239,19 @@ RecordTask::~RecordTask() {
     t->emulated_stop_pending = false;
     t->emulated_stop_type = NOT_STOPPED;
   }
+  if (emulated_SIGCHLD_pending) {
+    // We still owe our parent process the SIGCHLD for our stop or exit,
+    // which the synthetic SIGCHLD we sent it carries. Keep its siginfo with
+    // the parent.
+    ThreadGroup* parent = thread_group()->parent();
+    if (parent && !parent->gone_child_SIGCHLD) {
+      siginfo_t si;
+      memset(&si, 0, sizeof(si));
+      si.si_signo = SIGCHLD;
+      fill_SIGCHLD_siginfo(&si);
+      parent->gone_child_SIGCHLD = si;
+    }
+  }
 
   // We expect tasks to usually exit by a call to exit() or
   // exit_group(), so it's not helpful to warn about that.
@@ -1034,7 +1047,7 @@ void RecordTask::maybe_drop_pending_SIGCHLD_notifications() {
       }
     }
   }
-  if (owed.empty()) {
+  if (owed.empty() && !thread_group()->gone_child_SIGCHLD) {
     return;
   }
   for (Task* t : thread_group()->task_set()) {
@@ -1046,6 +1059,7 @@ void RecordTask::maybe_drop_pending_SIGCHLD_notifications() {
   for (bool* pending : owed) {
     *pending = false;
   }
+  thread_group()->gone_child_SIGCHLD.reset();
 }
 
 bool RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
@@ -1080,8 +1094,16 @@ bool RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
         }
       }
     }
+    // The SIGCHLD also covers the stop or exit of a child whose task we
+    // deleted.
+    std::optional<siginfo_t> gone_child;
+    gone_child.swap(thread_group()->gone_child_SIGCHLD);
 
     if (!from_task) {
+      if (gone_child) {
+        *si = *gone_child;
+        return true;
+      }
       // Maybe the task died after the synthetic SIGCHLD was sent
       LOG(warn) << "Can't find traced task that send synthetic SIGCHLD";
       return false;
@@ -1090,15 +1112,19 @@ bool RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
 
   // This overwrites the SIGCHLD_SYNTHETIC in si_value: si_status is at the
   // same place.
+  from_task->fill_SIGCHLD_siginfo(si);
+  return true;
+}
+
+void RecordTask::fill_SIGCHLD_siginfo(siginfo_t* si) {
   auto native_si = reinterpret_cast<NativeArch::siginfo_t*>(si);
-  from_task->set_siginfo_for_waited_task<NativeArch>(native_si);
+  set_siginfo_for_waited_task<NativeArch>(native_si);
   if (native_si->si_code == CLD_STOPPED || native_si->si_code == CLD_TRAPPED) {
     // waitid() reports the whole stop code for a ptrace event or syscall
     // stop, but a SIGCHLD has just the signal (do_notify_parent_cldstop()).
     native_si->_sifields._sigchld.si_status_ =
-        from_task->emulated_stop_code.ptrace_signal();
+        emulated_stop_code.ptrace_signal();
   }
-  return true;
 }
 
 bool RecordTask::is_waiting_for_ptrace(RecordTask* t) {

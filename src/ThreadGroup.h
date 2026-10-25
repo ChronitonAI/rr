@@ -4,9 +4,11 @@
 #define RR_TASKGROUP_H_
 
 #include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 
 #include <memory>
+#include <optional>
 #include <set>
 
 #include "HasTaskSet.h"
@@ -65,6 +67,11 @@ public:
   // True when a task in the task-group received a SIGSEGV because we
   // couldn't push a signal handler frame. Only used during recording.
   bool received_sigframe_SIGSEGV;
+
+  // The siginfo of the SIGCHLD that we owe this process for the stop or exit
+  // of a child whose task we deleted while it needed to send that SIGCHLD
+  // (RecordTask::emulated_SIGCHLD_pending). Only used during recording.
+  std::optional<siginfo_t> gone_child_SIGCHLD;
 
 private:
   ThreadGroup(const ThreadGroup&) = delete;

@@ -158,22 +158,29 @@ public:
    * rt_sigtimedwait() or reads it from a signalfd. If it's a synthetic
    * SIGCHLD (see send_synthetic_SIGCHLD_if_necessary) and we owe this
    * task's process a SIGCHLD for the stop of one of its tracees, or else of
-   * one of its children, update the siginfo to reflect that stop, and note
-   * that the process has had its SIGCHLD for the stops of all its tracees
-   * (or else children), which Linux merges into one SIGCHLD.
+   * one of its children (including a child whose task we deleted, see
+   * ThreadGroup::gone_child_SIGCHLD), update the siginfo to reflect that
+   * stop, and note that the process has had its SIGCHLD for the stops of all
+   * its tracees (or else children), which Linux merges into one SIGCHLD.
    * Note that we can't set the correct siginfo when we send the signal, because
    * it requires us to set information only the kernel has permission to set.
    * Returns true if we filled in |si|.
    */
   bool set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si);
   /**
+   * Fills in |si| for the SIGCHLD that this task sends its parent or ptracer
+   * for its emulated stop or exit.
+   */
+  void fill_SIGCHLD_siginfo(siginfo_t* si);
+  /**
    * Called when this process has taken a SIGCHLD some other way than in a
    * handler (after a handler, signal_delivered sends another SIGCHLD for the
    * stops we still owe it SIGCHLDs for), or when Linux has discarded its
-   * pending SIGCHLDs. The stops of its tracees and children that we still
-   * owe it SIGCHLDs for were merged into those SIGCHLDs, so this forgets
-   * them, unless a SIGCHLD is still pending for the process (or stashed by
-   * us), which can carry them.
+   * pending SIGCHLDs. The stops of its tracees and children (including a
+   * child whose task we deleted, see ThreadGroup::gone_child_SIGCHLD) that we
+   * still owe it SIGCHLDs for were merged into those SIGCHLDs, so this
+   * forgets them, unless a SIGCHLD is still pending for the process (or
+   * stashed by us), which can carry them.
    */
   void maybe_drop_pending_SIGCHLD_notifications();
   /**
