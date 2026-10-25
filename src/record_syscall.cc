@@ -2492,6 +2492,16 @@ static void prepare_ptrace_cont(RecordTask* tracee, int sig, int command) {
                << tracee->emulated_stop_code;
     sig = 0;
   }
+  if (sig && (tracee->emulated_stop_type == SYSCALL_ENTRY_STOP ||
+              tracee->emulated_stop_type == SYSCALL_EXIT_STOP)) {
+    // Linux sends the signal when the tracer resumes the tracee from a
+    // syscall-stop (see ptrace_report_syscall()), so the tracee takes it once
+    // the syscall is done.
+    LOG(debug) << "Sending signal " << signal_name(sig)
+               << " passed to ptrace resume from a syscall-stop";
+    tracee->tgkill(sig);
+    sig = 0;
+  }
   if (sig) {
     siginfo_t si = tracee->take_ptrace_signal_siginfo(sig);
     LOG(debug) << "Doing ptrace resume with signal " << signal_name(sig);

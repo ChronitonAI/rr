@@ -1326,6 +1326,7 @@ set(BASIC_TESTS
   ptrace_stop_sigcont
   ptrace_syscall
   ptrace_syscall_clone_untraced
+  ptrace_syscall_stop_signal
   x86/ptrace_sysemu
   ptrace_sysemu_syscall
   ptrace_trace_clone
