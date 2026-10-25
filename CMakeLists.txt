@@ -1333,6 +1333,7 @@ set(BASIC_TESTS
   ptrace_traceme
   ptrace_traceme_thread
   ptrace_waiter_thread
+  ptrace_waitid_siginfo
   ptrace_wnohang
   ptrace_wnohang_poll
   ptracer_death

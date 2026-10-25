@@ -7751,7 +7751,7 @@ static void rec_process_syscall_arch(RecordTask* t,
             typename Arch::siginfo_t si;
             memset(&si, 0, sizeof(si));
             si.si_signo = SIGCHLD;
-            tracee->set_siginfo_for_waited_task<Arch>(&si);
+            tracee->set_siginfo_for_waited_task<Arch>(&si, ptrace_stop);
             t->write_mem(sip, si);
           }
         } else {

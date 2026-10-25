@@ -163,13 +163,18 @@ public:
   void set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si);
   /**
    * Sets up |si| as if we're delivering a SIGCHLD/waitid for this waited task.
+   * |ptrace_wait| is true for a waitid() that reports a ptrace stop or exit of
+   * this task to its ptracer's process, which has this task's tid, and
+   * CLD_TRAPPED for every kind of ptrace stop (wait_task_stopped()).
    */
   template <typename Arch>
-  void set_siginfo_for_waited_task(typename Arch::siginfo_t* si) {
-    // XXX: The `ptrace` argument is likely incorrect here.
+  void set_siginfo_for_waited_task(typename Arch::siginfo_t* si,
+                                   bool ptrace_wait = false) {
+    // XXX: For a SIGCHLD, and for a wait that isn't a ptrace wait, the
+    // `ptrace` argument is likely incorrect here.
     emulated_stop_code.fill_siginfo<Arch>(si,
-      emulated_stop_type != GROUP_STOP, emulated_ptrace_options);
-    si->_sifields._sigchld.si_pid_ = tgid();
+      ptrace_wait || emulated_stop_type != GROUP_STOP, emulated_ptrace_options);
+    si->_sifields._sigchld.si_pid_ = ptrace_wait ? tid : tgid();
     si->_sifields._sigchld.si_uid_ = getuid();
   }
   /**
