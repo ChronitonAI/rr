@@ -1170,6 +1170,15 @@ RecordTask* RecordTask::waited_task_with_emulated_stop() {
   }
 
   for (ThreadGroup* child_process : thread_group()->children()) {
+    // When this process traces a child's leader, a wait reports only the
+    // leader's ptrace stops, above, and not the child's job-control stop
+    // (wait_consider_task()).
+    RecordTask* leader = session().find_task(child_process->tgid);
+    if (leader && leader->thread_group().get() == child_process &&
+        leader->emulated_ptracer &&
+        leader->emulated_ptracer->thread_group() == thread_group()) {
+      continue;
+    }
     for (Task* child : child_process->task_set()) {
       auto rchild = static_cast<RecordTask*>(child);
       if (!rchild->emulated_stop_pending ||
