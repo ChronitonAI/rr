@@ -68,10 +68,20 @@ public:
   // couldn't push a signal handler frame. Only used during recording.
   bool received_sigframe_SIGSEGV;
 
-  // The siginfo of the SIGCHLD that we owe this process for the stop or exit
-  // of a child whose task we deleted while it needed to send that SIGCHLD
-  // (RecordTask::emulated_SIGCHLD_pending). Only used during recording.
-  std::optional<siginfo_t> gone_child_SIGCHLD;
+  // The SIGCHLD that we owe this process for the stop or exit of a child
+  // whose task we deleted while it needed to send that SIGCHLD
+  // (RecordTask::emulated_SIGCHLD_pending): its siginfo, and its
+  // RecordTask::emulated_SIGCHLD_order. Only used during recording.
+  struct GoneChildSIGCHLD {
+    siginfo_t siginfo;
+    uint64_t order;
+  };
+  std::optional<GoneChildSIGCHLD> gone_child_SIGCHLD;
+  // The SIGCHLDs that tasks need to send this process with an
+  // RecordTask::emulated_SIGCHLD_order below this were needed when we last
+  // sent this process a synthetic SIGCHLD, which carries them. Only used
+  // during recording.
+  uint64_t synthetic_SIGCHLD_order;
 
 private:
   ThreadGroup(const ThreadGroup&) = delete;

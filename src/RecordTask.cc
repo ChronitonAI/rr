@@ -176,6 +176,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       held_at_emulated_ptrace_event(false),
       emulated_ptrace_SIGCHLD_pending(false),
       emulated_SIGCHLD_pending(false),
+      emulated_SIGCHLD_order(0),
       emulated_ptrace_seized(false),
       thread_synthetic_SIGCHLD_pending(false),
       in_wait_type(WAIT_TYPE_NONE),
@@ -246,11 +247,12 @@ RecordTask::~RecordTask() {
     // the parent.
     ThreadGroup* parent = thread_group()->parent();
     if (parent && !parent->gone_child_SIGCHLD) {
-      siginfo_t si;
-      memset(&si, 0, sizeof(si));
-      si.si_signo = SIGCHLD;
-      fill_SIGCHLD_siginfo(&si);
-      parent->gone_child_SIGCHLD = si;
+      ThreadGroup::GoneChildSIGCHLD gone_child;
+      memset(&gone_child.siginfo, 0, sizeof(gone_child.siginfo));
+      gone_child.siginfo.si_signo = SIGCHLD;
+      fill_SIGCHLD_siginfo(&gone_child.siginfo);
+      gone_child.order = emulated_SIGCHLD_order;
+      parent->gone_child_SIGCHLD = gone_child;
     }
   }
 
@@ -944,6 +946,8 @@ void RecordTask::set_stopped(bool stopped) {
 }
 
 void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
+  maybe_drop_sent_SIGCHLD_notifications();
+
   // Linux (do_notify_parent_cldstop(), complete_signal()) queues the SIGCHLD
   // for the process and tries to deliver it to the ptracer thread first,
   // for a tracee's stop, or to the child's parent thread, for a child's
@@ -1001,6 +1005,7 @@ void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
       ret = syscall(SYS_rt_sigqueueinfo, sigchld_thread->tid, SIGCHLD, &si);
     }
     ASSERT(this, ret == 0);
+    thread_group()->synthetic_SIGCHLD_order = session().next_SIGCHLD_order();
   }
 
   // Linux also wakes up the threads that wait for a child of the process
@@ -1051,6 +1056,32 @@ static bool has_SIGCHLD_carrier(ThreadGroup* tg) {
     }
   }
   return false;
+}
+
+void RecordTask::maybe_drop_sent_SIGCHLD_notifications() {
+  ThreadGroup* tg = thread_group().get();
+  vector<RecordTask*> sent;
+  for (ThreadGroup* child_tg : tg->children()) {
+    for (Task* child : child_tg->task_set()) {
+      auto rchild = static_cast<RecordTask*>(child);
+      if (rchild->emulated_SIGCHLD_pending &&
+          rchild->emulated_SIGCHLD_order < tg->synthetic_SIGCHLD_order) {
+        sent.push_back(rchild);
+      }
+    }
+  }
+  bool sent_gone_child =
+      tg->gone_child_SIGCHLD &&
+      tg->gone_child_SIGCHLD->order < tg->synthetic_SIGCHLD_order;
+  if ((sent.empty() && !sent_gone_child) || has_SIGCHLD_carrier(tg)) {
+    return;
+  }
+  for (RecordTask* rchild : sent) {
+    rchild->emulated_SIGCHLD_pending = false;
+  }
+  if (sent_gone_child) {
+    tg->gone_child_SIGCHLD.reset();
+  }
 }
 
 void RecordTask::maybe_drop_pending_SIGCHLD_notifications() {
@@ -1115,12 +1146,12 @@ bool RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
     }
     // The SIGCHLD also covers the stop or exit of a child whose task we
     // deleted.
-    std::optional<siginfo_t> gone_child;
+    std::optional<ThreadGroup::GoneChildSIGCHLD> gone_child;
     gone_child.swap(thread_group()->gone_child_SIGCHLD);
 
     if (!from_task) {
       if (gone_child) {
-        *si = *gone_child;
+        *si = gone_child->siginfo;
         return true;
       }
       // Maybe the task died after the synthetic SIGCHLD was sent
@@ -1334,6 +1365,11 @@ static pid_t get_ppid(pid_t pid) {
   return *end ? -1 : actual_ppid;
 }
 
+void RecordTask::set_emulated_SIGCHLD_pending() {
+  emulated_SIGCHLD_pending = true;
+  emulated_SIGCHLD_order = session().next_SIGCHLD_order();
+}
+
 void RecordTask::apply_group_stop(int sig) {
   if (emulated_stop_type == NOT_STOPPED) {
     LOG(debug) << "setting " << tid << " to GROUP_STOP due to signal " << sig;
@@ -1342,7 +1378,7 @@ void RecordTask::apply_group_stop(int sig) {
       emulated_stop_type = GROUP_STOP;
       emulated_stop_code = status;
       emulated_stop_pending = true;
-      emulated_SIGCHLD_pending = true;
+      set_emulated_SIGCHLD_pending();
       RecordTask* t = session().find_task(get_ppid(tid));
       if (t) {
         t->send_synthetic_SIGCHLD_if_necessary();

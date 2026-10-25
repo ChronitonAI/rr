@@ -680,14 +680,31 @@ public:
 
   /**
    * Called when this task is able to receive a SIGCHLD (e.g. because
-   * we completed delivery of a signal). If there are still tasks that need
-   * a SIGCHLD sent for them, sends a new synthetic SIGCHLD, for this task's
-   * tracees' stops to this task, or for a child's stop to the child's
-   * parent thread, if that thread is in a wait and doesn't block SIGCHLD,
-   * and otherwise to the process, with that thread tried first. Interrupts
-   * the waits that Linux wakes up for an emulated stop that satisfies them.
+   * we completed delivery of a signal). Forgets the SIGCHLDs that this
+   * task's process took or lost (see maybe_drop_sent_SIGCHLD_notifications).
+   * If there are still tasks that need a SIGCHLD sent for them, sends a new
+   * synthetic SIGCHLD, for this task's tracees' stops to this task, or for a
+   * child's stop to the child's parent thread, if that thread is in a wait
+   * and doesn't block SIGCHLD, and otherwise to the process, with that
+   * thread tried first. Interrupts the waits that Linux wakes up for an
+   * emulated stop that satisfies them.
    */
   void send_synthetic_SIGCHLD_if_necessary();
+  /**
+   * Called before we may send this task's process a synthetic SIGCHLD. The
+   * synthetic SIGCHLDs that we sent the process before carry the SIGCHLDs
+   * that its children needed to send then (see
+   * ThreadGroup::synthetic_SIGCHLD_order). Unless a SIGCHLD that carries them
+   * is left, the process has taken them, or they merged into a SIGCHLD that
+   * we didn't fill in (e.g. one for a child's exit), so this forgets them.
+   */
+  void maybe_drop_sent_SIGCHLD_notifications();
+  /**
+   * Notes that this task needs to send its parent a SIGCHLD for a new stop
+   * or exit (emulated_SIGCHLD_pending), which comes after the SIGCHLDs that
+   * tasks needed to send before (emulated_SIGCHLD_order).
+   */
+  void set_emulated_SIGCHLD_pending();
 
   void set_sigmask(sig_set_t mask);
 
@@ -836,6 +853,10 @@ public:
   // true if this task needs to send a SIGCHLD to its parent for its
   // emulated stop
   bool emulated_SIGCHLD_pending;
+  // When emulated_SIGCHLD_pending, where that SIGCHLD comes in the order of
+  // the SIGCHLDs that tasks need to send: smaller for a SIGCHLD that a task
+  // needed to send earlier (see RecordSession::next_SIGCHLD_order).
+  uint64_t emulated_SIGCHLD_order;
   // tracer attached via PTRACE_SEIZE
   bool emulated_ptrace_seized;
   // true if we sent this thread a synthetic SIGCHLD of its own (see

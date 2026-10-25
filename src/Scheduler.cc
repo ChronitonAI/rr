@@ -677,7 +677,7 @@ static RecordTask* find_waited_task(RecordSession& session, pid_t tid, WaitStatu
       LOGM(debug) << "    ... notifying parent.";
       waited->emulated_stop_type = CHILD_STOP;
       waited->emulated_stop_pending = true;
-      waited->emulated_SIGCHLD_pending = true;
+      waited->set_emulated_SIGCHLD_pending();
       waited->emulated_stop_code = status;
       parent->send_synthetic_SIGCHLD_if_necessary();
     }

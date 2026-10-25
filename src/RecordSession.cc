@@ -2649,7 +2649,8 @@ RecordSession::RecordSession(const std::string& exe_path,
       wait_for_all_(false),
       use_audit_(use_audit),
       unmap_vdso_(unmap_vdso),
-      check_outside_mmaps_(check_outside_mmaps) {
+      check_outside_mmaps_(check_outside_mmaps),
+      next_SIGCHLD_order_(0) {
   set_intel_pt_enabled(intel_pt_enabled);
   if (intel_pt_enabled) {
     PerfCounters::start_pt_copy_thread();

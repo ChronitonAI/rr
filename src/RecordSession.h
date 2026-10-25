@@ -152,6 +152,13 @@ public:
     return seccomp_filter_rewriter_;
   }
 
+  /**
+   * Returns a number larger than all numbers it returned before. We use these
+   * to order the SIGCHLDs that tasks need to send to their parents and the
+   * synthetic SIGCHLDs we send (see RecordTask::emulated_SIGCHLD_order).
+   */
+  uint64_t next_SIGCHLD_order() { return next_SIGCHLD_order_++; }
+
   enum ContinueType { DONT_CONTINUE = 0, CONTINUE, CONTINUE_SYSCALL };
 
   struct StepState {
@@ -300,6 +307,8 @@ private:
   bool use_audit_;
   bool unmap_vdso_;
   bool check_outside_mmaps_;
+
+  uint64_t next_SIGCHLD_order_;
 };
 
 } // namespace rr
