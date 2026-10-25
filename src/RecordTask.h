@@ -179,8 +179,8 @@ public:
    * pending SIGCHLDs. The stops of its tracees and children (including a
    * child whose task we deleted, see ThreadGroup::gone_child_SIGCHLD) that we
    * still owe it SIGCHLDs for were merged into those SIGCHLDs, so this
-   * forgets them, unless a SIGCHLD is still pending for the process (or
-   * stashed by us), which can carry them.
+   * forgets them, unless a SIGCHLD that carries them is left: pending for
+   * the process, or for a thread that we sent one to, or stashed by us.
    */
   void maybe_drop_pending_SIGCHLD_notifications();
   /**
@@ -838,6 +838,11 @@ public:
   bool emulated_SIGCHLD_pending;
   // tracer attached via PTRACE_SEIZE
   bool emulated_ptrace_seized;
+  // true if we sent this thread a synthetic SIGCHLD of its own (see
+  // send_synthetic_SIGCHLD_if_necessary), and since then the thread hasn't
+  // dequeued a SIGCHLD (see did_wait) and Linux hasn't discarded that
+  // SIGCHLD (see update_sigaction_arch).
+  bool thread_synthetic_SIGCHLD_pending;
   WaitType in_wait_type;
   int in_wait_options;
   pid_t in_wait_pid;

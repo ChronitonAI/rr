@@ -177,6 +177,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       emulated_ptrace_SIGCHLD_pending(false),
       emulated_SIGCHLD_pending(false),
       emulated_ptrace_seized(false),
+      thread_synthetic_SIGCHLD_pending(false),
       in_wait_type(WAIT_TYPE_NONE),
       in_wait_pid(0),
       creator_tid(0),
@@ -803,6 +804,13 @@ vector<remote_code_ptr> RecordTask::syscallbuf_syscall_entry_breakpoints() {
 }
 
 void RecordTask::did_wait() {
+  if (status().stop_sig() == SIGCHLD) {
+    // This thread dequeued a SIGCHLD. Linux dequeues a SIGCHLD pending for
+    // the thread before one pending for its process, so no SIGCHLD that we
+    // sent this thread is left.
+    thread_synthetic_SIGCHLD_pending = false;
+  }
+
   if (did_set_syscallbuf_breakpoints) {
     // syscallbuf_breakpoints() depends only on state that rr doesn't change
     // while the task runs tracee code, so these are the breakpoints
@@ -984,6 +992,7 @@ void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
                  << sigchld_thread->tid;
       ret = syscall(SYS_rt_tgsigqueueinfo, tgid(), sigchld_thread->tid,
                     SIGCHLD, &si);
+      sigchld_thread->thread_synthetic_SIGCHLD_pending = true;
     } else {
       // Given a thread's tid, rt_sigqueueinfo() queues the SIGCHLD for the
       // process and has the kernel try that thread first.
@@ -1016,6 +1025,34 @@ static bool is_synthetic_SIGCHLD(const siginfo_t& si) {
   return si.si_signo == SIGCHLD && si.si_value.sival_int == SIGCHLD_SYNTHETIC;
 }
 
+/**
+ * Returns true if a SIGCHLD that carries the synthetic SIGCHLDs we sent |tg|
+ * is left: pending for the process, pending for a thread that we sent a
+ * synthetic SIGCHLD of its own (RecordTask::thread_synthetic_SIGCHLD_pending),
+ * or stashed by us. A SIGCHLD that tkill() or tgkill() (e.g. raise()) sent a
+ * thread is pending for that thread alone and doesn't carry ours.
+ */
+static bool has_SIGCHLD_carrier(ThreadGroup* tg) {
+  for (Task* t : tg->task_set()) {
+    auto rt = static_cast<RecordTask*>(t);
+    if (rt->has_stashed_sig(SIGCHLD)) {
+      return true;
+    }
+    auto pending = read_proc_status_fields(rt->tid, "SigPnd", "ShdPnd");
+    if (pending.size() < 2) {
+      continue;
+    }
+    sig_set_t thread_pending = strtoull(pending[0].c_str(), nullptr, 16);
+    sig_set_t process_pending = strtoull(pending[1].c_str(), nullptr, 16);
+    if ((process_pending & signal_bit(SIGCHLD)) ||
+        (rt->thread_synthetic_SIGCHLD_pending &&
+         (thread_pending & signal_bit(SIGCHLD)))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void RecordTask::maybe_drop_pending_SIGCHLD_notifications() {
   vector<bool*> owed;
   for (Task* t : thread_group()->task_set()) {
@@ -1034,14 +1071,9 @@ void RecordTask::maybe_drop_pending_SIGCHLD_notifications() {
       }
     }
   }
-  if (owed.empty() && !thread_group()->gone_child_SIGCHLD) {
+  if ((owed.empty() && !thread_group()->gone_child_SIGCHLD) ||
+      has_SIGCHLD_carrier(thread_group().get())) {
     return;
-  }
-  for (Task* t : thread_group()->task_set()) {
-    auto rt = static_cast<RecordTask*>(t);
-    if (rt->is_signal_pending(SIGCHLD) || rt->has_stashed_sig(SIGCHLD)) {
-      return;
-    }
   }
   for (bool* pending : owed) {
     *pending = false;
@@ -1505,6 +1537,9 @@ void RecordTask::update_sigaction_arch(const Registers& regs) {
       // Linux has discarded the SIGCHLDs pending for the process and its
       // threads (do_sigaction()), which carried the stops that we owe the
       // process SIGCHLDs for.
+      for (Task* t : thread_group()->task_set()) {
+        static_cast<RecordTask*>(t)->thread_synthetic_SIGCHLD_pending = false;
+      }
       maybe_drop_pending_SIGCHLD_notifications();
     }
   }
