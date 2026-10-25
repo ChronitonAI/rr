@@ -1354,6 +1354,7 @@ set(BASIC_TESTS
   recvmsg_short_namelen
   redzone_integrity
   rename
+  reparent_stop_sigchld
   rlimit
   rrcall_arm_kill
   rrcall_arm_kill_inherit

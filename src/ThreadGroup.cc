@@ -44,6 +44,17 @@ ThreadGroup::~ThreadGroup() {
     // We don't fix the parenting during replay. Currently
     // nothing depends on parenting during replay.
     if (session_ && session_->is_recording()) {
+      for (Task* t : tg->task_set()) {
+        auto rt = static_cast<RecordTask*>(t);
+        WaitStatus::Type type = rt->emulated_stop_code.type();
+        if (rt->emulated_SIGCHLD_pending && type != WaitStatus::EXIT &&
+            type != WaitStatus::FATAL_SIGNAL) {
+          // |rt| still needs to send us a SIGCHLD for its stop, which we
+          // can't take anymore. Linux sends the new parent a SIGCHLD only
+          // for a child that has exited (reparent_leader()).
+          rt->emulated_SIGCHLD_pending = false;
+        }
+      }
       auto it = tg->task_set().begin();
       if (it != tg->task_set().end()) {
         const RecordTask* rt = static_cast<const RecordTask*>(*it);
