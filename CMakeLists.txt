@@ -1066,6 +1066,7 @@ set(BASIC_TESTS
   daemon
   x86/deferred_patch
   x86/deferred_patch_changed_restart
+  x86/deferred_patch_refused_restart
   desched_blocking_poll
   desched_sigkill
   detach_huge_mmap
@@ -1141,6 +1142,7 @@ set(BASIC_TESTS
   grandchild_threads_main_running
   grandchild_threads_thread_running
   grandchild_threads_parent_alive
+  group_stop_restarted_syscall
   group_stop_thundering_herd
   x86/hle
   x86/hlt
@@ -1308,6 +1310,7 @@ set(BASIC_TESTS
   ptrace_attach_thread_running
   ptrace_breakpoint
   ptrace_change_patched_syscall
+  ptrace_change_restarted_syscall
   x86/ptrace_debug_regs
   ptrace_event_stop_sigcont
   ptrace_exec
@@ -1324,10 +1327,12 @@ set(BASIC_TESTS
   ptrace_signals
   ptrace_singlestep
   ptrace_singlestep_signal_handler
+  ptrace_skip_restarted_syscall
   ptrace_stop_sigcont
   ptrace_syscall
   ptrace_syscall_clone_untraced
   x86/ptrace_sysemu
+  ptrace_sysemu_restarted_syscall
   ptrace_sysemu_syscall
   ptrace_trace_clone
   ptrace_trace_exit
@@ -1373,6 +1378,7 @@ set(BASIC_TESTS
   seccomp_cloning
   seccomp_clone_fail
   seccomp_desched
+  seccomp_errno_restarted_syscall
   x86/seccomp_ip_high_bits
   seccomp_kill_exit
   seccomp_madvise
@@ -1818,6 +1824,7 @@ set(TESTS_WITHOUT_PROGRAM
   fork_exec_info_thr
   gdb_bare_qsupported
   get_thread_list
+  group_stop_restarted_signalfd
   hardlink_mmapped_files
   hbreak
   interrupt_after_exit

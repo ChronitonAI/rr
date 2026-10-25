@@ -845,6 +845,9 @@ public:
    * record buffer from being reset when it normally would be.
    * This is set by the code for handling seccomp SIGSYS signals. */
   bool delay_syscallbuf_reset_for_seccomp_trap;
+  /* Set when rr resumed the task from a syscall-entry stop to handle the
+   * syscall at the PTRACE_EVENT_SECCOMP stop that follows it. */
+  bool waiting_for_seccomp_stop;
   // Value to return from PR_GET_SECCOMP
   uint8_t prctl_seccomp_status;
 

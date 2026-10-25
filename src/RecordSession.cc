@@ -480,9 +480,12 @@ void RecordSession::handle_seccomp_traced_syscall(RecordTask* t,
     ASSERT(t, syscall_seccomp_ordering_ == PTRACE_SYSCALL_BEFORE_SECCOMP);
     if (t->ev().is_syscall_event() &&
         t->ev().Syscall().state == PROCESSING_SYSCALL) {
-      // We did PTRACE_SYSCALL and already saw a syscall trap. Just ignore this.
-      LOG(debug) << "Ignoring SECCOMP syscall trap since we already got a "
-                    "PTRACE_SYSCALL trap";
+      // We already handled this syscall's entry. prepare_exit() re-enters
+      // exit()/exit_group() with Task::enter_syscall(), which leaves the
+      // task at this stop, and the task can be held there for an emulated
+      // PTRACE_EVENT_EXIT; we see the stop again when the task is released.
+      LOG(debug) << "Ignoring SECCOMP syscall trap of a syscall we already "
+                    "entered";
       // The next continue needs to be a PTRACE_SYSCALL to observe
       // the exit-syscall event.
       step_state->continue_type = RecordSession::CONTINUE_SYSCALL;
@@ -661,6 +664,8 @@ void RecordSession::handle_seccomp_errno(RecordTask* t,
   step_state->continue_type = RecordSession::DONT_CONTINUE;
 }
 
+static void syscall_not_restarted(RecordTask* t, bool entering_syscall);
+
 bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
                                         StepState* step_state,
                                         RecordResult* result,
@@ -686,6 +691,7 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
   switch (event) {
     case PTRACE_EVENT_SECCOMP_OBSOLETE:
     case PTRACE_EVENT_SECCOMP: {
+      t->waiting_for_seccomp_stop = false;
       if (syscall_seccomp_ordering_ == PTRACE_SYSCALL_BEFORE_SECCOMP_UNKNOWN) {
         syscall_seccomp_ordering_ = SECCOMP_BEFORE_PTRACE_SYSCALL;
       }
@@ -720,6 +726,16 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
           break;
         }
         uint16_t real_result_data = real_result & SECCOMP_RET_DATA;
+        if (t->ev().type() == EV_SYSCALL_INTERRUPTION &&
+            !t->is_in_untraced_syscall()) {
+          // The task's previous syscall was interrupted and may restart, and
+          // the process's filter refuses the syscall the task entered (the
+          // restart or another syscall), which gets its own event. At the
+          // untraced instruction, the event is the one handle_desched_event
+          // pushed for this syscall, which handle_seccomp_trap() and
+          // handle_seccomp_errno() handle.
+          syscall_not_restarted(t, true);
+        }
         switch (real_result & SECCOMP_RET_ACTION) {
           case SECCOMP_RET_TRAP:
             LOG(debug) << "  seccomp trap for syscall: "
@@ -1058,7 +1074,11 @@ static void retry_syscall_patch(RecordTask* t, remote_code_ptr orig_syscall_ip)
   ASSERT(t, !should_retry);
 }
 
-static void syscall_not_restarted(RecordTask* t) {
+/**
+ * Pop |t|'s interrupted syscall, which isn't restarted. |entering_syscall|
+ * says whether |t| is at the entry of a syscall.
+ */
+static void syscall_not_restarted(RecordTask* t, bool entering_syscall) {
   LOG(debug) << "  " << t->tid << ": popping abandoned interrupted " << t->ev()
              << "; pending events:";
   if (IS_LOGGING(debug)) {
@@ -1069,11 +1089,13 @@ static void syscall_not_restarted(RecordTask* t) {
   t->pop_syscall_interruption();
   // The patch overwrites the instructions that end at orig_syscall_ip.
   // Don't patch while the task is at the syscall instruction, which it
-  // would then skip. A syscall made there puts the patch off to its exit
-  // again.
+  // would then skip, or entering a syscall made from it: handling that
+  // entry reads the instruction, and a restart moves the task back to it.
+  // A syscall made there puts the patch off to its exit again.
   remote_code_ptr ip = t->regs().ip();
   if (should_retry_patch &&
-      ip != orig_syscall_ip.decrement_by_syscall_insn_length(t->arch())) {
+      ip != orig_syscall_ip.decrement_by_syscall_insn_length(t->arch()) &&
+      !(entering_syscall && ip == orig_syscall_ip)) {
     LOG(debug) << "Retrying deferred syscall patching non-restarted syscall at " << orig_syscall_ip << " (current ip " << t->regs().ip() << ")";
     retry_syscall_patch(t, orig_syscall_ip);
   }
@@ -1100,7 +1122,7 @@ static bool maybe_restart_syscall(RecordTask* t) {
     return true;
   }
   if (EV_SYSCALL_INTERRUPTION == t->ev().type()) {
-    syscall_not_restarted(t);
+    syscall_not_restarted(t, true);
   }
   return false;
 }
@@ -1123,14 +1145,14 @@ static void maybe_discard_syscall_interruption(RecordTask* t, intptr_t ret) {
 
   syscallno = t->ev().Syscall().number;
   if (0 > ret) {
-    syscall_not_restarted(t);
+    syscall_not_restarted(t, false);
   } else if (t->arch() == x86 || t->arch() == x86_64) {
     SupportedArch arch;
     if (get_syscall_instruction_arch(t, t->regs().ip(), &arch) && arch == t->arch() &&
         (syscallno == ret || is_restart_syscall_syscall(ret, t->ev().Syscall().arch()))) {
       return;
     }
-    syscall_not_restarted(t);
+    syscall_not_restarted(t, false);
   }
 }
 
@@ -2163,15 +2185,6 @@ bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
 
   // We just entered a syscall.
   if (!maybe_restart_syscall(t)) {
-    if (syscall_seccomp_ordering_ == PTRACE_SYSCALL_BEFORE_SECCOMP_UNKNOWN &&
-        t->seccomp_bpf_enabled) {
-      // We received a PTRACE_SYSCALL notification before the seccomp
-      // notification. Ignore it and continue to the seccomp notification.
-      syscall_seccomp_ordering_ = PTRACE_SYSCALL_BEFORE_SECCOMP;
-      step_state->continue_type = CONTINUE;
-      return true;
-    }
-
     // Don't ever patch a sigreturn syscall. These can't go through the syscallbuf.
     bool should_retry = false;
     if (!is_sigreturn(t->regs().original_syscallno(), t->arch())) {
@@ -2232,6 +2245,30 @@ void RecordSession::runnable_state_changed(RecordTask* t, StepState* step_state,
     case EV_SIGNAL_HANDLER:
     case EV_SYSCALL_INTERRUPTION: {
       if (!can_consume_wait_status) {
+        return;
+      }
+
+      // If we resumed the task from the syscall-entry stop below and this is
+      // the syscall's exit, the kernel ran the syscall without the seccomp
+      // filters (Linux does that for x86-64's uretprobe and uprobe syscalls,
+      // which rr doesn't support) and rr hasn't handled its entry.
+      ASSERT(t, !t->waiting_for_seccomp_stop)
+          << "Syscall "
+          << syscall_name(t->regs().original_syscallno(), t->arch())
+          << " ran without a PTRACE_EVENT_SECCOMP stop";
+
+      if (t->seccomp_bpf_enabled && !t->is_in_untraced_syscall() &&
+          syscall_seccomp_ordering_ != SECCOMP_BEFORE_PTRACE_SYSCALL) {
+        // The task stopped at a syscall entry after we resumed it with
+        // PTRACE_SYSCALL. Our seccomp filter traces this syscall and we
+        // haven't seen its PTRACE_EVENT_SECCOMP stop, so the kernel runs the
+        // seccomp filters after the syscall-entry stop, and the next stop is
+        // the PTRACE_EVENT_SECCOMP stop. Handle the syscall's entry there,
+        // after the process's own filters have decided whether the syscall
+        // runs, as when the task gets there with PTRACE_CONT.
+        syscall_seccomp_ordering_ = PTRACE_SYSCALL_BEFORE_SECCOMP;
+        t->waiting_for_seccomp_stop = true;
+        step_state->continue_type = CONTINUE_SYSCALL;
         return;
       }
 
