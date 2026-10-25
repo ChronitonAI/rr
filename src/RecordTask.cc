@@ -923,11 +923,32 @@ void RecordTask::do_ptrace_exit_stop(WaitStatus exit_status) {
   }
 }
 
+void RecordTask::drop_job_control_stop() {
+  // Once a task has no stop pending, did_reach_zombie() can delete it.
+  for (Task* t : thread_group()->task_set()) {
+    auto rt = static_cast<RecordTask*>(t);
+    if (rt->in_job_control_stop()) {
+      rt->emulated_stop_pending = false;
+    }
+  }
+}
+
+void RecordTask::drop_job_control_stop_if_process_exited() {
+  for (Task* t : thread_group()->task_set()) {
+    if (!t->is_exiting()) {
+      return;
+    }
+  }
+  drop_job_control_stop();
+}
+
 void RecordTask::did_reach_zombie() {
   // Remove from address-space and fds list since we really aren't associated
   // with them anymore (and we can't be used to operate on them)
   as->erase_task(this);
   fds->erase_task(this);
+
+  drop_job_control_stop_if_process_exited();
 
   if (!was_reaped() && !try_reap()) {
     waiting_for_reap = true;
@@ -1318,6 +1339,14 @@ RecordTask* RecordTask::waited_task_with_emulated_stop(bool for_wakeup) {
           (only_own && parent_thread_of(child_process) != this)) {
         continue;
       }
+      if (rchild->in_job_control_stop() &&
+          rchild->is_signal_pending_for_process(SIGKILL)) {
+        // A SIGKILL sent to the process, by anyone, ended the stop (see
+        // drop_job_control_stop()). It stays pending for the process until
+        // the process is reaped.
+        rchild->drop_job_control_stop();
+        continue;
+      }
       return rchild;
     }
   }
@@ -1416,6 +1445,18 @@ bool RecordTask::is_signal_pending(int sig) {
   char* end2;
   sig_set_t mask2 = strtoull(pending_strs[1].c_str(), &end2, 16);
   return !*end1 && !*end2 && ((mask1 | mask2) & signal_bit(sig));
+}
+
+bool RecordTask::is_signal_pending_for_process(int sig) {
+  // The leader's status shows the process's pending signals until the
+  // leader is reaped, after all other tasks of the process.
+  auto pending_strs = read_proc_status_fields(real_tgid(), "ShdPnd");
+  if (pending_strs.empty()) {
+    return false;
+  }
+  char* end;
+  sig_set_t mask = strtoull(pending_strs[0].c_str(), &end, 16);
+  return !*end && (mask & signal_bit(sig));
 }
 
 bool RecordTask::is_SIGCONT_pending_for_job_control_stop() {

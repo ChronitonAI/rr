@@ -256,6 +256,11 @@ public:
    */
   bool is_signal_pending(int sig);
   /**
+   * Return true if |sig| is pending for this task's process, rather than for
+   * one of its threads.
+   */
+  bool is_signal_pending_for_process(int sig);
+  /**
    * Return true if a SIGCONT is pending that ends the job-control stop of this
    * task: one in the shared queue or in this task's queue, or one sent to a
    * traced thread of the process. Linux continues all untraced threads of a
@@ -657,6 +662,19 @@ public:
    * it, emulating ptrace stops, etc.)
    */
   void did_reach_zombie();
+  /**
+   * Drops the pending wait notification for the job-control stop of this
+   * task's process. Linux ends that stop when the process's group exit
+   * starts (complete_signal() for a SIGKILL, or do_group_exit(), clears
+   * SIGNAL_STOP_STOPPED), so no wait reports it after that.
+   */
+  void drop_job_control_stop();
+  /**
+   * Called when a task of this task's process has become a zombie. If all of
+   * the process's tasks have exited, drops the pending wait notification for
+   * the process's job-control stop.
+   */
+  void drop_job_control_stop_if_process_exited();
 
   // Is this task a container init? (which has special signal behavior)
   bool is_container_init() const { return tg->tgid_own_namespace == 1; }

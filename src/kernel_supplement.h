@@ -498,6 +498,10 @@ enum {
 #define CLONE_PIDFD 0x1000
 #endif
 
+#ifndef PIDFD_SIGNAL_THREAD
+#define PIDFD_SIGNAL_THREAD (1UL << 0)
+#endif
+
 #ifndef RLIMIT_RTTIME
 #define RLIMIT_RTTIME 15
 #endif

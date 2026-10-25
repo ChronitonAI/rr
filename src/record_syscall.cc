@@ -7249,6 +7249,97 @@ static void emulate_SIGCONT_sent_by_tracee(RecordTask* t) {
 }
 
 /**
+ * Returns true if |t| is in our pid namespace, so the pids it passes to
+ * syscalls are ours.
+ */
+static bool is_in_our_pid_namespace(RecordTask* t) {
+  // NSpid lists |t|'s pid in each pid namespace from ours down to its own.
+  auto nspid = read_proc_status_fields(t->tid, "NSpid");
+  return nspid.size() == 1 && nspid[0].find_first_of(" \t") == string::npos;
+}
+
+/**
+ * Returns the signal that the syscall |syscallno| with the arguments in
+ * |regs| sends, or 0 if it doesn't send one.
+ */
+template <typename Arch>
+static int signal_sent_by_syscall_arch(int syscallno, const Registers& regs) {
+  switch (syscallno) {
+    case Arch::kill:
+    case Arch::tkill:
+    case Arch::rt_sigqueueinfo:
+    case Arch::pidfd_send_signal:
+      return (int)regs.arg2();
+    case Arch::tgkill:
+    case Arch::rt_tgsigqueueinfo:
+      return (int)regs.arg3();
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Returns the task that the signal-sending syscall |syscallno|, which the
+ * tracee |t| just made with the arguments in |regs|, sent its signal to:
+ * the thread for tkill(), tgkill(), rt_tgsigqueueinfo() and
+ * pidfd_send_signal() with PIDFD_SIGNAL_THREAD, and the pidfd's task for
+ * pidfd_send_signal() without flags, which sends to the pidfd's thread, or
+ * to the process for a process's pidfd (whose task is the leader). Returns
+ * null for the other syscalls and flags, and if we can't tell which task it
+ * is.
+ */
+template <typename Arch>
+static RecordTask* task_sent_signal(RecordTask* t, int syscallno,
+                                    const Registers& regs) {
+  pid_t tid;
+  switch (syscallno) {
+    case Arch::tkill:
+      tid = (pid_t)regs.arg1();
+      break;
+    case Arch::tgkill:
+    case Arch::rt_tgsigqueueinfo:
+      tid = (pid_t)regs.arg2();
+      break;
+    case Arch::pidfd_send_signal: {
+      unsigned int flags = (unsigned int)regs.arg4();
+      if (flags != 0 && flags != PIDFD_SIGNAL_THREAD) {
+        return nullptr;
+      }
+      // The pidfd's pid is in our pid namespace.
+      pid_t pid = t->pid_of_pidfd((int)regs.arg1());
+      return pid > 0 ? t->session().find_task(pid) : nullptr;
+    }
+    default:
+      return nullptr;
+  }
+  // |tid| is in |t|'s pid namespace.
+  return is_in_our_pid_namespace(t) ? t->session().find_task(tid) : nullptr;
+}
+
+/**
+ * Linux ends the job-control stop of a process when it generates a SIGKILL
+ * for it (see RecordTask::drop_job_control_stop), before the process's tasks
+ * exit. RecordTask::waited_task_with_emulated_stop drops the stop of a
+ * process that has a SIGKILL pending. This drops the stop that a SIGKILL
+ * that the tracee |t| sent to the task |task| (see task_sent_signal) ended.
+ * That SIGKILL kills |task|'s process unless |task| has started to exit
+ * (complete_signal()), or its process is the init of a pid namespace that
+ * |t| is in or below (sig_task_ignored()). Every other tracee pid namespace
+ * is below ours. A SIGKILL sent to a thread is pending for that thread
+ * alone, which dequeues it when it starts to exit, so we check this when the
+ * SIGKILL is sent. For a process's pidfd, the SIGKILL is pending for the
+ * process and |task| is its leader; this check holds there too, since a
+ * SIGKILL sent to a process whose leader isn't exiting kills it.
+ */
+static void drop_job_control_stop_for_SIGKILL(RecordTask* t,
+                                              RecordTask* task) {
+  if (task && !task->is_exiting() &&
+      (!task->is_container_init() || is_in_our_pid_namespace(t))) {
+    task->drop_job_control_stop();
+  }
+}
+
+/**
  * The synthetic SIGCHLDs we send (see
  * RecordTask::send_synthetic_SIGCHLD_if_necessary) carry none of the siginfo
  * that the kernel fills in for a SIGCHLD. We fill it in when we deliver such a
@@ -7873,21 +7964,23 @@ static void rec_process_syscall_arch(RecordTask* t,
 
     case Arch::kill:
     case Arch::tkill:
-    case Arch::rt_sigqueueinfo:
-    case Arch::pidfd_send_signal:
-      if ((int)syscall_state.syscall_entry_registers.arg2() == SIGCONT &&
-          !t->regs().syscall_failed()) {
-        emulate_SIGCONT_sent_by_tracee(t);
-      }
-      break;
-
     case Arch::tgkill:
+    case Arch::rt_sigqueueinfo:
     case Arch::rt_tgsigqueueinfo:
-      if ((int)syscall_state.syscall_entry_registers.arg3() == SIGCONT &&
-          !t->regs().syscall_failed()) {
+    case Arch::pidfd_send_signal: {
+      if (t->regs().syscall_failed()) {
+        break;
+      }
+      const Registers& entry_regs = syscall_state.syscall_entry_registers;
+      int sig = signal_sent_by_syscall_arch<Arch>(syscallno, entry_regs);
+      if (sig == SIGCONT) {
         emulate_SIGCONT_sent_by_tracee(t);
+      } else if (sig == SIGKILL) {
+        drop_job_control_stop_for_SIGKILL(
+            t, task_sent_signal<Arch>(t, syscallno, entry_regs));
       }
       break;
+    }
 
     case Arch::rt_sigtimedwait_time64:
     case Arch::rt_sigtimedwait: {

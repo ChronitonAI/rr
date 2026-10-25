@@ -1522,6 +1522,7 @@ set(BASIC_TESTS
   x86/x87env
   wait
   wait_for_child_stop_sigchld_pending
+  wait_killed_stopped_child
   wait_options_emulated_stop
   wait_sigstop
   write_race
