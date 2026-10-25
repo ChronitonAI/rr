@@ -702,7 +702,9 @@ public:
   /**
    * Notes that this task needs to send its parent a SIGCHLD for a new stop
    * or exit (emulated_SIGCHLD_pending), which comes after the SIGCHLDs that
-   * tasks needed to send before (emulated_SIGCHLD_order).
+   * tasks needed to send before (emulated_SIGCHLD_order). If the SIGCHLD
+   * that this task owes for an earlier stop is unsent or still pending, the
+   * new one merges into it and keeps its place.
    */
   void set_emulated_SIGCHLD_pending();
 

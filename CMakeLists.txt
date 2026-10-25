@@ -1403,6 +1403,7 @@ set(BASIC_TESTS
   sigaction_old
   sigaltstack
   sigchld_interrupt_signal
+  sigchld_merged_first_child
   sigchld_merged_into_exit
   sigchld_siginfo
   sigchld_siginfo_after_reap

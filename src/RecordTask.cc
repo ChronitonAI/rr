@@ -244,9 +244,13 @@ RecordTask::~RecordTask() {
   if (emulated_SIGCHLD_pending) {
     // We still owe our parent process the SIGCHLD for our stop or exit,
     // which the synthetic SIGCHLD we sent it carries. Keep its siginfo with
-    // the parent.
+    // the parent. One SIGCHLD has the siginfo of the first of the SIGCHLDs
+    // that merged into it (see set_siginfo_for_synthetic_SIGCHLD), so keep
+    // the one that we needed to send first.
     ThreadGroup* parent = thread_group()->parent();
-    if (parent && !parent->gone_child_SIGCHLD) {
+    if (parent &&
+        (!parent->gone_child_SIGCHLD ||
+         emulated_SIGCHLD_order < parent->gone_child_SIGCHLD->order)) {
       ThreadGroup::GoneChildSIGCHLD gone_child;
       memset(&gone_child.siginfo, 0, sizeof(gone_child.siginfo));
       gone_child.siginfo.si_signo = SIGCHLD;
@@ -1133,11 +1137,15 @@ bool RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
   }
 
   if (!from_task) {
+    // Linux merges the SIGCHLDs pending for a process into the first one,
+    // so the SIGCHLD covers the stops and exits of all our children and has
+    // the siginfo of the one that needed to send it first.
     for (ThreadGroup* child_tg : thread_group()->children()) {
       for (Task* child : child_tg->task_set()) {
         auto rchild = static_cast<RecordTask*>(child);
         if (rchild->emulated_SIGCHLD_pending) {
-          if (!from_task) {
+          if (!from_task || rchild->emulated_SIGCHLD_order <
+                                from_task->emulated_SIGCHLD_order) {
             from_task = rchild;
           }
           rchild->emulated_SIGCHLD_pending = false;
@@ -1148,12 +1156,14 @@ bool RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
     // deleted.
     std::optional<ThreadGroup::GoneChildSIGCHLD> gone_child;
     gone_child.swap(thread_group()->gone_child_SIGCHLD);
+    if (gone_child &&
+        (!from_task ||
+         gone_child->order < from_task->emulated_SIGCHLD_order)) {
+      *si = gone_child->siginfo;
+      return true;
+    }
 
     if (!from_task) {
-      if (gone_child) {
-        *si = gone_child->siginfo;
-        return true;
-      }
       // Maybe the task died after the synthetic SIGCHLD was sent
       LOG(warn) << "Can't find traced task that send synthetic SIGCHLD";
       return false;
@@ -1366,6 +1376,15 @@ static pid_t get_ppid(pid_t pid) {
 }
 
 void RecordTask::set_emulated_SIGCHLD_pending() {
+  ThreadGroup* parent = thread_group()->parent();
+  if (emulated_SIGCHLD_pending && parent &&
+      (emulated_SIGCHLD_order >= parent->synthetic_SIGCHLD_order ||
+       has_SIGCHLD_carrier(parent))) {
+    // The SIGCHLD that we owe for an earlier stop is unsent, or a SIGCHLD
+    // that carries it is still pending. The new SIGCHLD merges into that
+    // one, which keeps the earlier stop's place in the order.
+    return;
+  }
   emulated_SIGCHLD_pending = true;
   emulated_SIGCHLD_order = session().next_SIGCHLD_order();
 }
