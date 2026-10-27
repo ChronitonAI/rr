@@ -1360,6 +1360,7 @@ set(BASIC_TESTS
   rename
   rlimit
   robust_futex_clone
+  robust_futex_cycle
   rrcall_arm_kill
   rrcall_arm_kill_inherit
   rseq_cpu_id_reset
