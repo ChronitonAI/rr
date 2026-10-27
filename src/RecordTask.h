@@ -215,6 +215,15 @@ public:
    */
   void apply_ptrace_interrupt_stop();
   /**
+   * Call this when the emulated ptracer resumes this task from a ptrace stop,
+   * detaches from it or exits, before anything else changes the task's
+   * events. If the task is at the exit of an interrupted syscall that the
+   * syscall buffer didn't deschedule, and the ptracer changed the syscall's
+   * result or set its syscall number to -1 there, so that the kernel doesn't
+   * restart the syscall, this pops the EV_SYSCALL_INTERRUPTION.
+   */
+  void discard_syscall_interruption_if_restart_cancelled();
+  /**
    * Call this after |sig| is delivered to this task.  Emulate
    * sighandler updates induced by the signal delivery.
    */
@@ -796,6 +805,19 @@ public:
   // (e.g. PTRACE_EVENT_FORK) to the ptracer. prepare_ptrace_cont resumes the
   // task when the ptracer does. Cleared whenever the task is resumed.
   bool held_at_emulated_ptrace_event;
+  // true when we have the task stopped at the exit of an interrupted syscall
+  // (EV_SYSCALL_INTERRUPTION) before the kernel decides whether to restart
+  // it: as we left it when we processed the exit, or, on x86, at a
+  // signal-delivery stop or group-stop that the task got to from there (see
+  // did_wait()). Cleared whenever the task is resumed.
+  bool stopped_at_interrupted_syscall_exit;
+  // true while the task runs after we resumed it with
+  // stopped_at_interrupted_syscall_exit set, from the registers and tick
+  // count in regs_at_interrupted_syscall_exit and
+  // ticks_at_interrupted_syscall_exit.
+  bool resumed_at_interrupted_syscall_exit;
+  Registers regs_at_interrupted_syscall_exit;
+  Ticks ticks_at_interrupted_syscall_exit;
   // true if this task needs to send a SIGCHLD to its ptracer for its
   // emulated ptrace stop
   bool emulated_ptrace_SIGCHLD_pending;

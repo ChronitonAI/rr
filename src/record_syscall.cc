@@ -2514,6 +2514,10 @@ static void prepare_ptrace_cont(RecordTask* tracee, int sig, int command) {
   // or be at a stop we haven't processed yet. The scheduler will deal with
   // those like with any other task.
   bool held = tracee->held_at_emulated_ptrace_event;
+  // Whether the kernel restarts an interrupted syscall depends on the
+  // registers that the ptracer leaves at this stop. Decide that before we
+  // push an event for |sig|.
+  tracee->discard_syscall_interruption_if_restart_cancelled();
   if (sig && (held || tracee->emulated_stop_code.ptrace_event() ||
               tracee->emulated_stop_code.group_stop() ||
               tracee->emulated_stop_type == SIGNAL_HANDLER_STOP)) {

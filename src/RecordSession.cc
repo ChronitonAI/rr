@@ -1480,6 +1480,7 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         } else {
           t->ev().transform(EV_SYSCALL_INTERRUPTION);
           t->ev().Syscall().is_restart = true;
+          t->stopped_at_interrupted_syscall_exit = true;
         }
 
         t->canonicalize_regs(syscall_arch);

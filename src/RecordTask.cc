@@ -174,6 +174,9 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       emulated_ptrace_cont_command(0),
       emulated_stop_pending(false),
       held_at_emulated_ptrace_event(false),
+      stopped_at_interrupted_syscall_exit(false),
+      resumed_at_interrupted_syscall_exit(false),
+      ticks_at_interrupted_syscall_exit(0),
       emulated_ptrace_SIGCHLD_pending(false),
       emulated_SIGCHLD_pending(false),
       emulated_ptrace_seized(false),
@@ -234,6 +237,7 @@ RecordTask::~RecordTask() {
   for (RecordTask* t : emulated_ptrace_tracees) {
     // XXX emulate PTRACE_O_EXITKILL
     ASSERT(this, t->emulated_ptracer == this);
+    t->discard_syscall_interruption_if_restart_cancelled();
     t->emulated_ptracer = nullptr;
     t->emulated_ptrace_options = 0;
     t->emulated_stop_pending = false;
@@ -678,6 +682,12 @@ bool RecordTask::is_at_syscallstub_exit_breakpoint() {
 void RecordTask::will_resume_execution(ResumeRequest, WaitRequest,
                                        TicksRequest ticks_request, int sig) {
   held_at_emulated_ptrace_event = false;
+  resumed_at_interrupted_syscall_exit = stopped_at_interrupted_syscall_exit;
+  if (stopped_at_interrupted_syscall_exit) {
+    regs_at_interrupted_syscall_exit = regs();
+    ticks_at_interrupted_syscall_exit = tick_count();
+  }
+  stopped_at_interrupted_syscall_exit = false;
 
   // We may execute user code, which could lead to an RDTSC or grow-map
   // operation which unblocks SIGSEGV, and we'll need to know whether to
@@ -786,6 +796,24 @@ vector<remote_code_ptr> RecordTask::syscallbuf_syscall_entry_breakpoints() {
 }
 
 void RecordTask::did_wait() {
+  if (resumed_at_interrupted_syscall_exit) {
+    resumed_at_interrupted_syscall_exit = false;
+    // On x86, Linux reports signal-delivery stops and group-stops (from
+    // get_signal()) at a syscall's exit before it decides whether to restart
+    // the syscall (in arch_do_signal_or_restart() or handle_signal(), which
+    // change the registers to restart it or to run a signal handler). If the
+    // task got to such a stop without running user code and with the same
+    // registers, it's still at the interrupted syscall's exit.
+    WaitStatus::Type type = status().type();
+    if (is_x86ish(arch()) &&
+        (type == WaitStatus::SIGNAL_STOP || type == WaitStatus::GROUP_STOP) &&
+        tick_count() == ticks_at_interrupted_syscall_exit &&
+        regs() == regs_at_interrupted_syscall_exit) {
+      LOG(debug) << "  still at the exit of interrupted " << ev();
+      stopped_at_interrupted_syscall_exit = true;
+    }
+  }
+
   if (did_set_syscallbuf_breakpoints) {
     // syscallbuf_breakpoints() depends only on state that rr doesn't change
     // while the task runs tracee code, so these are the breakpoints
@@ -1177,6 +1205,36 @@ void RecordTask::apply_ptrace_interrupt_stop() {
   // Technically PTRACE_INTERRUPT stops are distinct from group stops, but not
   // in any way we currently care about.
   apply_group_stop(sig ? sig : SIGTRAP);
+}
+
+void RecordTask::discard_syscall_interruption_if_restart_cancelled() {
+  if (!stopped_at_interrupted_syscall_exit ||
+      EV_SYSCALL_INTERRUPTION != ev().type() ||
+      emulated_stop_type == NOT_STOPPED || desched_rec()) {
+    return;
+  }
+  // On x86, Linux decides whether to restart the syscall after the ptrace
+  // stops at its exit (in arch_do_signal_or_restart() or handle_signal()).
+  // On aarch64, arch_do_signal_or_restart() (in arch/arm64/kernel/signal.c)
+  // sets up the restart before any stop after the syscall-exit stop, so
+  // there x0 holds the restarted syscall's first argument.
+  if (arch() == aarch64 && emulated_stop_type != SYSCALL_EXIT_STOP) {
+    return;
+  }
+  // Linux restarts the syscall only if its syscall number isn't -1
+  // (syscall_get_nr() on x86, in_syscall() on aarch64).
+  if (regs().syscall_may_restart() && regs().original_syscallno() != -1) {
+    return;
+  }
+  LOG(debug) << "  ptracer left result " << regs().syscall_result_signed()
+             << " and syscall number " << regs().original_syscallno()
+             << " at the exit of interrupted " << ev()
+             << "; it won't be restarted";
+  stopped_at_interrupted_syscall_exit = false;
+  // Patching a syscall may run syscalls in the task and records an event, so
+  // we leave a deferred patch (should_retry_patch) to the next time the task
+  // makes the syscall.
+  pop_syscall_interruption();
 }
 
 bool RecordTask::is_signal_pending(int sig) {
