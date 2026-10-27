@@ -1314,6 +1314,7 @@ set(BASIC_TESTS
   ptrace_group_stop
   ptrace_interrupt_syscall
   ptrace_kill_grandtracee
+  ptrace_proc_mem_write
   ptrace_resume_signal_ignored
   x86/ptrace_tls
   ptrace_seize

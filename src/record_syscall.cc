@@ -4020,6 +4020,16 @@ static Switchable reject_preadv2_pwritev2(RecordTask* t,
 }
 
 /**
+ * Puts the number of the syscall back after the kernel ran another syscall
+ * in its place.
+ */
+static void restore_original_syscallno(RecordTask* t) {
+  Registers r = t->regs();
+  r.set_original_syscallno(t->ev().Syscall().number);
+  t->set_regs(r);
+}
+
+/**
  * With CONFIG_PROC_MEM_FORCE_PTRACE=y, writing to /proc/<pid>/mem will fail
  * on read-only pages unless the writer is ptracing <pid>. Under rr, rr is
  * the real ptracer, so we need to emulate those writes on the tracee's behalf.
@@ -4103,10 +4113,13 @@ static Switchable maybe_emulate_proc_mem_write(RecordTask* t,
   }
 
   syscall_state.emulate_result(written);
-  // We can just let the write go through as normal. This avoids
-  // having to modify the syscall arguments and restore them afterward.
-  // If the kernel returns EIO it doesn't matter since we're replacing it
-  // with our result.
+  // The kernel runs gettid in place of the syscall, so that it doesn't
+  // write the data again (for write() and writev(), from the file position
+  // we just set).
+  Registers r = t->regs();
+  r.set_original_syscallno(Arch::gettid);
+  t->set_regs(r);
+  syscall_state.after_syscall_action(restore_original_syscallno);
   return PREVENT_SWITCH;
 }
 
