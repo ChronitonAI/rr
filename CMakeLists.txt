@@ -1149,6 +1149,7 @@ set(BASIC_TESTS
   x86/int80_fork
   x86/int80_mmap
   x86/int80_ptrace_wait
+  x86/int80_sigaction
   intr_futex_wait_restart
   intr_poll
   intr_ppoll

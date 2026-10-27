@@ -45,8 +45,8 @@ struct Sighandler {
   }
 
   /**
-   * Set from the fields of a sigaction struct of another layout, stored as a
-   * kernel_sigaction of Arch (the task's).
+   * Set from the fields of a sigaction struct of another layout or arch,
+   * stored as a kernel_sigaction of Arch (the task's).
    */
   template <typename Arch>
   void init_from_fields_arch(uint64_t handler, uint64_t flags,
@@ -648,7 +648,7 @@ void RecordTask::on_syscall_exit_arch(int syscallno, const Registers& regs) {
       return;
     case Arch::rt_sigaction:
       // TODO: SYS_signal
-      update_sigaction(regs);
+      update_sigaction_arch<Arch>(regs, false);
       return;
     case Arch::set_tid_address:
       set_tid_addr(regs.orig_arg1());
@@ -1378,20 +1378,27 @@ void RecordTask::update_sigaction_arch(const Registers& regs,
   // sighandler table.
   // TODO: discard attempts to handle or ignore signals
   // that can't be by POSIX
-  if (!old_sigaction) {
+  uint64_t handler, flags, restorer, mask = 0;
+  if (old_sigaction) {
+    auto sa = read_mem(new_sigaction.cast<typename Arch::old_sigaction>());
+    handler = sa.k_sa_handler.rptr().as_int();
+    flags = sa.sa_flags;
+    restorer = sa.sa_restorer.rptr().as_int();
+    mask = sa.sa_mask;
+  } else {
     auto sa = read_mem(new_sigaction.cast<typename Arch::kernel_sigaction>());
-    sighandlers->get(sig).init_arch<Arch>(sa);
-    return;
+    if (Arch::arch() == arch()) {
+      sighandlers->get(sig).init_arch<Arch>(sa);
+      return;
+    }
+    handler = sa.k_sa_handler.rptr().as_int();
+    flags = sa.sa_flags;
+    restorer = sa.sa_restorer.rptr().as_int();
+    memcpy(&mask, &sa.sa_mask, min(sizeof(mask), sizeof(sa.sa_mask)));
   }
-  auto sa = read_mem(new_sigaction.cast<typename Arch::old_sigaction>());
   // Store it with the task's layout, which rr uses to install it again.
-  init_handler_from_fields(&sighandlers->get(sig), arch(),
-                           sa.k_sa_handler.rptr().as_int(), sa.sa_flags,
-                           sa.sa_restorer.rptr().as_int(), sa.sa_mask);
-}
-
-void RecordTask::update_sigaction(const Registers& regs) {
-  RR_ARCH_FUNCTION(update_sigaction_arch, regs.arch(), regs, false);
+  init_handler_from_fields(&sighandlers->get(sig), arch(), handler, flags,
+                           restorer, mask);
 }
 
 sig_set_t RecordTask::read_sigmask_from_process() {

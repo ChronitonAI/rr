@@ -718,11 +718,6 @@ private:
    */
   void futex_wait(remote_ptr<int> futex, int val, bool* ok);
 
-  /**
-   * Call this when SYS_rt_sigaction is finishing with |regs|.
-   */
-  void update_sigaction(const Registers& regs);
-
   template <typename Arch> void init_buffers_arch();
   template <typename Arch>
   void on_syscall_exit_arch(int syscallno, const Registers& regs);
