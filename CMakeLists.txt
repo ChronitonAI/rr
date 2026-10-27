@@ -1258,6 +1258,7 @@ set(BASIC_TESTS
   nscd
   numa
   x86/old_fork
+  x86/old_sigaction
   openat2
   openat_null
   open_tree
