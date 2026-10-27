@@ -1051,6 +1051,7 @@ set(BASIC_TESTS
   clone_cleartid_coredump
   clone_fail
   clone_immediate_exit
+  clone_killed_during_preparation
   clone_newflags
   clone_parent
   clone_untraced

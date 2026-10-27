@@ -95,6 +95,7 @@
 #include "SysCpuMonitor.h"
 #include "TraceStream.h"
 #include "VirtualPerfCounterMonitor.h"
+#include "WaitManager.h"
 #include "cpp_supplement.h"
 #include "ftrace.h"
 #include "kernel_abi.h"
@@ -3687,6 +3688,28 @@ static bool is_new_tracee(RecordTask* t, pid_t tid) {
   return tracer.size() == 1 && atoi(tracer[0].c_str()) == getpid();
 }
 
+/**
+ * This is purely for testing purposes. See RRCALL_KILL_IN_CLONE_PREPARATION.
+ * `t` is at the entry of a clone(), fork() or vfork(). If a kill armed for
+ * `t` fires now, SIGKILL `t` and wait until it has reached its
+ * PTRACE_EVENT_EXIT stop (or has exited), leaving that stop for
+ * prepare_clone() to find.
+ */
+static void maybe_kill_task_in_clone_preparation(RecordTask* t) {
+  if (t->is_exiting() ||
+      !t->take_armed_kill(RRCALL_KILL_IN_CLONE_PREPARATION)) {
+    return;
+  }
+  t->tgkill(SIGKILL);
+  WaitOptions options(t->tid);
+  options.consume = false;
+  WaitResult result;
+  do {
+    result = WaitManager::wait_stop_or_exit(options);
+  } while (result.code == WAIT_NO_STATUS);
+  ASSERT(t, result.code == WAIT_OK) << "Task disappeared";
+}
+
 template <typename Arch>
 static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) {
   uintptr_t flags;
@@ -3717,6 +3740,7 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
     flags = SIGCHLD;
   }
 
+  maybe_kill_task_in_clone_preparation(t);
   while (true) {
     if (!t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
       // Tracee died unexpectedly during clone, before reporting the event.

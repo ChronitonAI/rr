@@ -255,5 +255,15 @@ enum rrcall_kill_point {
      the task is dying. */
   RRCALL_KILL_BEFORE_SYSCALL_PATCH,
 
+  /* clone(), fork() and vfork(), while rr prepares the syscall */
+
+  /* A task that has entered clone(), fork() or vfork(), while rr prepares
+     the syscall: at the stop where rr handles the syscall's entry, just
+     before rr resumes the task to get its PTRACE_EVENT_CLONE,
+     PTRACE_EVENT_FORK or PTRACE_EVENT_VFORK stop. The syscall doesn't run
+     then. rr waits until the task has reached its PTRACE_EVENT_EXIT stop
+     (or has exited), without collecting that stop. */
+  RRCALL_KILL_IN_CLONE_PREPARATION,
+
   RRCALL_KILL_NUM_POINTS
 };
