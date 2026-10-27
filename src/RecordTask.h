@@ -216,6 +216,22 @@ public:
    * when t's status changes due to a regular event (exit).
    */
   bool is_waiting_for(RecordTask* t);
+  /**
+   * Returns a tracee or child of this task's process with an emulated stop
+   * pending that the waitpid or similar this task is in reports, or null.
+   * With |for_wakeup|, only one whose stop Linux wakes this task up for
+   * (pid_child_should_wake()).
+   */
+  RecordTask* waited_task_with_emulated_stop(bool for_wakeup = false);
+  /**
+   * Returns the thread of this task's process that forked |child_process|
+   * or, once that thread is exiting, the first thread of this process that
+   * isn't exiting, in the order rr created them, which is how Linux picks
+   * the child's parent thread (real_parent). Returns null if
+   * |child_process| isn't a child of this process or this process has no
+   * live thread.
+   */
+  RecordTask* parent_thread_of(ThreadGroup* child_process);
 
   bool already_exited() const override {
     return waiting_for_reap;
@@ -664,10 +680,12 @@ public:
 
   /**
    * Called when this task is able to receive a SIGCHLD (e.g. because
-   * we completed delivery of a signal). Sends a new synthetic
-   * SIGCHLD to the task if there are still tasks that need a SIGCHLD
-   * sent for them.
-   * May queue signals for specific tasks.
+   * we completed delivery of a signal). If there are still tasks that need
+   * a SIGCHLD sent for them, sends a new synthetic SIGCHLD, for this task's
+   * tracees' stops to this task, or for a child's stop to the child's
+   * parent thread, if that thread is in a wait and doesn't block SIGCHLD,
+   * and otherwise to the process, with that thread tried first. Interrupts
+   * the waits that Linux wakes up for an emulated stop that satisfies them.
    */
   void send_synthetic_SIGCHLD_if_necessary();
 
@@ -824,6 +842,8 @@ public:
   int in_wait_options;
   pid_t in_wait_pid;
   pid_t creator_tid;
+  // The thread that forked this task's process.
+  TaskUid forker;
 
   // Signal handler state
 

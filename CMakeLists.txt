@@ -1039,6 +1039,7 @@ set(BASIC_TESTS
   capget
   chew_cpu
   x86/chew_cpu_cpuid
+  child_stop_sigchld_thread
   chmod
   chown
   clock
@@ -1516,6 +1517,8 @@ set(BASIC_TESTS
   vsyscall_timeslice
   x86/x87env
   wait
+  wait_for_child_stop_sigchld_pending
+  wait_options_emulated_stop
   wait_sigstop
   write_race
   writev

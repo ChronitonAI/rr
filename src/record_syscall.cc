@@ -2374,37 +2374,12 @@ static Switchable prepare_bpf(RecordTask* t,
 }
 
 static bool maybe_emulate_wait(RecordTask* t, TaskSyscallState& syscall_state) {
-  if (t->in_wait_type == WAIT_TYPE_NONE) {
+  RecordTask* child = t->waited_task_with_emulated_stop();
+  if (!child) {
     return false;
   }
-
-  for (Task* thread : t->thread_group()->task_set()) {
-    RecordTask* rthread = static_cast<RecordTask*>(thread);
-    for (RecordTask* child : rthread->emulated_ptrace_tracees) {
-      if (t->is_waiting_for_ptrace(child) && child->emulated_stop_pending) {
-        syscall_state.emulate_wait_for_child = child;
-        return true;
-      }
-    }
-  }
-
-  for (ThreadGroup* child_process : t->thread_group()->children()) {
-    for (Task* child : child_process->task_set()) {
-      auto rchild = static_cast<RecordTask*>(child);
-      if (rchild->emulated_stop_type == NOT_STOPPED) {
-        continue;
-      }
-      if (!(t->in_wait_options & WUNTRACED) && rchild->emulated_stop_type != CHILD_STOP) {
-        continue;
-      }
-      if (!rchild->emulated_stop_pending || !t->is_waiting_for(rchild)) {
-        continue;
-      }
-      syscall_state.emulate_wait_for_child = rchild;
-      return true;
-    }
-  }
-  return false;
+  syscall_state.emulate_wait_for_child = child;
+  return true;
 }
 
 static void maybe_pause_instead_of_waiting(RecordTask* t,

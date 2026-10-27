@@ -352,6 +352,7 @@ Task* RecordTask::clone(CloneReason reason, int flags, remote_ptr<void> stack,
     }
     if (reason == TRACEE_CLONE) {
       rt->creator_tid = tid;
+      rt->forker = (flags & CLONE_SHARE_THREAD_GROUP) ? forker : tuid();
     }
   }
   return t;
@@ -415,6 +416,9 @@ void RecordTask::post_exec() {
   // Newly execed tasks always have non-faulting mode (from their point of
   // view, even if rr is secretly causing faults).
   cpuid_mode = 1;
+
+  // Linux makes SIGCHLD the exit signal of a task that execs (de_thread()).
+  termination_signal = SIGCHLD;
 }
 
 template <typename Arch> static void do_preload_init_arch(RecordTask* t) {
@@ -883,14 +887,12 @@ void RecordTask::force_emulate_ptrace_stop(WaitStatus status, EmulatedStopType s
   emulated_ptrace_SIGCHLD_pending = true;
 
   emulated_ptracer->send_synthetic_SIGCHLD_if_necessary();
-  // The SIGCHLD will eventually be reported to rr via a ptrace stop,
-  // interrupting wake_task's syscall (probably a waitpid) if necessary. At
-  // that point, we'll fix up the siginfo data with values that match what
-  // the kernel would have delivered for a real ptracer's SIGCHLD. When the
-  // signal handler (if any) returns, if wake_task was in a blocking wait that
-  // wait will be resumed, at which point rec_prepare_syscall_arch will
-  // discover the pending ptrace result and emulate the wait syscall to
-  // return that result immediately.
+  // set_siginfo_for_synthetic_SIGCHLD fixes up the SIGCHLD's siginfo with
+  // values that match what the kernel would have delivered for a real
+  // ptracer's SIGCHLD. A thread of the ptracer's process in a blocking wait
+  // that this stop satisfies, and that Linux wakes up for it, gets a
+  // TIME_SLICE_SIGNAL, which interrupts the wait, and then we emulate the
+  // wait syscall to return the pending ptrace result.
 }
 
 void RecordTask::do_ptrace_exit_stop(WaitStatus exit_status) {
@@ -934,94 +936,79 @@ void RecordTask::set_stopped(bool stopped) {
 }
 
 void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
-  RecordTask* wake_task = nullptr;
-  bool need_signal = false;
+  // Linux (do_notify_parent_cldstop(), complete_signal()) queues the SIGCHLD
+  // for the process and tries to deliver it to the ptracer thread first,
+  // for a tracee's stop, or to the child's parent thread, for a child's
+  // stop. Find that thread.
+  RecordTask* sigchld_thread = nullptr;
   for (RecordTask* tracee : emulated_ptrace_tracees) {
     if (tracee->emulated_ptrace_SIGCHLD_pending) {
-      need_signal = true;
-      // check to see if any thread in the ptracer process is in a waitpid that
-      // could read the status of 'tracee'. If it is, we should wake up that
-      // thread. Otherwise we send SIGCHLD to the ptracer thread.
-      for (Task* t : thread_group()->task_set()) {
-        auto rt = static_cast<RecordTask*>(t);
-        if (rt->is_waiting_for_ptrace(tracee)) {
-          wake_task = rt;
-          break;
+      sigchld_thread = this;
+      break;
+    }
+  }
+  for (ThreadGroup* child_tg : thread_group()->children()) {
+    if (sigchld_thread) {
+      break;
+    }
+    for (Task* child : child_tg->task_set()) {
+      if (static_cast<RecordTask*>(child)->emulated_SIGCHLD_pending) {
+        sigchld_thread = parent_thread_of(child_tg);
+        if (!sigchld_thread) {
+          sigchld_thread = this;
         }
-      }
-      if (wake_task) {
         break;
       }
     }
   }
-  if (!need_signal) {
-    for (ThreadGroup* child_tg : thread_group()->children()) {
-      for (Task* child : child_tg->task_set()) {
-        RecordTask* rchild = static_cast<RecordTask*>(child);
-        if (rchild->emulated_SIGCHLD_pending) {
-          need_signal = true;
-          // check to see if any thread in the ptracer process is in a waitpid
-          // that could read the status of 'tracee'. If it is, we should wake
-          // up that thread. Otherwise we send SIGCHLD to the ptracer thread.
-          for (Task* t : thread_group()->task_set()) {
-            auto rt = static_cast<RecordTask*>(t);
-            if (rt->is_waiting_for(rchild)) {
-              wake_task = rt;
-              break;
-            }
-          }
-          if (wake_task) {
-            break;
-          }
-        }
-      }
-    }
-    if (!need_signal) {
-      return;
-    }
-  }
 
-  // ptrace events trigger SIGCHLD in the ptracer's wake_task.
-  // We can't set all the siginfo values to their correct values here, so
-  // we'll patch this up when the signal is received.
-  // If there's already a pending SIGCHLD, this signal will be ignored,
-  // but at some point the pending SIGCHLD will be delivered and then
-  // send_synthetic_SIGCHLD_if_necessary will be called again to deliver a new
-  // SIGCHLD if necessary.
   siginfo_t si;
   memset(&si, 0, sizeof(si));
-  si.si_code = SI_QUEUE;
   si.si_value.sival_int = SIGCHLD_SYNTHETIC;
   int ret;
-  if (wake_task) {
-    LOG(debug) << "Sending synthetic SIGCHLD to waiting tid " << wake_task->tid;
-    // We must use the raw SYS_rt_tgsigqueueinfo syscall here to ensure the
-    // signal is sent to the correct thread by tid.
-    ret = syscall(SYS_rt_tgsigqueueinfo, wake_task->tgid(), wake_task->tid,
-                  SIGCHLD, &si);
+  if (sigchld_thread) {
+    // We can't set all the siginfo values to their correct values here, so
+    // we'll patch this up when the signal is received.
+    // If there's already a pending SIGCHLD, this signal will be ignored,
+    // but at some point the pending SIGCHLD will be delivered and then
+    // send_synthetic_SIGCHLD_if_necessary will be called again to deliver a
+    // new SIGCHLD if necessary.
+    si.si_code = SI_QUEUE;
+    if (sigchld_thread->in_wait_type != WAIT_TYPE_NONE &&
+        !sigchld_thread->is_sig_blocked(SIGCHLD)) {
+      // sigchld_thread is in a wait, so Linux has it take the SIGCHLD. We
+      // send the SIGCHLD to sigchld_thread itself, because when we resume
+      // another thread from a ptrace stop first, that thread can take a
+      // signal pending for the process.
+      LOG(debug) << "Sending synthetic SIGCHLD to waiting tid "
+                 << sigchld_thread->tid;
+      ret = syscall(SYS_rt_tgsigqueueinfo, tgid(), sigchld_thread->tid,
+                    SIGCHLD, &si);
+    } else {
+      // Given a thread's tid, rt_sigqueueinfo() queues the SIGCHLD for the
+      // process and has the kernel try that thread first.
+      LOG(debug) << "Sending synthetic SIGCHLD to pid " << tgid() << ", tid "
+                 << sigchld_thread->tid << " first";
+      ret = syscall(SYS_rt_sigqueueinfo, sigchld_thread->tid, SIGCHLD, &si);
+    }
     ASSERT(this, ret == 0);
-    // `stashed_signals_blocking_more_signals` means that SIGCHLD can be
-    // blocked even when `is_sig_blocked` is false.
-    if (wake_task->is_sig_blocked(SIGCHLD) ||
-        wake_task->stashed_signals_blocking_more_signals) {
-      LOG(debug) << "SIGCHLD is blocked, kicking it out of the syscall";
-      // Just sending SIGCHLD won't wake it up. Send it a TIME_SLICE_SIGNAL
-      // as well to make sure it exits a blocking syscall. We ensure those
-      // can never be blocked.
-      // We have to send a negative code here because only the kernel can set
-      // positive codes. We set a magic number so we can recognize it
-      // when received.
-      si.si_code = SYNTHETIC_TIME_SLICE_SI_CODE;
-      ret = syscall(SYS_rt_tgsigqueueinfo, wake_task->tgid(), wake_task->tid,
+  }
+
+  // Linux also wakes up the threads that wait for a child of the process
+  // (__wake_up_parent(), pid_child_should_wake()), and a wait that a stop
+  // satisfies returns it. Interrupt those waits with a TIME_SLICE_SIGNAL,
+  // which the tracee can't block: we then emulate their results. We have to
+  // send a negative code here because only the kernel can set positive
+  // codes. We set a magic number so we can recognize it when received.
+  si.si_code = SYNTHETIC_TIME_SLICE_SI_CODE;
+  for (Task* t : thread_group()->task_set()) {
+    auto rt = static_cast<RecordTask*>(t);
+    if (!rt->is_exiting() && rt->waited_task_with_emulated_stop(true)) {
+      LOG(debug) << "Kicking tid " << rt->tid << " out of its wait";
+      ret = syscall(SYS_rt_tgsigqueueinfo, rt->tgid(), rt->tid,
                     PerfCounters::TIME_SLICE_SIGNAL, &si);
       ASSERT(this, ret == 0);
     }
-  } else {
-    // Send the signal to the process as a whole and let the kernel
-    // decide which thread gets it.
-    ret = syscall(SYS_rt_sigqueueinfo, tgid(), SIGCHLD, &si);
-    ASSERT(this, ret == 0);
-    LOG(debug) << "Sending synthetic SIGCHLD to pid " << tgid();
   }
 }
 
@@ -1158,6 +1145,16 @@ bool RecordTask::is_waiting_for(RecordTask* t) {
   if (t->thread_group()->parent() != thread_group().get()) {
     return false;
   }
+  // Without __WALL, a wait reports a child process whose exit signal isn't
+  // SIGCHLD only with __WCLONE, and other children only without __WCLONE
+  // (eligible_child()). A process's exit signal is its leader's.
+  if (!(in_wait_options & __WALL)) {
+    RecordTask* leader = session().find_task(t->tgid());
+    if ((leader ? leader : t)->is_clone_child() !=
+        !!(in_wait_options & __WCLONE)) {
+      return false;
+    }
+  }
   switch (in_wait_type) {
     case WAIT_TYPE_NONE:
       return false;
@@ -1173,6 +1170,85 @@ bool RecordTask::is_waiting_for(RecordTask* t) {
       ASSERT(this, false);
       return false;
   }
+}
+
+RecordTask* RecordTask::parent_thread_of(ThreadGroup* child_process) {
+  if (child_process->parent() != thread_group().get() ||
+      child_process->task_set().empty()) {
+    return nullptr;
+  }
+  // Linux makes the thread that forked a process its parent, and when that
+  // thread exits, the first thread of the process (in the order they were
+  // created) that isn't exiting (find_new_reaper()).
+  auto child = static_cast<RecordTask*>(*child_process->task_set().begin());
+  RecordTask* forker = session().find_task(child->forker);
+  if (forker && forker->thread_group() == thread_group() &&
+      !forker->is_exiting()) {
+    return forker;
+  }
+  RecordTask* parent = nullptr;
+  for (Task* t : thread_group()->task_set()) {
+    if (!t->is_exiting() &&
+        (!parent || t->tuid().serial() < parent->tuid().serial())) {
+      parent = static_cast<RecordTask*>(t);
+    }
+  }
+  return parent;
+}
+
+RecordTask* RecordTask::waited_task_with_emulated_stop(bool for_wakeup) {
+  if (in_wait_type == WAIT_TYPE_NONE) {
+    return nullptr;
+  }
+
+  // With __WNOTHREAD, a thread waits only for its own tracees and for the
+  // children it is the parent of. When another thread of this process
+  // traces a child's leader, Linux reports the leader's ptrace stops to the
+  // child's parent thread too, also without WUNTRACED, if the wait reports
+  // that child (wait_consider_task()), but doesn't wake that thread up for
+  // them (pid_child_should_wake()).
+  bool only_own = in_wait_options & __WNOTHREAD;
+  for (Task* thread : thread_group()->task_set()) {
+    for (RecordTask* tracee :
+         static_cast<RecordTask*>(thread)->emulated_ptrace_tracees) {
+      if (!tracee->emulated_stop_pending || !is_waiting_for_ptrace(tracee)) {
+        continue;
+      }
+      if (only_own && thread != this &&
+          (for_wakeup || tracee->tid != tracee->tgid() ||
+           parent_thread_of(tracee->thread_group().get()) != this ||
+           !is_waiting_for(tracee))) {
+        continue;
+      }
+      return tracee;
+    }
+  }
+
+  for (ThreadGroup* child_process : thread_group()->children()) {
+    for (Task* child : child_process->task_set()) {
+      auto rchild = static_cast<RecordTask*>(child);
+      if (!rchild->emulated_stop_pending ||
+          rchild->emulated_stop_type == NOT_STOPPED) {
+        continue;
+      }
+      if (rchild->emulated_ptracer &&
+          rchild->emulated_ptracer->thread_group() == thread_group()) {
+        // We report the stops of a task that this process traces only as
+        // ptrace stops, above.
+        continue;
+      }
+      if (!(in_wait_options & WUNTRACED) &&
+          rchild->emulated_stop_type != CHILD_STOP) {
+        continue;
+      }
+      if (!is_waiting_for(rchild) ||
+          (only_own && parent_thread_of(child_process) != this)) {
+        continue;
+      }
+      return rchild;
+    }
+  }
+  return nullptr;
 }
 
 void RecordTask::save_ptrace_signal_siginfo(const siginfo_t& si) {
