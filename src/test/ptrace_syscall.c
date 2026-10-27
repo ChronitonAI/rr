@@ -10,38 +10,6 @@
 #define SYSCALLNO SYS_geteuid
 #endif
 
-/* Old systems don't have these. glibc's sys/ptrace.h defines the
-   PTRACE_SYSCALL_INFO_* values in an enum, hence the RR_ prefix. */
-#ifndef PTRACE_GET_SYSCALL_INFO
-#define PTRACE_GET_SYSCALL_INFO 0x420e
-#endif
-#define RR_PTRACE_SYSCALL_INFO_NONE 0
-#define RR_PTRACE_SYSCALL_INFO_ENTRY 1
-#define RR_PTRACE_SYSCALL_INFO_EXIT 2
-
-struct rr_ptrace_syscall_info {
-  uint8_t op;
-  uint8_t pad[3];
-  uint32_t arch;
-  uint64_t instruction_pointer;
-  uint64_t stack_pointer;
-  union {
-    struct {
-      uint64_t nr;
-      uint64_t args[6];
-    } entry;
-    struct {
-      int64_t rval;
-      uint8_t is_error;
-    } exit;
-    struct {
-      uint64_t nr;
-      uint64_t args[6];
-      uint32_t ret_data;
-    } seccomp;
-  };
-};
-
 extern char syscall_addr __attribute__ ((visibility ("hidden")));
 
 int main(void) {

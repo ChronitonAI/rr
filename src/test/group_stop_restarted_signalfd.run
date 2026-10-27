@@ -1,0 +1,4 @@
+source `dirname $0`/util.sh
+record group_stop_restarted_syscall$bitness signalfd
+replay
+check EXIT-SUCCESS
