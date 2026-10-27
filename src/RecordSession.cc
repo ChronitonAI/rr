@@ -917,8 +917,23 @@ void RecordSession::task_continue(const StepState& step_state) {
 
     bool singlestep = is_ptrace_any_singlestep(t->arch(),
       t->emulated_ptrace_cont_command);
-    if (singlestep && is_at_syscall_instruction(t, t->ip())) {
-      // We're about to singlestep into a syscall instruction.
+    // A PTRACE_SINGLESTEP from the signal stop of an interrupted syscall
+    // runs the whole syscall if the kernel restarts it. On x86, the kernel
+    // restarts it only if the registers still say so: the result is a
+    // restart error, and orig_ax, as an int, isn't -1. A ptracer can prevent
+    // the restart at the signal stop, e.g. by setting orig_ax to -1 (gdb
+    // does that whenever it writes the pc). Here, orig_ax must also be a
+    // syscall number, i.e. not negative as an int. (On aarch64, the kernel
+    // has already moved the pc back to the syscall instruction by then.)
+    // A PTRACE_SYSEMU_SINGLESTEP stops at the restarted syscall's entry,
+    // which rr gets from the single-step's seccomp stop for a traced
+    // syscall.
+    bool will_restart = t->emulated_ptrace_cont_command == PTRACE_SINGLESTEP &&
+                        may_restart && t->regs().syscall_may_restart() &&
+                        (int)t->regs().original_syscallno() >= 0;
+    if (singlestep && (is_at_syscall_instruction(t, t->ip()) || will_restart)) {
+      // We're about to singlestep into a syscall instruction, or the kernel
+      // is about to restart an interrupted syscall.
       // Act like we're NOT singlestepping since doing a PTRACE_SINGLESTEP would
       // skip over the system call.
       LOG(debug)
