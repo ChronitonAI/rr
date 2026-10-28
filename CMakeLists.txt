@@ -1339,6 +1339,7 @@ set(BASIC_TESTS
   ptrace_wnohang
   ptrace_wnohang_poll
   ptracer_death
+  ptracer_death_event_stop
   ptracer_death_multithread
   ptracer_death_multithread_peer
   # pivot_root ... disabled because it fails when run as root and does nothing otherwise
