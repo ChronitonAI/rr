@@ -1,0 +1,17 @@
+source `dirname $0`/util.sh
+# A thread of the initial process execs, and rr SIGKILLs it at each kill
+# point. rr must exit as the process did, by SIGKILL.
+for point in before-exec-stop before-geteventmsg \
+    before-geteventmsg-at-exit-stop after-exec-stop; do
+  record exec_killed_at_exec_stop$bitness $point in-initial-process
+  if [[ $exit_code != 137 ]]; then
+    failed ": rr exited with $exit_code at $point"
+  fi
+  replay
+  if [[ $(cat replay.err) != "" ]]; then
+    failed ": error replaying $point"
+  fi
+done
+if [[ "$test_passed" == "y" ]]; then
+  passed
+fi

@@ -1,0 +1,10 @@
+source `dirname $0`/util.sh
+for point in before-exec-stop before-geteventmsg \
+    before-geteventmsg-at-exit-stop after-exec-stop before-exec-exit-event; do
+  record $TESTNAME $point
+  replay
+  check EXIT-SUCCESS
+  if grep -q "new image ran" record.out; then
+    failed ": a child wasn't killed at $point"
+  fi
+done

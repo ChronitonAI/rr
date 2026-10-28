@@ -34,6 +34,20 @@ void rec_prepare_restart_syscall(RecordTask* t);
 void rec_process_syscall(RecordTask* t);
 
 /**
+ * |t|'s execve has replaced its image, and |t| is at its PTRACE_EVENT_EXEC
+ * stop, which we're going to report to its emulated ptracer. Record the new
+ * image and an EV_EXEC, so that replay does the exec before anything the
+ * ptracer does there. We finish recording the exec at the execve's exit.
+ */
+void rec_process_exec_stop(RecordTask* t);
+
+/**
+ * |t| is about to leave the PTRACE_EVENT_EXEC stop that we've held it in
+ * since rec_process_exec_stop(). Save what we need at the execve's exit.
+ */
+void rec_leave_exec_stop(RecordTask* t);
+
+/**
  * Apply any necessary processing for an executed sigreturn.
  */
 void rec_did_sigreturn(RecordTask* t);

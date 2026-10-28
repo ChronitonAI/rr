@@ -1317,6 +1317,7 @@ set(BASIC_TESTS
   ptrace_exec
   x86/ptrace_exec32
   ptrace_exec_multithreaded
+  ptrace_exec_stop_end
   ptrace_group_stop
   ptrace_interrupt_syscall
   ptrace_kill_grandtracee
@@ -1341,6 +1342,7 @@ set(BASIC_TESTS
   ptrace_waiter_thread
   ptrace_wnohang
   ptrace_wnohang_poll
+  ptrace_write_at_exec_stop
   ptrace_zombie_leader_group_stop
   ptracer_death
   ptracer_death_event_stop
@@ -1621,7 +1623,10 @@ set(TESTS_WITH_PROGRAM
   elapsed_time
   exclusion_region
   exec_failed
+  exec_killed_at_exec_stop
   exec_killed_before_scratch
+  exec_killed_sibling_tracer
+  exec_killed_traced
   exec_leader_exit_race
   exec_many
   exec_shared_as
@@ -1686,6 +1691,7 @@ set(TESTS_WITH_PROGRAM
   patch_syscall_killed_task
   prctl_tsc
   priority
+  ptrace_exec_killed_before_scratch
   ptrace_remote_unmap
   x86/rdtsc_loop
   x86/rdtsc_loop2
@@ -1819,6 +1825,7 @@ set(TESTS_WITHOUT_PROGRAM
   deliver_async_signal_during_syscalls
   env_newline
   exec_deleted
+  exec_killed_initial_process
   exec_stop
   execp
   explicit_checkpoint_clone

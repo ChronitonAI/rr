@@ -46,6 +46,7 @@
 #include "Flags.h"
 #include "PerfCounters.h"
 #include "ReplaySession.h"
+#include "RecordSession.h"
 #include "RecordTask.h"
 #include "ReplayTask.h"
 #include "ScopedFd.h"
@@ -514,7 +515,11 @@ void checksum_process_memory(RecordTask* t, FrameTime global_time) {
     AddressSpace::Mapping m = *it;
     string raw_map_line = m.map.str();
 
-    if (!checksum_segment_filter(m)) {
+    // At an EV_EXEC, the new image still has the mappings that we unmap at
+    // the execve's exit, which replay doesn't have.
+    if (!checksum_segment_filter(m) || m.map.is_vvar() ||
+        m.map.is_vvar_vclock() ||
+        (m.map.is_vdso() && t->session().unmap_vdso())) {
       fprintf(checksums_file, "(%x) %s\n", ignored_checksum,
               raw_map_line.c_str());
       continue;

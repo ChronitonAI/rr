@@ -362,10 +362,13 @@ static void restore_mapped_region(ReplayTask* t, AutoRemoteSyscalls& remote,
                real_file_name, device, inode, nullptr, &km);
 }
 
-static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
-                           ReplayTraceStep* step) {
-  step->action = TSTEP_RETIRE;
-
+/**
+ * Exec a stub program and set up the new image as recorded. If
+ * |fds_to_close| is set, this is the execve's exit: close those fds, and
+ * set up our scratch memory if we recorded it.
+ */
+static void exec_recorded_image(ReplayTask* t, const TraceFrame& trace_frame,
+                                const vector<int>* fds_to_close) {
   /* First, exec a stub program */
   pid_t new_tid = t->real_tgid();
   pid_t old_tid = t->tid;
@@ -459,8 +462,9 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
     LOG(warn) << "Failed to restore PAC keys. Replay may fail.";
   }
 
-  t->fd_table()->close_after_exec(
-      t, t->current_trace_frame().event().Syscall().exec_fds_to_close);
+  if (fds_to_close) {
+    t->fd_table()->close_after_exec(t, *fds_to_close);
+  }
 
   {
     // Tell AutoRemoteSyscalls that we don't need memory parameters. This will
@@ -479,9 +483,9 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
     restore_mapped_region(t, remote, kms[0], datas[0]);
   }
 
-  // The last mapping is the scratch memory rr mapped after the exec, unless
-  // the task died before rr could map it.
-  bool have_scratch = kms.size() > 1 &&
+  // At the execve's exit, the last mapping is the scratch memory rr mapped
+  // after the exec, unless the task died before rr could map it.
+  bool have_scratch = fds_to_close && kms.size() > 1 &&
       kms.back().start() == AddressSpace::exec_scratch_start();
   {
     // Now that [stack] is mapped, reinitialize AutoRemoteSyscalls with
@@ -501,7 +505,9 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
   // Apply final data records --- fixing up the last page in each data segment
   // for zeroing applied by the kernel, and applying monkeypatches.
   t->apply_all_data_records_from_trace();
+}
 
+static void save_exec_auxv(ReplayTask* t) {
   // Now it's safe to save the auxv data
   t->vm()->save_auxv(t);
 
@@ -510,6 +516,62 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
   // the same syscall numbers. The inner rr could be replaying
   // a trace with different rr syscall numbers.
   syscall(SYS_rrcall_reload_auxv, t->tid);
+}
+
+void rep_process_exec_stop(ReplayTask* t) {
+  exec_recorded_image(t, t->current_trace_frame(), nullptr);
+  save_exec_auxv(t);
+}
+
+static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
+                           ReplayTraceStep* step) {
+  step->action = TSTEP_RETIRE;
+
+  const SyscallEvent& ev = trace_frame.event().Syscall();
+  if (!ev.exec_at_stop) {
+    exec_recorded_image(t, trace_frame, &ev.exec_fds_to_close);
+    save_exec_auxv(t);
+    return;
+  }
+
+  // We did the exec at the EV_EXEC (see rep_process_exec_stop()). Recording
+  // finished it at the execve's exit: it mapped its rr page, the pages of its
+  // vdso and scratch memory, and patched the new image.
+  t->fd_table()->close_after_exec(t, ev.exec_fds_to_close);
+  vector<KernelMapping> kms;
+  vector<TraceReader::MappedData> datas;
+  while (true) {
+    TraceReader::MappedData data;
+    bool found;
+    KernelMapping km = t->trace_reader().read_mapped_region(&data, &found);
+    if (!found) {
+      break;
+    }
+    if (km.start() == AddressSpace::rr_page_start() ||
+        km.start() == AddressSpace::preload_thread_locals_start()) {
+      // We mapped those at the EV_EXEC.
+      continue;
+    }
+    kms.push_back(km);
+    datas.push_back(data);
+  }
+  // The last mapping is our scratch memory, unless the task died before
+  // recording could map it.
+  bool have_scratch = !kms.empty() &&
+      kms.back().start() == AddressSpace::exec_scratch_start();
+  {
+    AutoRemoteSyscalls remote(t);
+    for (size_t i = 0; i < kms.size() - (have_scratch ? 1 : 0); ++i) {
+      restore_mapped_region(t, remote, kms[i], datas[i]);
+    }
+  }
+  if (have_scratch) {
+    init_scratch_memory(t, kms.back(), datas.back());
+  }
+  t->apply_all_data_records_from_trace();
+  t->set_regs(trace_frame.regs());
+  t->set_recorded_extra_regs(trace_frame.extra_regs());
+  save_exec_auxv(t);
 }
 
 static void process_brk(ReplayTask* t) {
