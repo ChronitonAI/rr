@@ -2514,6 +2514,11 @@ static void prepare_ptrace_cont(RecordTask* tracee, int sig, int command) {
   // or be at a stop we haven't processed yet. The scheduler will deal with
   // those like with any other task.
   bool held = tracee->held_at_emulated_ptrace_event;
+  // We report PTRACE_EVENT_VFORK_DONE at the exit of its syscall. The
+  // command the tracer resumes the tracee with from it decides what the
+  // tracer gets at that exit.
+  bool at_vfork_done =
+      tracee->emulated_stop_code.ptrace_event() == PTRACE_EVENT_VFORK_DONE;
   if (sig && (held || tracee->emulated_stop_code.ptrace_event() ||
               tracee->emulated_stop_code.group_stop() ||
               tracee->emulated_stop_type == SIGNAL_HANDLER_STOP)) {
@@ -2557,6 +2562,10 @@ static void prepare_ptrace_cont(RecordTask* tracee, int sig, int command) {
     // Continue the task since we didn't in enter_syscall
     tracee->resume_execution(RESUME_SYSCALL, RESUME_NONBLOCKING,
                              RESUME_NO_TICKS);
+  }
+
+  if (at_vfork_done) {
+    maybe_trigger_emulated_ptrace_syscall_exit_stop(tracee, command, false);
   }
 }
 

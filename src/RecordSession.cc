@@ -1190,14 +1190,16 @@ static void maybe_trigger_emulated_ptrace_interrupt_stop(
   }
 }
 
-/**
- * Report the exit of |t|'s syscall to its emulated ptracer if
- * |ptrace_cont_command| asks for that. Call
- * maybe_trigger_emulated_ptrace_interrupt_stop next, with the same
- * |ptrace_interrupt_stop|.
- */
-static void maybe_trigger_emulated_ptrace_syscall_exit_stop(
+void maybe_trigger_emulated_ptrace_syscall_exit_stop(
     RecordTask* t, int ptrace_cont_command, bool ptrace_interrupt_stop) {
+  if (t->emulated_stop_type != NOT_STOPPED &&
+      t->emulated_stop_code.ptrace_event() == PTRACE_EVENT_VFORK_DONE) {
+    // rec_process_syscall has just reported PTRACE_EVENT_VFORK_DONE. Linux
+    // reports it in the syscall, before the exit, so the command that the
+    // ptracer resumes |t| with from that stop decides what the ptracer gets
+    // at the exit (see prepare_ptrace_cont).
+    return;
+  }
   if (ptrace_cont_command == PTRACE_SYSCALL) {
     t->emulate_ptrace_stop(WaitStatus::for_syscall(t), SYSCALL_EXIT_STOP);
   } else if (is_ptrace_any_singlestep(t->arch(), ptrace_cont_command)) {

@@ -302,6 +302,15 @@ private:
   bool check_outside_mmaps_;
 };
 
+/**
+ * Report the exit of |t|'s syscall to its emulated ptracer if
+ * |ptrace_cont_command| asks for that. Call
+ * maybe_trigger_emulated_ptrace_interrupt_stop next, with the same
+ * |ptrace_interrupt_stop|.
+ */
+void maybe_trigger_emulated_ptrace_syscall_exit_stop(
+    RecordTask* t, int ptrace_cont_command, bool ptrace_interrupt_stop);
+
 } // namespace rr
 
 #endif // RR_RECORD_SESSION_H_

@@ -1511,6 +1511,7 @@ set(BASIC_TESTS
   vdso_parts
   vdso_symbols
   vfork_done
+  vfork_done_syscall_exit
   vfork_exec_scratch
   vfork_flush
   vfork_setopts
