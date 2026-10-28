@@ -20,6 +20,7 @@
 #include "kernel_metadata.h"
 #include "log.h"
 #include "record_signal.h"
+#include "record_syscall.h"
 #include "rr/rr.h"
 #include "util.h"
 
@@ -397,6 +398,9 @@ void RecordTask::post_exec() {
   // Newly execed tasks always have non-faulting mode (from their point of
   // view, even if rr is secretly causing faults).
   cpuid_mode = 1;
+
+  // An exec makes the task's exit signal SIGCHLD (de_thread()).
+  termination_signal = SIGCHLD;
 }
 
 template <typename Arch> static void do_preload_init_arch(RecordTask* t) {
@@ -911,6 +915,11 @@ void RecordTask::leave_held_ptrace_event_stop() {
   }
   ASSERT(this, ev().is_syscall_event() &&
                    PROCESSING_SYSCALL == ev().Syscall().state);
+  if (ev().Syscall().exec_at_stop) {
+    // We hold the task at the PTRACE_EVENT_EXEC stop where we recorded the
+    // exec.
+    rec_leave_exec_stop(this);
+  }
   // Finish the syscall we held the task in.
   resume_execution(RESUME_SYSCALL, RESUME_NONBLOCKING, RESUME_NO_TICKS);
 }

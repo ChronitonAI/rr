@@ -27,6 +27,11 @@ void rep_after_enter_syscall(ReplayTask* t);
 void rep_process_syscall(ReplayTask* t, ReplayTraceStep* step);
 
 /**
+ * Do the exec at |t|'s EV_EXEC: switch |t| to the new image as recorded.
+ */
+void rep_process_exec_stop(ReplayTask* t);
+
+/**
  * Process an EV_GROW_MAP event. These are like mmap syscalls, so handled
  * in replay_syscall.
  */

@@ -195,8 +195,21 @@ public:
    * The task in the thread-group that triggered the successful execve has changed
    * its tid to |rec_tid|. We mirror that, and emit TraceTaskEvents to make it
    * look like a new task was spawned and the old task exited.
+   * Returns null if that task has been killed since it stopped, before we
+   * could read its former tid. We've then recorded its death and the
+   * leader's (see record_death_in_exec()), and destroyed the leader's task;
+   * the caller should ignore the stop.
    */
   RecordTask* revive_task_for_exec(pid_t rec_tid);
+
+  /**
+   * Called when |rec_tid|, a thread-group leader's tid, reports a
+   * PTRACE_EVENT_EXIT stop or exits. If that's really a non-leader thread
+   * of the group that exec'd, took over |rec_tid| in de_thread(), and was
+   * killed before it reported its PTRACE_EVENT_EXEC, deal with it (see
+   * record_death_in_exec()) and return true.
+   */
+  bool handle_death_of_execed_thread(pid_t rec_tid, WaitStatus status);
 
   /**
    * This is purely for testing purposes (see SYS_rrcall_arm_kill). If a task
@@ -231,15 +244,30 @@ private:
    * thread-group leader, which the exec killed: we record its exit if we
    * haven't yet, destroy it, and revive_task_for_exec(). Returns null if
    * the task that did the exec was killed before we could read its
-   * registers.
+   * registers, or its former tid (see revive_task_for_exec()).
    */
   RecordTask* switch_to_exec_image(RecordTask* t);
+
+  /**
+   * Returns the task of a thread other than the leader of the thread group
+   * led by |rec_tid| that exec'd and has taken over |rec_tid| in
+   * de_thread(), if any.
+   */
+  RecordTask* execed_non_leader(pid_t rec_tid);
 
   /**
    * Record the exit of the thread-group leader |leader|, which a non-leader
    * thread's exec killed, if we haven't yet, and destroy it.
    */
   void dispose_of_leader_killed_by_exec(RecordTask* leader);
+
+  /**
+   * |t|, a non-leader thread of the thread group led by |rec_tid|, exec'd
+   * and took over |rec_tid|, but was killed before we could record its
+   * exec. Record its exit, and the old leader's, and destroy the leader's
+   * task, and |t| once an emulated ptracer has collected its exit stop.
+   */
+  void record_death_in_exec(pid_t rec_tid, RecordTask* t);
 
   RecordSession(const std::string& exe_path,
                 const std::vector<std::string>& argv,

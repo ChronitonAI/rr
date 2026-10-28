@@ -1831,7 +1831,12 @@ Completion ReplaySession::exit_task(ReplayTask* t) {
 
 void ReplaySession::maybe_revive_task_for_exec() {
   const Event& ev = trace_frame.event();
-  if (!ev.is_syscall_event() || !ev.Syscall().is_exec() ||
+  // That frame is the execve's exit, or its EV_EXEC if we recorded the exec
+  // at its PTRACE_EVENT_EXEC stop. If the thread was killed before the
+  // execve returned, it can be the thread's EV_EXIT.
+  bool is_exit = ev.type() == EV_EXIT;
+  if ((!is_exit && ev.type() != EV_EXEC &&
+       (!ev.is_syscall_event() || !ev.Syscall().is_exec())) ||
       find_task(trace_frame.tid())) {
     return;
   }
@@ -1846,6 +1851,11 @@ void ReplaySession::maybe_revive_task_for_exec() {
     }
   }
   if (!tg) {
+    if (is_exit) {
+      // The exit of a task that doesn't exist yet: the initial task killed
+      // before its first exec, whose frame the constructor reads.
+      return;
+    }
     FATAL()
         << "Dead task tid should be task-group leader, but we can't find it";
   }
@@ -1854,6 +1864,13 @@ void ReplaySession::maybe_revive_task_for_exec() {
   }
 
   ReplayTask* t = static_cast<ReplayTask*>(*tg->task_set().begin());
+  if (is_exit) {
+    int syscallno = t->regs().original_syscallno();
+    ASSERT(t, is_execve_syscall(syscallno, t->arch()) ||
+                  is_execveat_syscall(syscallno, t->arch()))
+        << "Exit of " << trace_frame.tid() << " but " << t->rec_tid
+        << " isn't in an execve";
+  }
   LOG(debug) << "Changing task tid from " << t->rec_tid << " to "
              << trace_frame.tid();
   task_map.erase(t->rec_tid);
@@ -1958,6 +1975,10 @@ ReplayTask* ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
       process_grow_map(t);
       current_step.action = TSTEP_RETIRE;
       break;
+    case EV_EXEC:
+      rep_process_exec_stop(t);
+      current_step.action = TSTEP_RETIRE;
+      break;
     case EV_SIGNAL: {
       if (skip_next_execution_event) {
         current_step.action = TSTEP_NONE;
@@ -2032,12 +2053,18 @@ ReplayTask* ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
   return t;
 }
 
-bool ReplaySession::next_step_is_successful_exec_syscall_exit() {
+bool ReplaySession::next_step_is_exec() {
   const Event& ev = trace_frame.event();
-  return current_step.action == TSTEP_NONE &&
-         ev.is_syscall_event() &&
+  if (current_step.action != TSTEP_NONE) {
+    return false;
+  }
+  if (ev.type() == EV_EXEC) {
+    return true;
+  }
+  return ev.is_syscall_event() &&
          ev.Syscall().is_exec() &&
          ev.Syscall().state == EXITING_SYSCALL &&
+         !ev.Syscall().exec_at_stop &&
          !trace_frame.regs().syscall_failed();
 }
 

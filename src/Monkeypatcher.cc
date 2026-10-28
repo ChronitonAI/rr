@@ -1589,6 +1589,33 @@ static remote_ptr<void> resolve_address(ElfReader& reader, uintptr_t elf_addr,
   return map_start + elf_addr;
 }
 
+/**
+ * Whether the |size| bytes at |addr|, mapped from |elf_addr| in |reader|'s
+ * file, differ from the file's.
+ */
+static bool written_since_mapped(RecordTask* t, ElfReader& reader,
+                                 uintptr_t elf_addr, remote_ptr<void> addr,
+                                 size_t size) {
+  PhdrInfo phdr;
+  vector<uint8_t> mem_bytes(size);
+  if (!reader.addr_to_phdr(elf_addr, phdr) ||
+      t->read_bytes_fallible(addr, size, mem_bytes.data()) != (ssize_t)size) {
+    return false;
+  }
+  // Bytes past the end of the segment in the file are zero.
+  vector<uint8_t> file_bytes(size, 0);
+  uint64_t offset = elf_addr - phdr.vaddr;
+  if (offset < phdr.filesz) {
+    size_t in_file = min<uint64_t>(size, phdr.filesz - offset);
+    const void* p = reader.read_bytes(phdr.offset + offset, in_file);
+    if (!p) {
+      return false;
+    }
+    memcpy(file_bytes.data(), p, in_file);
+  }
+  return mem_bytes != file_bytes;
+}
+
 static void set_and_record_bytes(RecordTask* t, ElfReader& reader,
                                  uintptr_t elf_addr, const void* bytes,
                                  size_t size, remote_ptr<void> map_start,
@@ -1597,6 +1624,12 @@ static void set_and_record_bytes(RecordTask* t, ElfReader& reader,
   remote_ptr<void> addr =
       resolve_address(reader, elf_addr, map_start, map_size, map_offset, prot);
   if (!addr) {
+    return;
+  }
+  // A ptracer can write to a new image at its exec stop, before we patch it
+  // (see rec_process_exec_stop()). Leave what it wrote alone.
+  if (written_since_mapped(t, reader, elf_addr, addr, size)) {
+    LOG(debug) << "Not patching " << addr << ", which has been written to";
     return;
   }
   bool ok = true;

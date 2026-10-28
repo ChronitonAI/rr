@@ -574,13 +574,19 @@ struct TaskSyscallState : TaskSyscallStateBase {
   /** Miscellaneous saved data that can be used by particular syscalls */
   vector<uint8_t> saved_data;
 
+  /** For an execve recorded at its PTRACE_EVENT_EXEC stop (aarch64): x7 when
+   *  the task left that stop.
+   */
+  uintptr_t exec_stop_x7;
+
   TaskSyscallState()
       : t(nullptr),
         emulate_wait_for_child(nullptr),
         expect_errno(0),
         should_emulate_result(false),
         preparation_done(false),
-        scratch_enabled(false) {}
+        scratch_enabled(false),
+        exec_stop_x7(0) {}
 };
 
 template <typename Arch>
@@ -2450,11 +2456,28 @@ static void maybe_pause_instead_of_waiting(RecordTask* t,
   t->set_regs(r);
 }
 
+/**
+ * |allow_exited| is for the requests that the kernel accepts for a tracee
+ * that has exited but that the tracer hasn't collected yet (PTRACE_KILL and
+ * PTRACE_INTERRUPT); others fail with ESRCH for it.
+ */
 static RecordTask* verify_ptrace_target(RecordTask* tracer,
                                         TaskSyscallState& syscall_state,
                                         pid_t pid,
-                                        bool require_stopped = true) {
+                                        bool require_stopped = true,
+                                        bool allow_exited = false) {
   RecordTask* tracee = tracer->session().find_task(pid);
+  if (!tracee) {
+    // A dead tracee that's only waiting for the tracer to collect its exit
+    // may be gone from the task map (see
+    // RecordSession::record_death_in_exec()).
+    for (RecordTask* t : tracer->emulated_ptrace_tracees) {
+      if (t->tid == pid && t->already_exited()) {
+        tracee = t;
+        break;
+      }
+    }
+  }
   if (!tracee) {
     LOG(debug) << "tracee pid " << pid << " is unknown to rr";
     syscall_state.emulate_result(-ESRCH);
@@ -2462,6 +2485,15 @@ static RecordTask* verify_ptrace_target(RecordTask* tracer,
   }
   if (tracee->emulated_ptracer != tracer) {
     LOG(debug) << pid << " is not traced by " << tracer->tid;
+    syscall_state.emulate_result(-ESRCH);
+    return nullptr;
+  }
+  if (tracee->already_exited()) {
+    // It's dead, and only waits for the tracer to collect its exit.
+    LOG(debug) << pid << " has exited";
+    if (allow_exited) {
+      return tracee;
+    }
     syscall_state.emulate_result(-ESRCH);
     return nullptr;
   }
@@ -3212,18 +3244,30 @@ static Switchable prepare_ptrace(RecordTask* t,
       break;
     }
     case PTRACE_KILL: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, tid);
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, tid, true,
+                                                true);
       if (tracee) {
-        tracee->kill_if_alive();
+        if (!tracee->already_exited()) {
+          tracee->kill_if_alive();
+        }
         syscall_state.emulate_result(0);
       }
       break;
     }
     case PTRACE_INTERRUPT: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, tid, false);
-      if (tracee) {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, tid, false,
+                                                true);
+      if (tracee && tracee->already_exited()) {
+        // There's nothing to interrupt, but the kernel only fails this if
+        // the tracee wasn't seized.
+        syscall_state.emulate_result(tracee->emulated_ptrace_seized ? 0
+                                                                    : -EIO);
+      } else if (tracee) {
         uint64_t result = 0;
-        if (!tracee->is_stopped()) {
+        if (tracee->emulated_stop_type != NOT_STOPPED) {
+          // The tracee is in a ptrace-stop already, which the kernel leaves
+          // alone.
+        } else if (!tracee->is_stopped()) {
           // Running in a blocked syscall. Forward the PTRACE_INTERRUPT.
           // Regular syscall exit handling will take over from here.
           LOG(debug) << "Interrupting " << tracee->tid;
@@ -3237,12 +3281,11 @@ static Switchable prepare_ptrace(RecordTask* t,
           tracee->apply_group_stop(SIGSTOP);
         } else if (tracee->status().is_syscall()) {
           tracee->emulate_ptrace_stop(tracee->status(), SYSCALL_EXIT_STOP);
-        } else if (tracee->emulated_stop_pending == NOT_STOPPED) {
+        } else {
           // The tracee is stopped from our perspective, but not stopped from
           // the perspective of the ptracer. Emulate a stop now.
           tracee->apply_group_stop(SIGSTOP);
         }
-        // Otherwise, there's nothing to do.
         syscall_state.emulate_result(result);
       }
       break;
@@ -6019,7 +6062,15 @@ static void aarch64_kernel_bug_workaround(RecordTask *t,
     // un-recorded divergence). I'm really hoping to get this fixed
     // in the kernel.
     Registers r = t->regs();
-    r.set_x(7, syscall_state.syscall_entry_registers.x(7));
+    if (t->ev().is_syscall_event() && t->ev().Syscall().is_exec() &&
+        !r.syscall_failed()) {
+      // start_thread() zeroed the new image's registers, and a ptracer may
+      // have written x7 at the exec stop.
+      r.set_x(7, t->ev().Syscall().exec_at_stop ? syscall_state.exec_stop_x7
+                                                : 0);
+    } else {
+      r.set_x(7, syscall_state.syscall_entry_registers.x(7));
+    }
     t->set_regs(r);
   }
 }
@@ -6278,44 +6329,24 @@ static void disarm_exec_stop_kills(RecordTask* t) {
   }
 }
 
-static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
-  disarm_exec_stop_kills(t);
+static string read_exec_interp_name(RecordTask* t) {
+  std::string exe_path = t->proc_exe_path();
+  ScopedFd fd(exe_path.c_str(), O_RDONLY);
+  ASSERT(t, fd.is_open());
 
-  Registers r = t->regs();
-  if (r.syscall_failed()) {
-    // Otherwise we would have done this during PTRACE_EVENT_EXEC
-    t->session().scheduler().did_exit_execve(t);
-    return;
+  if (ElfFileReader::is_x32_abi(fd)) {
+    // NB: We opened proc_exe_path because exe_path may not be correct in
+    // this namespace, but we want to report something more useful than
+    // /proc/<pid>/exe in the event of a failure.
+    FATAL() << "rr does not support the x32 ABI, but " << t->exe_path()
+            << " is an x32 ABI program.";
   }
 
-  string interp_name;
-  {
-    std::string exe_path = t->proc_exe_path();
-    ScopedFd fd(exe_path.c_str(), O_RDONLY);
-    ASSERT(t, fd.is_open());
+  ElfFileReader reader(fd);
+  return reader.read_interp();
+}
 
-    if (ElfFileReader::is_x32_abi(fd)) {
-      // NB: We opened proc_exe_path because exe_path may not be correct in
-      // this namespace, but we want to report something more useful than
-      // /proc/<pid>/exe in the event of a failure.
-      FATAL() << "rr does not support the x32 ABI, but " << t->exe_path()
-              << " is an x32 ABI program.";
-    }
-
-    ElfFileReader reader(fd);
-    interp_name = reader.read_interp();
-  }
-
-  // This is purely for testing purposes. See RRCALL_KILL_BEFORE_POST_EXEC.
-  if (t->take_armed_kill(RRCALL_KILL_BEFORE_POST_EXEC)) {
-    t->tgkill(SIGKILL);
-  }
-  t->post_exec_syscall(t->exe_path());
-  t->ev().Syscall().exec_fds_to_close =
-      t->fd_table()->fds_to_close_after_exec(t);
-
-  check_privileged_exe(t);
-
+static void record_exec_rr_mappings(RecordTask* t) {
   KernelMapping rr_page_mapping =
       t->vm()->mapping_of(AddressSpace::rr_page_start()).map;
   auto mode = t->trace_writer().write_mapped_region(
@@ -6334,11 +6365,46 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
       vector<TraceRemoteFd>(),
       TraceWriter::RR_BUFFER_MAPPING);
   ASSERT(t, mode == TraceWriter::DONT_RECORD_IN_TRACE);
+}
 
+/**
+ * The mappings of a new image that we treat specially.
+ */
+struct ExecKernelMappings {
+  vector<KernelMapping> stacks;
   KernelMapping vvar;
   KernelMapping vvar_vclock;
   KernelMapping vdso;
+};
 
+static ExecKernelMappings find_exec_kernel_mappings(RecordTask* t) {
+  ExecKernelMappings result;
+  for (const auto& m : t->vm()->maps()) {
+    auto& km = m.map;
+    if (km.is_stack()) {
+      result.stacks.push_back(km);
+    } else if (km.is_vvar()) {
+      result.vvar = km;
+    } else if (km.is_vvar_vclock()) {
+      result.vvar_vclock = km;
+    } else if (km.is_vdso()) {
+      result.vdso = km;
+    }
+  }
+  return result;
+}
+
+/**
+ * Whether we unmap |km| from a new image. We don't record it.
+ */
+static bool is_unmapped_after_exec(RecordTask* t, const KernelMapping& km) {
+  return km.is_vvar() || km.is_vvar_vclock() ||
+         (km.is_vdso() && t->session().unmap_vdso());
+}
+
+static void record_exec_task_event(RecordTask* t,
+                                   TaskSyscallState& syscall_state,
+                                   const string& interp_name) {
   // get the remote executable entry point
   // with the pointer, we find out which mapping is the executable
   auto auxv_pointers = get_exe_entry_interp_base(t);
@@ -6346,21 +6412,8 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
   auto interp_base = auxv_pointers.second;
   // NB: A binary is not required to have an interpreter.
 
-  // Write out stack mappings first since during replay we need to set up the
-  // stack before any files get mapped.
-  vector<KernelMapping> stacks;
   for (const auto& m : t->vm()->maps()) {
     auto& km = m.map;
-    if (km.is_stack()) {
-      stacks.push_back(km);
-    } else if (km.is_vvar()) {
-      vvar = km;
-    } else if (km.is_vvar_vclock()) {
-      vvar_vclock = km;
-    } else if (km.is_vdso()) {
-      vdso = km;
-    }
-
     // if true, this mapping is our executable
     if (km.start() <= exe_entry && exe_entry < km.end()) {
       ASSERT(t, km.prot() & PROT_EXEC) << "Entry point not in executable code?";
@@ -6376,61 +6429,81 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
 
   syscall_state.exec_saved_event->set_pac_data(t->pac_keys());
   t->session().trace_writer().write_task_event(*syscall_state.exec_saved_event);
+}
 
-  {
-    AutoRemoteSyscalls remote(t, AutoRemoteSyscalls::DISABLE_MEMORY_PARAMS);
-
-    if (vvar.size()) {
-      // We're not going to map [vvar] during replay --- that wouldn't
-      // make sense, since it contains data from the kernel that isn't correct
-      // for replay, and we patch out the vdso syscalls that would use it.
-      // Unmapping it now makes recording look more like replay.
-      // Also note that under 4.0.7-300.fc22.x86_64 (at least) /proc/<pid>/mem
-      // can't read the contents of [vvar].
-      remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
-                                vvar.start(), vvar.size());
-      t->vm()->unmap(t, vvar.start(), vvar.size());
-    }
-    if (vvar_vclock.size()) {
-      // Give [vvar_vclock] the same treatment.
-      remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
-                                vvar_vclock.start(), vvar_vclock.size());
-      t->vm()->unmap(t, vvar_vclock.start(), vvar_vclock.size());
-    }
-
-    if (t->session().unmap_vdso() && vdso.size()) {
-      remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
-                                vdso.start(), vdso.size());
-      t->vm()->unmap(t, vdso.start(), vdso.size());
-    }
-
-    for (auto& km : stacks) {
-      mode = t->trace_writer().write_mapped_region(t, km, km.fake_stat(),
-                                                   km.fsname(), vector<TraceRemoteFd>(),
-                                                   TraceWriter::EXEC_MAPPING);
-      ASSERT(t, mode == TraceWriter::RECORD_IN_TRACE);
-      auto buf = t->read_mem(km.start().cast<uint8_t>(), km.size());
-      t->trace_writer().write_raw(t->rec_tid, buf.data(), km.size(),
-                                  km.start());
-
-      // Remove MAP_GROWSDOWN from stacks by remapping the memory and
-      // writing the contents back.
-      int flags = (km.flags() & ~MAP_GROWSDOWN) | MAP_ANONYMOUS;
-      remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
-                                km.start(), km.size());
-      if (!t->vm()->has_mapping(km.start() - page_size())) {
-        // Unmap an extra page at the start; this seems to be necessary
-        // to properly wipe out the growsdown mapping. Doing it as a separate
-        // munmap call also seems to be necessary.
-        remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
-                                  km.start() - page_size(), page_size());
-      }
-      remote.infallible_mmap_syscall_if_alive(km.start(), km.size(), km.prot(), flags,
-                                              -1, 0);
-      t->write_mem(km.start().cast<uint8_t>(), buf.data(), buf.size());
-    }
+static void unmap_exec_kernel_mappings(RecordTask* t,
+                                       AutoRemoteSyscalls& remote,
+                                       const ExecKernelMappings& kms) {
+  if (kms.vvar.size()) {
+    // We're not going to map [vvar] during replay --- that wouldn't
+    // make sense, since it contains data from the kernel that isn't correct
+    // for replay, and we patch out the vdso syscalls that would use it.
+    // Unmapping it now makes recording look more like replay.
+    // Also note that under 4.0.7-300.fc22.x86_64 (at least) /proc/<pid>/mem
+    // can't read the contents of [vvar].
+    remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
+                              kms.vvar.start(), kms.vvar.size());
+    t->vm()->unmap(t, kms.vvar.start(), kms.vvar.size());
+  }
+  if (kms.vvar_vclock.size()) {
+    // Give [vvar_vclock] the same treatment.
+    remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
+                              kms.vvar_vclock.start(), kms.vvar_vclock.size());
+    t->vm()->unmap(t, kms.vvar_vclock.start(), kms.vvar_vclock.size());
   }
 
+  if (t->session().unmap_vdso() && kms.vdso.size()) {
+    remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
+                              kms.vdso.start(), kms.vdso.size());
+    t->vm()->unmap(t, kms.vdso.start(), kms.vdso.size());
+  }
+}
+
+/**
+ * Write out a stack mapping of a new image and its contents, which replay
+ * sets up before any files get mapped. Returns the contents.
+ */
+static vector<uint8_t> record_exec_stack(RecordTask* t,
+                                         const KernelMapping& km) {
+  auto mode = t->trace_writer().write_mapped_region(
+      t, km, km.fake_stat(), km.fsname(), vector<TraceRemoteFd>(),
+      TraceWriter::EXEC_MAPPING);
+  ASSERT(t, mode == TraceWriter::RECORD_IN_TRACE);
+  auto buf = t->read_mem(km.start().cast<uint8_t>(), km.size());
+  t->trace_writer().write_raw(t->rec_tid, buf.data(), km.size(), km.start());
+  return buf;
+}
+
+/**
+ * Remove MAP_GROWSDOWN from a stack mapping by remapping the memory and
+ * writing the contents |buf| back.
+ */
+static void remap_exec_stack(RecordTask* t, AutoRemoteSyscalls& remote,
+                             const KernelMapping& km,
+                             const vector<uint8_t>& buf) {
+  int flags = (km.flags() & ~MAP_GROWSDOWN) | MAP_ANONYMOUS;
+  remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
+                            km.start(), km.size());
+  if (!t->vm()->has_mapping(km.start() - page_size())) {
+    // Unmap an extra page at the start; this seems to be necessary
+    // to properly wipe out the growsdown mapping. Doing it as a separate
+    // munmap call also seems to be necessary.
+    remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
+                              km.start() - page_size(), page_size());
+  }
+  remote.infallible_mmap_syscall_if_alive(km.start(), km.size(), km.prot(),
+                                          flags, -1, 0);
+  t->write_mem(km.start().cast<uint8_t>(), buf.data(), buf.size());
+}
+
+/**
+ * Write out the mappings of a new image other than its stacks and rr's page
+ * and thread locals (or, if |rr_vdso_pages_only|, just the pages that
+ * AddressSpace::map_rr_page() maps for our vdso), and the contents that
+ * replay can't get from the mapped files.
+ */
+static void record_exec_mappings(RecordTask* t,
+                                 bool rr_vdso_pages_only = false) {
   // The kernel may modify some of the pages in the mapping according to
   // ELF BSS metadata. We use /proc/<pid>/pagemap to observe which pages
   // have been changed and mark them for recording.
@@ -6439,7 +6512,10 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
   for (const auto& m : t->vm()->maps()) {
     auto& km = m.map;
     if (km.start() == AddressSpace::rr_page_start() ||
-        km.start() == AddressSpace::preload_thread_locals_start()) {
+        km.start() == AddressSpace::preload_thread_locals_start() ||
+        is_unmapped_after_exec(t, km) ||
+        (rr_vdso_pages_only &&
+         !(m.flags & AddressSpace::Mapping::IS_RR_VDSO_PAGE))) {
       continue;
     }
     if (km.is_stack() || km.is_vsyscall()) {
@@ -6478,12 +6554,109 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
   for (const auto& mr : memory_to_record) {
     t->record_remote(mr.start(), mr.size());
   }
+}
 
+/**
+ * Set up rr's own state in a new image: patch it and map our scratch
+ * memory.
+ */
+static void finish_exec(RecordTask* t) {
   // Patch LD_PRELOAD and VDSO after saving the mappings. Replay will apply
   // patches to the saved mappings.
   t->vm()->monkeypatcher().patch_after_exec(t);
 
   init_scratch_memory(t, FIXED_ADDRESS);
+}
+
+void rec_process_exec_stop(RecordTask* t) {
+  auto& syscall_state = TaskSyscallState::get(t);
+  string interp_name = read_exec_interp_name(t);
+  t->ev().Syscall().exec_fds_to_close =
+      t->fd_table()->fds_to_close_after_exec(t);
+  check_privileged_exe(t);
+  record_exec_task_event(t, syscall_state, interp_name);
+  for (auto& km : find_exec_kernel_mappings(t).stacks) {
+    record_exec_stack(t, km);
+  }
+  record_exec_mappings(t);
+  t->ev().Syscall().exec_at_stop = true;
+  t->record_event(Event::exec(), RecordTask::DONT_FLUSH_SYSCALLBUF,
+                  RecordTask::DONT_RESET_SYSCALLBUF);
+}
+
+void rec_leave_exec_stop(RecordTask* t) {
+  ASSERT(t, t->ev().is_syscall_event() && t->ev().Syscall().exec_at_stop);
+  if (t->arch() == aarch64) {
+    // The kernel restores x7 at the execve's syscall-exit stop.
+    TaskSyscallState::get(t).exec_stop_x7 = t->regs().x(7);
+  }
+}
+
+static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
+  disarm_exec_stop_kills(t);
+
+  Registers r = t->regs();
+  if (r.syscall_failed()) {
+    // Otherwise we would have done this during PTRACE_EVENT_EXEC
+    t->session().scheduler().did_exit_execve(t);
+    return;
+  }
+
+  if (t->ev().Syscall().exec_at_stop) {
+    // We recorded the new image at the exec stop (see
+    // rec_process_exec_stop()). The ptracer may have written to its
+    // registers there, which the kernel kept, and which
+    // post_exec_syscall() mustn't canonicalize.
+    // This is purely for testing purposes. See RRCALL_KILL_BEFORE_POST_EXEC.
+    if (t->take_armed_kill(RRCALL_KILL_BEFORE_POST_EXEC)) {
+      t->tgkill(SIGKILL);
+    }
+    t->post_exec_syscall(t->exe_path());
+    t->set_regs(r);
+    record_exec_rr_mappings(t);
+    record_exec_mappings(t, true);
+    ExecKernelMappings kms = find_exec_kernel_mappings(t);
+    {
+      AutoRemoteSyscalls remote(t, AutoRemoteSyscalls::DISABLE_MEMORY_PARAMS);
+      unmap_exec_kernel_mappings(t, remote, kms);
+      for (auto& km : kms.stacks) {
+        remap_exec_stack(t, remote, km,
+                         t->read_mem(km.start().cast<uint8_t>(), km.size()));
+      }
+    }
+    finish_exec(t);
+    return;
+  }
+
+  string interp_name = read_exec_interp_name(t);
+
+  // This is purely for testing purposes. See RRCALL_KILL_BEFORE_POST_EXEC.
+  if (t->take_armed_kill(RRCALL_KILL_BEFORE_POST_EXEC)) {
+    t->tgkill(SIGKILL);
+  }
+  t->post_exec_syscall(t->exe_path());
+  t->ev().Syscall().exec_fds_to_close =
+      t->fd_table()->fds_to_close_after_exec(t);
+
+  check_privileged_exe(t);
+
+  record_exec_rr_mappings(t);
+
+  ExecKernelMappings kms = find_exec_kernel_mappings(t);
+  record_exec_task_event(t, syscall_state, interp_name);
+
+  {
+    AutoRemoteSyscalls remote(t, AutoRemoteSyscalls::DISABLE_MEMORY_PARAMS);
+    unmap_exec_kernel_mappings(t, remote, kms);
+    // Write out stack mappings first since during replay we need to set up
+    // the stack before any files get mapped.
+    for (auto& km : kms.stacks) {
+      remap_exec_stack(t, remote, km, record_exec_stack(t, km));
+    }
+  }
+
+  record_exec_mappings(t);
+  finish_exec(t);
 }
 
 static bool is_writable(RecordTask* t, int fd) {

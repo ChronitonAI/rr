@@ -479,6 +479,9 @@ void TraceWriter::write_frame(RecordTask* t, const Event& ev,
     case EV_GROW_MAP:
       event.setGrowMap(Void());
       break;
+    case EV_EXEC:
+      event.setExec(Void());
+      break;
     case EV_SIGNAL:
       to_trace_signal(event.initSignal(), ev);
       break;
@@ -507,6 +510,7 @@ void TraceWriter::write_frame(RecordTask* t, const Event& ev,
                             : e.number);
       syscall.setState(to_trace_syscall_state(e.state));
       syscall.setFailedDuringPreparation(e.failed_during_preparation);
+      syscall.setExecAtStop(e.exec_at_stop);
       auto data = syscall.initExtra();
       if (e.write_offset >= 0) {
         data.setWriteOffset(e.write_offset);
@@ -663,6 +667,9 @@ TraceFrame TraceReader::read_frame(FrameTime skip_before) {
     case trace::Frame::Event::GROW_MAP:
       ret.ev = Event::grow_map();
       break;
+    case trace::Frame::Event::EXEC:
+      ret.ev = Event::exec();
+      break;
     case trace::Frame::Event::SIGNAL:
       ret.ev = from_trace_signal(EV_SIGNAL, event.getSignal());
       break;
@@ -694,6 +701,7 @@ TraceFrame TraceReader::read_frame(FrameTime skip_before) {
       syscall_ev.state = from_trace_syscall_state(syscall.getState());
       syscall_ev.failed_during_preparation =
           syscall.getFailedDuringPreparation();
+      syscall_ev.exec_at_stop = syscall.getExecAtStop();
       auto data = syscall.getExtra();
       switch (data.which()) {
         case trace::Frame::Event::Syscall::Extra::NONE:

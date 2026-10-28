@@ -990,9 +990,7 @@ static Task* is_in_exec(ReplayTimeline* timeline) {
   if (!t) {
     return nullptr;
   }
-  return timeline->current_session().next_step_is_successful_exec_syscall_exit()
-             ? t
-             : nullptr;
+  return timeline->current_session().next_step_is_exec() ? t : nullptr;
 }
 
 void GdbServer::maybe_notify_stop(const Session& session,

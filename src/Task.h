@@ -310,9 +310,11 @@ public:
   void did_kill();
 
   /**
-   * Call when another thread's exec has killed this task, the thread-group
-   * leader, and de_thread() has reaped it before we handled its
-   * PTRACE_EVENT_EXIT. Like did_kill(), and also marks the task as reaped
+   * Call when this task has died in or because of an exec and its tid may
+   * now refer to another task: the thread-group leader that another
+   * thread's exec killed (and de_thread() reaped), or the thread that
+   * exec'd and took over the leader's tid, and was killed before we could
+   * handle its exec stop. Like did_kill(), and also marks the task as reaped
    * so nothing touches it through its tid.
    */
   void did_die_in_exec();

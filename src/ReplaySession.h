@@ -224,10 +224,10 @@ public:
   ReplayTask* find_task(const TaskUid& tuid) const;
 
   /**
-   * Returns true if the next step for this session is to exit a syscall with
-   * the given number.
+   * Returns true if the next step for this session is to do an exec: at the
+   * exit of a successful execve, or at an EV_EXEC.
    */
-  bool next_step_is_successful_exec_syscall_exit();
+  bool next_step_is_exec();
 
   /**
    * The current ReplayStepKey.
@@ -384,9 +384,9 @@ private:
 
   /**
    * When a thread other than the thread-group leader execs, it takes over the
-   * leader's tid, and its frames from the execve's exit on are under that
-   * tid. If the current frame is the first of them, move the thread's task to
-   * that tid.
+   * leader's tid, and its frames from the execve's exit (or EV_EXEC, or its
+   * EV_EXIT if it died in the execve) on are under that tid. If the current
+   * frame is the first of them, move the thread's task to that tid.
    */
   void maybe_revive_task_for_exec();
   ReplayTask* setup_replay_one_trace_frame(ReplayTask* t);

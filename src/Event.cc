@@ -82,6 +82,7 @@ bool Event::record_regs() const {
   switch (type()) {
     case EV_INSTRUCTION_TRAP:
     case EV_PATCH_SYSCALL:
+    case EV_EXEC:
     case EV_SCHED:
     case EV_SYSCALL:
     case EV_SIGNAL:
@@ -113,6 +114,9 @@ bool Event::record_extra_regs() const {
     case EV_SIGNAL_HANDLER:
       // entering a signal handler seems to clear FP/SSE regs,
       // so record these effects.
+      return true;
+    case EV_EXEC:
+      // The exec sets everything under the sun.
       return true;
     default:
       return false;
@@ -213,6 +217,7 @@ std::string Event::type_name() const {
       CASE(SYSCALLBUF_RESET);
       CASE(PATCH_SYSCALL);
       CASE(GROW_MAP);
+      CASE(EXEC);
       CASE(DESCHED);
       CASE(SIGNAL);
       CASE(SIGNAL_DELIVERY);

@@ -82,6 +82,12 @@ enum EventType {
   // Map memory pages due to a (future) memory access. This is associated
   // with a mmap entry for the new pages.
   EV_GROW_MAP,
+  // The task's execve has replaced its image and the task is at the
+  // kernel's PTRACE_EVENT_EXEC stop, which we report to its emulated
+  // ptracer. Replay does the exec here, and the execve's exit frame has
+  // SyscallEvent::exec_at_stop set. The frame has the task's registers at
+  // the stop. Associated with the exec's task event, mappings and data.
+  EV_EXEC,
   // Use .signal.
   EV_SIGNAL,
   EV_SIGNAL_DELIVERY,
@@ -193,7 +199,8 @@ struct SignalEvent {
  * creates the new task or does the exec), allow a context switch so the
  * ptracer can modify the new task or post-exec state in a PTRACE_EVENT_EXEC/
  * CLONE/FORK/VFORK, then perform EXITING_SYSCALL to get into the correct
- * post-syscall state.
+ * post-syscall state. When we report a PTRACE_EVENT_EXEC stop, we record an
+ * EV_EXEC before it.
  *
  * When PTRACE_SYSEMU is used, there will only be one event: an
  * ENTERING_SYSCALL_PTRACE.
@@ -236,7 +243,8 @@ struct SyscallEvent {
         is_restart(false),
         failed_during_preparation(false),
         in_sysemu(false),
-        should_retry_patch(false) {}
+        should_retry_patch(false),
+        exec_at_stop(false) {}
 
   std::string syscall_name() const { return rr::syscall_name(number, arch()); }
 
@@ -284,6 +292,9 @@ struct SyscallEvent {
   bool in_sysemu;
   // True if we should retry patching on exit from this syscall
   bool should_retry_patch;
+  // For an execve: we recorded the exec at its PTRACE_EVENT_EXEC stop, as
+  // an EV_EXEC.
+  bool exec_at_stop;
 };
 
 struct syscall_interruption_t {
@@ -417,6 +428,7 @@ struct Event {
   }
   static Event syscallbuf_reset() { return Event(EV_SYSCALLBUF_RESET); }
   static Event grow_map() { return Event(EV_GROW_MAP); }
+  static Event exec() { return Event(EV_EXEC); }
   static Event exit() { return Event(EV_EXIT); }
   static Event sentinel() { return Event(EV_SENTINEL); }
 

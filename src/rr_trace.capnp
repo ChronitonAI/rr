@@ -375,6 +375,8 @@ struct Frame {
       number @19 :Int32;
       state @20 :SyscallState;
       failedDuringPreparation @21 :Bool;
+      # For an execve's exit: the exec happened at the 'exec' event before.
+      execAtStop @34 :Bool;
       extra :union {
         none @22 :Void;
         # Must be >= 0
@@ -398,5 +400,10 @@ struct Frame {
     patchAfterSyscall @26: Void;
     patchVsyscall @27: Void;
     patchTrappingInstruction @31: Void;
+    # The task's execve has replaced its image, and the task is at the
+    # kernel's PTRACE_EVENT_EXEC stop, which rr reports to its ptracer.
+    # 'registers' are its registers there. Replay does the exec here; the
+    # exec's task event, mapped regions and raw data have this frame's time.
+    exec @33 :Void;
   }
 }

@@ -185,9 +185,9 @@ enum rrcall_kill_point {
      returns, whether it succeeded or not. */
   RRCALL_KILL_BEFORE_EXEC_STOP,
   /* A thread that execs, at its PTRACE_EVENT_EXEC stop, just before rr
-     reads the thread's former tid with PTRACE_GETEVENTMSG, which it does
-     when that thread isn't the thread-group leader. Arm it as for
-     RRCALL_KILL_BEFORE_EXEC_STOP. rr doesn't wait. */
+     reads the thread's former tid with PTRACE_GETEVENTMSG to find its
+     task, which it does when that thread isn't the thread-group leader.
+     Arm it as for RRCALL_KILL_BEFORE_EXEC_STOP. rr doesn't wait. */
   RRCALL_KILL_BEFORE_EXEC_GETEVENTMSG,
   /* The same, but rr then waits until the task is at its PTRACE_EVENT_EXIT
      stop (or has exited), without collecting that stop. */
