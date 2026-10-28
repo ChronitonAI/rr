@@ -7062,11 +7062,69 @@ static bool is_mapped_shared(RecordTask* t, const struct stat& st) {
   return false;
 }
 
+// Whether a live address space maps any file MAP_SHARED.
+static bool has_shared_file_mappings(RecordTask* t) {
+  for (AddressSpace* vm : t->session().vms()) {
+    if (all_tasks_exited(vm)) {
+      continue;
+    }
+    for (auto& m : vm->maps()) {
+      if ((m.map.flags() & MAP_SHARED) && m.mapped_file_stat) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Record the file and its size in the trace, so replay can resize its
+// EmuFile, if it is a regular file that is mapped shared.
+static void record_resized_file(RecordTask* t, const struct stat& st) {
+  if (S_ISREG(st.st_mode) && is_mapped_shared(t, st)) {
+    t->ev().Syscall().resized_file =
+        ResizedFile{ st.st_dev, st.st_ino, (uint64_t)st.st_size };
+  }
+}
+
+// When truncate() changes the size of a file that is mapped shared,
+// record the file and its new size so replay can resize its EmuFile.
+static void record_truncated_file(RecordTask* t, remote_ptr<char> path) {
+  if (!has_shared_file_mappings(t)) {
+    return;
+  }
+  struct stat st;
+  {
+    // Look the path up in the tracee, so that its root, working directory
+    // and /proc/self apply.
+    AutoRemoteSyscalls remote(t);
+    int fd = remote.syscall(syscall_number_for_openat(t->arch()), AT_FDCWD,
+                            path, O_PATH | O_CLOEXEC);
+    if (fd < 0) {
+      LOG(warn) << "Can't open the path of a truncated file: "
+                << errno_name(-fd);
+      return;
+    }
+    int ret = stat(t->proc_fd_path(fd).c_str(), &st);
+    remote.infallible_close_syscall_if_alive(fd);
+    if (ret < 0) {
+      return;
+    }
+  }
+  record_resized_file(t, st);
+}
+
 // Returns the file path. This could be a blacklisted file so don't
 // do anything for blacklisted files.
 static string handle_opened_file(RecordTask* t, int fd, int flags) {
   string pathname = t->file_name_of_fd(fd);
   struct stat st = t->stat_fd(fd);
+
+  if ((flags & O_TRUNC) && !(flags & O_PATH)) {
+    // The open truncated the file (O_RDONLY | O_TRUNC does too). Other
+    // tasks may have run and written to it since, so record the size it
+    // has now.
+    record_resized_file(t, st);
+  }
 
   // This must be kept in sync with replay_syscall's handle_opened_files.
   FileMonitor* file_monitor = nullptr;
@@ -7534,6 +7592,13 @@ static void rec_process_syscall_arch(RecordTask* t,
       }
       break;
     }
+
+    case Arch::truncate:
+    case Arch::truncate64:
+      if (!t->regs().syscall_failed()) {
+        record_truncated_file(t, remote_ptr<char>(t->regs().orig_arg1()));
+      }
+      break;
 
     case SYS_rrcall_notify_control_msg: {
       auto msg =

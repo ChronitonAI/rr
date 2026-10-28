@@ -111,9 +111,13 @@ void EmuFile::update(dev_t device, ino_t inode, uint64_t size) {
 
 void EmuFile::ensure_size(uint64_t size) {
   if (size_ < size) {
-    resize_shmem_segment(file, size);
-    size_ = size;
+    set_size(size);
   }
+}
+
+void EmuFile::set_size(uint64_t size) {
+  resize_shmem_segment(file, size);
+  size_ = size;
 }
 
 std::string make_temp_name(const string& orig_path, dev_t orig_device,
