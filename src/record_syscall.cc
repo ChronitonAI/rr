@@ -2567,6 +2567,15 @@ static void prepare_ptrace_cont(RecordTask* tracee, int sig, int command) {
   if (at_vfork_done) {
     maybe_trigger_emulated_ptrace_syscall_exit_stop(tracee, command, false);
   }
+
+  if (tracee->syscall_exit_stop_on_resume) {
+    tracee->syscall_exit_stop_on_resume = false;
+    // A ptracer that detaches (|command| 0) doesn't get the stop.
+    if (command) {
+      tracee->emulate_ptrace_stop(WaitStatus::for_syscall(tracee),
+                                  SYSCALL_EXIT_STOP);
+    }
+  }
 }
 
 static uint64_t widen_buffer_unsigned(const void* buf, size_t size) {

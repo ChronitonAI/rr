@@ -1192,6 +1192,10 @@ static void maybe_trigger_emulated_ptrace_interrupt_stop(
 
 void maybe_trigger_emulated_ptrace_syscall_exit_stop(
     RecordTask* t, int ptrace_cont_command, bool ptrace_interrupt_stop) {
+  // The ptracer may have exited or detached since.
+  if (!t->emulated_ptracer) {
+    return;
+  }
   if (t->emulated_stop_type != NOT_STOPPED &&
       t->emulated_stop_code.ptrace_event() == PTRACE_EVENT_VFORK_DONE) {
     // rec_process_syscall has just reported PTRACE_EVENT_VFORK_DONE. Linux
@@ -1200,15 +1204,26 @@ void maybe_trigger_emulated_ptrace_syscall_exit_stop(
     // at the exit (see prepare_ptrace_cont).
     return;
   }
+  // Otherwise |t| may be in a group stop that we put it in during the
+  // syscall (we put every thread of a process in a group stop at once, and
+  // report it to a ptracer at once), or in a PTRACE_INTERRUPT stop, which we
+  // treat like a group stop. Linux reports these after the syscall's exit.
+  bool in_group_stop = t->emulated_stop_type != NOT_STOPPED;
   if (ptrace_cont_command == PTRACE_SYSCALL) {
-    t->emulate_ptrace_stop(WaitStatus::for_syscall(t), SYSCALL_EXIT_STOP);
+    if (in_group_stop) {
+      // Linux reports the syscall-exit stop first. prepare_ptrace_cont
+      // reports it when the ptracer resumes |t|.
+      t->syscall_exit_stop_on_resume = true;
+    } else {
+      t->emulate_ptrace_stop(WaitStatus::for_syscall(t), SYSCALL_EXIT_STOP);
+    }
   } else if (is_ptrace_any_singlestep(t->arch(), ptrace_cont_command)) {
     // Deliver the singlestep trap now that we've finished executing the
     // syscall.
-    if (ptrace_interrupt_stop && t->emulated_ptracer) {
+    if (ptrace_interrupt_stop || in_group_stop) {
       // Linux queues the SIGTRAP, and reports the PTRACE_EVENT_STOP for a
-      // PTRACE_INTERRUPT before it dequeues the SIGTRAP (see get_signal() in
-      // kernel/signal.c).
+      // PTRACE_INTERRUPT, or the group stop, before it dequeues the SIGTRAP
+      // (see get_signal() in kernel/signal.c).
       siginfo_t si;
       memset(&si, 0, sizeof(si));
       si.si_signo = SIGTRAP;

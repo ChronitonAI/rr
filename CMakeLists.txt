@@ -1328,10 +1328,12 @@ set(BASIC_TESTS
   ptrace_signal_during_clone
   ptrace_signals
   ptrace_singlestep
+  x86/ptrace_singlestep_group_stop
   ptrace_singlestep_signal_handler
   ptrace_stop_sigcont
   ptrace_syscall
   ptrace_syscall_clone_untraced
+  ptrace_syscall_group_stop
   x86/ptrace_sysemu
   ptrace_sysemu_interrupt
   ptrace_sysemu_syscall

@@ -816,6 +816,13 @@ public:
   // (e.g. PTRACE_EVENT_FORK) to the ptracer. prepare_ptrace_cont resumes the
   // task when the ptracer does. Cleared whenever the task is resumed.
   bool held_at_emulated_ptrace_event;
+  // true when the task is at the exit of a syscall, in a group stop (or a
+  // PTRACE_INTERRUPT stop) that we put it in during the syscall, and the
+  // ptracer's resume command at the exit asks for a syscall-exit stop.
+  // Linux reports the syscall-exit stop before the group stop;
+  // prepare_ptrace_cont reports it when the ptracer resumes the task.
+  // Cleared whenever the task is resumed or loses its ptracer.
+  bool syscall_exit_stop_on_resume;
   // true if this task needs to send a SIGCHLD to its ptracer for its
   // emulated ptrace stop
   bool emulated_ptrace_SIGCHLD_pending;
