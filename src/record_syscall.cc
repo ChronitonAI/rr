@@ -536,6 +536,10 @@ struct TaskSyscallState : TaskSyscallStateBase {
 
   RecordTask* emulate_wait_for_child;
 
+  /** For ftruncate and truncate of a regular file that is mapped shared,
+   *  the file's size at syscall entry, otherwise -1. */
+  int64_t mapped_file_size_before;
+
   /** Saved syscall-entry registers, used by code paths that modify the
    *  registers temporarily.
    */
@@ -576,6 +580,7 @@ struct TaskSyscallState : TaskSyscallStateBase {
   TaskSyscallState()
       : t(nullptr),
         emulate_wait_for_child(nullptr),
+        mapped_file_size_before(-1),
         expect_errno(0),
         should_emulate_result(false),
         preparation_done(false),
@@ -4110,6 +4115,30 @@ static Switchable maybe_emulate_proc_mem_write(RecordTask* t,
   return PREVENT_SWITCH;
 }
 
+static bool is_mapped_shared(RecordTask* t, const struct stat& st);
+
+// Stat the file that `path` names, looking it up in the tracee.
+static bool stat_tracee_path(RecordTask* t, remote_ptr<char> path,
+                             struct stat* st) {
+  AutoRemoteSyscalls remote(t);
+  int fd = remote.syscall(syscall_number_for_openat(t->arch()), AT_FDCWD,
+                          path, O_PATH | O_CLOEXEC);
+  if (fd < 0) {
+    return false;
+  }
+  bool ok = stat(t->proc_fd_path(fd).c_str(), st) == 0;
+  remote.infallible_close_syscall_if_alive(fd);
+  return ok;
+}
+
+static void save_mapped_file_size(RecordTask* t,
+                                  TaskSyscallState& syscall_state,
+                                  const struct stat& st) {
+  if (S_ISREG(st.st_mode) && is_mapped_shared(t, st)) {
+    syscall_state.mapped_file_size_before = st.st_size;
+  }
+}
+
 template <typename Arch>
 static Switchable rec_prepare_syscall_arch(RecordTask* t,
                                            TaskSyscallState& syscall_state,
@@ -5913,6 +5942,24 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       return ALLOW_SWITCH;
     }
 
+    case Arch::ftruncate:
+    case Arch::ftruncate64: {
+      struct stat st;
+      if (stat(t->proc_fd_path((int)regs.arg1()).c_str(), &st) == 0) {
+        save_mapped_file_size(t, syscall_state, st);
+      }
+      return PREVENT_SWITCH;
+    }
+
+    case Arch::truncate:
+    case Arch::truncate64: {
+      struct stat st;
+      if (stat_tracee_path(t, remote_ptr<char>(regs.arg1()), &st)) {
+        save_mapped_file_size(t, syscall_state, st);
+      }
+      return PREVENT_SWITCH;
+    }
+
     case Arch::syslog: {
       int type = regs.arg1();
       if (type < 0 || type > 10) {
@@ -7062,6 +7109,60 @@ static bool is_mapped_shared(RecordTask* t, const struct stat& st) {
   return false;
 }
 
+// When a file's size changes, its shared mappings read zeroes in the
+// pages after the one that holds the smaller of the old and new sizes,
+// once the file grows to cover them. The rest of that page is cleared
+// when the file shrinks, and when it grows only on some filesystems
+// (ext4 but not tmpfs, for example). During replay these mappings are
+// backed by emulated files that the size change doesn't reach, so for
+// the part of each mapping beyond `size`, the smaller size, record the
+// rest of that page as it is now and zeroes for the pages after it.
+static void record_file_resize(RecordTask* t, const struct stat& st,
+                               uint64_t size) {
+  if (!S_ISREG(st.st_mode)) {
+    return;
+  }
+  uint64_t size_page_end = ceil_page_size(size);
+  for (AddressSpace* vm : t->session().vms()) {
+    RecordTask* vm_task = nullptr;
+    if (vm == t->vm().get()) {
+      vm_task = t;
+    } else {
+      for (Task* tt : vm->task_set()) {
+        if (!tt->already_exited()) {
+          vm_task = static_cast<RecordTask*>(tt);
+          break;
+        }
+      }
+    }
+    if (!vm_task) {
+      continue;
+    }
+    for (auto& m : vm->maps()) {
+      if (!(m.map.flags() & MAP_SHARED) || !m.mapped_file_stat ||
+          m.mapped_file_stat->st_dev != st.st_dev ||
+          m.mapped_file_stat->st_ino != st.st_ino) {
+        continue;
+      }
+      uint64_t map_offset = m.map.file_offset_bytes();
+      uint64_t map_end = map_offset + m.map.size();
+      uint64_t start = max<uint64_t>(map_offset, size);
+      uint64_t zeroes_start = min(map_end, max(start, size_page_end));
+      if (start < zeroes_start) {
+        vm_task->record_remote_fallible(m.map.start() + (start - map_offset),
+                                        zeroes_start - start);
+      }
+      if (zeroes_start < map_end) {
+        // A raw-data record that is all hole replays as zeroes.
+        uint64_t len = map_end - zeroes_start;
+        t->trace_writer().write_raw_header(
+            vm_task->rec_tid, len, m.map.start() + (zeroes_start - map_offset),
+            { { 0, len } });
+      }
+    }
+  }
+}
+
 // Returns the file path. This could be a blacklisted file so don't
 // do anything for blacklisted files.
 static string handle_opened_file(RecordTask* t, int fd, int flags) {
@@ -7517,6 +7618,12 @@ static void rec_process_syscall_arch(RecordTask* t,
         }
 
         string pathname = handle_opened_file(t, fd, flags);
+        if ((flags & O_TRUNC) && !(flags & O_PATH)) {
+          // Start from the file's size now rather than 0, since other tasks
+          // may have grown the file again while this task was in the open.
+          struct stat st = t->stat_fd(fd);
+          record_file_resize(t, st, st.st_size);
+        }
         bool gcrypt = is_gcrypt_deny_file(pathname.c_str());
         if (gcrypt || is_blacklisted_filename(pathname.c_str())) {
           {
@@ -7531,6 +7638,30 @@ static void rec_process_syscall_arch(RecordTask* t,
           }
           t->set_regs(r);
         }
+      }
+      break;
+    }
+
+    case Arch::ftruncate:
+    case Arch::ftruncate64:
+      if (syscall_state.mapped_file_size_before >= 0 &&
+          !t->regs().syscall_failed()) {
+        struct stat st = t->stat_fd((int)t->regs().orig_arg1());
+        record_file_resize(t, st,
+                           min<uint64_t>(syscall_state.mapped_file_size_before,
+                                         st.st_size));
+      }
+      break;
+
+    case Arch::truncate:
+    case Arch::truncate64: {
+      struct stat st;
+      if (syscall_state.mapped_file_size_before >= 0 &&
+          !t->regs().syscall_failed() &&
+          stat_tracee_path(t, remote_ptr<char>(t->regs().orig_arg1()), &st)) {
+        record_file_resize(t, st,
+                           min<uint64_t>(syscall_state.mapped_file_size_before,
+                                         st.st_size));
       }
       break;
     }

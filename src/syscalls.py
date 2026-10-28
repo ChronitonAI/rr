@@ -516,8 +516,8 @@ munmap = IrregularEmulatedSyscall(x86=91, x64=11, generic=215)
 # The truncate() and ftruncate() functions cause the regular file
 # named by path or referenced by fd to be truncated to a size of
 # precisely length bytes.
-truncate = EmulatedSyscall(x86=92, x64=76, generic=45)
-ftruncate = EmulatedSyscall(x86=93, x64=77, generic=46)
+truncate = IrregularEmulatedSyscall(x86=92, x64=76, generic=45)
+ftruncate = IrregularEmulatedSyscall(x86=93, x64=77, generic=46)
 
 #  int fchmod(int fd, mode_t mode);
 #
@@ -990,8 +990,8 @@ ugetrlimit = EmulatedSyscall(x86=191, arg2="typename Arch::rlimit")
 
 mmap2 = IrregularEmulatedSyscall(x86=192)
 
-truncate64 = EmulatedSyscall(x86=193)
-ftruncate64 = EmulatedSyscall(x86=194)
+truncate64 = IrregularEmulatedSyscall(x86=193)
+ftruncate64 = IrregularEmulatedSyscall(x86=194)
 
 # int stat(const char *path, struct stat *buf);
 #
