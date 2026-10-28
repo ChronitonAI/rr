@@ -482,6 +482,12 @@ enum {
   RR_BPF_TOKEN_CREATE,
 };
 
+// Values of enum bpf_attach_type
+enum {
+  RR_BPF_TRACE_UPROBE_MULTI = 48,
+  RR_BPF_TRACE_UPROBE_SESSION = 57,
+};
+
 #ifndef O_PATH
 #define O_PATH 040000000
 #endif
@@ -642,6 +648,10 @@ struct dma_buf_export_sync_file {
 
 #ifndef ZFS_SUPER_MAGIC
 #define ZFS_SUPER_MAGIC 0x2fc12fc1
+#endif
+
+#ifndef TRACEFS_MAGIC
+#define TRACEFS_MAGIC 0x74726163
 #endif
 
 #ifndef FUSE_DEV_IOC_MAGIC

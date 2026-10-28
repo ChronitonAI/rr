@@ -1511,6 +1511,7 @@ set(BASIC_TESTS
   unexpected_exit_pid_ns
   unjoined_thread
   unshare
+  uprobe_create
   userfaultfd
   utimes
   v4l_dmabuf
