@@ -573,6 +573,11 @@ struct TaskSyscallState : TaskSyscallStateBase {
    *  Only valid when preparation_done is true.
    */
   bool scratch_enabled;
+  /** When true, we didn't use the scratch area because the tracee can't
+   *  access some of the parameters.
+   *  Only valid when preparation_done is true.
+   */
+  bool params_inaccessible;
 
   /** Miscellaneous saved data that can be used by particular syscalls */
   vector<uint8_t> saved_data;
@@ -583,7 +588,8 @@ struct TaskSyscallState : TaskSyscallStateBase {
         expect_errno(0),
         should_emulate_result(false),
         preparation_done(false),
-        scratch_enabled(false) {}
+        scratch_enabled(false),
+        params_inaccessible(false) {}
 };
 
 template <typename Arch>
@@ -691,6 +697,26 @@ Switchable TaskSyscallState::done_preparing_internal(Switchable sw) {
   write_back = WRITE_BACK;
   switchable = sw;
 
+  // We read and write the parameters with ptrace, which ignores the memory's
+  // protection. Note whether the tracee can access them.
+  for (auto& param : param_list) {
+    size_t size = param.num_bytes.incoming_size;
+    int prot = PROT_READ | PROT_WRITE;
+    if (param.mode == IN) {
+      prot = PROT_READ;
+    } else if (param.mode == OUT) {
+      prot = PROT_WRITE;
+    } else if (param.mode == IN_OUT_NO_SCRATCH || size == size_t(-1)) {
+      continue;
+    }
+    if (t->syscall_accessible_prefix(param.dest, size, prot) < size) {
+      LOG(debug) << "`" << t->ev().Syscall().syscall_name()
+                 << "': tracee can't access " << param.dest;
+      params_inaccessible = true;
+      break;
+    }
+  }
+
   if (!t->scratch_ptr) {
     return switchable;
   }
@@ -707,6 +733,15 @@ Switchable TaskSyscallState::done_preparing_internal(Switchable sw) {
     return switchable;
   }
   if (switchable == PREVENT_SWITCH || param_list.empty()) {
+    return switchable;
+  }
+  if (params_inaccessible) {
+    // If the kernel touches the memory that the tracee can't access, it fails
+    // the syscall with EFAULT as it would without rr. If it doesn't, the
+    // syscall works, but without scratch, as above.
+    LOG(warn) << "`" << t->ev().Syscall().syscall_name()
+              << "' has a parameter that the tracee can't access. Allowing "
+                 "the syscall to proceed without scratch, which may race.";
     return switchable;
   }
 
@@ -802,6 +837,22 @@ size_t TaskSyscallState::eval_param_size(size_t i,
   return size;
 }
 
+/**
+ * Record what the kernel may have written to [addr, addr + size) for a
+ * syscall of |t| although some of that memory is inaccessible: the part up
+ * to the first byte that |t| can't write. When the syscall failed with
+ * EFAULT, the kernel may also have written past such a byte, e.g.
+ * get_mempolicy() clears the tail of the nodemask before it copies the head.
+ * That happens within a page of the start of a parameter.
+ */
+static void record_writable_fallible(RecordTask* t, remote_ptr<void> addr,
+                                     size_t size, bool efault) {
+  for (const MemoryRange& range :
+       t->syscall_writable_ranges(addr, size, efault ? page_size() : 0)) {
+    t->record_remote_fallible(range);
+  }
+}
+
 void TaskSyscallState::process_syscall_results() {
   ASSERT(t, preparation_done);
 
@@ -892,13 +943,38 @@ void TaskSyscallState::process_syscall_results() {
       }
     }
     ASSERT(t, saved_data.empty());
-    // Step 3: record all output memory areas
+    // Step 3: record all output memory areas, except the OUT parameters of a
+    // failed syscall. A syscall that fails with EFAULT may have written part
+    // of them, though, e.g. a recvfrom() that received data into its buffer
+    // and then failed to store the source address. That includes faults that
+    // our model of the tracee's memory doesn't predict, e.g. on a page past
+    // the end of a mapped file. Their sizes can be smaller than what the
+    // kernel wrote, e.g. when they come from the result. With an inaccessible
+    // parameter, a syscall that succeeds may also have written more than a
+    // size in memory says, e.g. a recvmmsg() that received a second message
+    // and then failed to store its flags, so that its msg_len is stale. We
+    // can't tell how much, so record those parameters in full, except where
+    // the tracee can't write.
+    bool efault = (should_emulate_result ? (int64_t)emulated_result
+                                         : t->regs().syscall_result_signed()) ==
+                  -EFAULT;
     for (size_t i = 0; i < param_list.size(); ++i) {
       auto& param = param_list[i];
       size_t size = actual_sizes[i];
-      if (param.mode != IN && (param.mode != OUT || !syscall_failed)) {
-        t->record_remote(param.dest, size);
+      if (param.mode == IN ||
+          (param.mode == OUT && syscall_failed && !efault)) {
+        continue;
       }
+      if (!efault && !params_inaccessible) {
+        t->record_remote(param.dest, size);
+        continue;
+      }
+      if ((efault || (!syscall_failed && !param.num_bytes.mem_ptr.is_null())) &&
+          (param.mode == OUT || param.mode == IN_OUT) &&
+          param.num_bytes.incoming_size < size_t(-1)) {
+        size = max(size, param.num_bytes.incoming_size);
+      }
+      record_writable_fallible(t, param.dest, size, efault);
     }
   }
 

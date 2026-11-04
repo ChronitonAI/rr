@@ -470,6 +470,20 @@ public:
    * Return true if there is some mapping for the byte at 'addr'.
    */
   bool has_mapping(remote_ptr<void> addr) const;
+  /**
+   * Return the size of the longest prefix of [addr, addr + len) that the
+   * tracee can access with |prot|, according to our model of its memory.
+   */
+  size_t accessible_prefix(remote_ptr<void> addr, size_t len, int prot) const;
+  /**
+   * Return the parts of [addr, addr + len) that the tracee can write,
+   * according to our model of its memory: the part up to the first byte that
+   * it can't write, and then the parts that it can write before
+   * addr + gap_limit. They don't cross the boundary of a mapping that rr
+   * creates for itself (see Mapping::flags).
+   */
+  std::vector<MemoryRange> writable_ranges(remote_ptr<void> addr, size_t len,
+                                           size_t gap_limit) const;
 
   /**
    * If the given memory region is mapped into the local address space, obtain

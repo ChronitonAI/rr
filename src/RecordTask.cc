@@ -1920,7 +1920,8 @@ ssize_t RecordTask::record_remote_fallible(remote_ptr<void> addr,
       ASSERT(this, hole_iter->offset > offset);
       bytes = min(bytes, uintptr_t(hole_iter->offset) - offset);
     }
-    if (record_remote_by_local_map(addr + offset, bytes)) {
+    if (uint8_t* local_addr = as->local_mapping(addr + offset, bytes)) {
+      trace_writer().write_raw_data(local_addr, bytes);
       offset += bytes;
       continue;
     }

@@ -1,0 +1,20 @@
+source `dirname $0`/util.sh
+record $TESTNAME
+replay
+# The test prints the addresses of memory that the kernel doesn't write for
+# its syscalls that fail with EINVAL or EFAULT. rr must not record any of it
+# for those syscalls, nor its own memory after RR_PAGE_ADDR (0x70000000).
+einval=$(sed -n 's/^EINVAL buffer: //p' record.out)
+efault=$(sed -n 's/^EFAULT buffer: //p' record.out)
+if [[ -z "$einval" || -z "$efault" ]]; then
+  failed ": no EINVAL or EFAULT buffer in record.out"
+elif get_events -m | awk -v addrs="addr:($einval|$efault|0x70001000)," '
+    /event:/ {
+      s = $0 ~ /SYSCALL: (readv|rt_sigpending|getgroups). .state:EXITING/
+    }
+    s && $0 ~ addrs { found = 1 }
+    END { exit !found }'; then
+  failed ": recorded memory that the kernel didn't write"
+else
+  check EXIT-SUCCESS
+fi

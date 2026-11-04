@@ -1763,6 +1763,7 @@ set(TESTS_WITH_PROGRAM
   threaded_syscall_spam
   threads
   tls
+  traced_syscall_efault
   tracee_unmap_vdso
   ttyname
   unexpected_stack_growth

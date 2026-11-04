@@ -949,6 +949,66 @@ void* AddressSpace::detach_local_mapping(remote_ptr<void> addr) {
   return p;
 }
 
+size_t AddressSpace::accessible_prefix(remote_ptr<void> addr, size_t len,
+                                       int prot) const {
+  remote_ptr<void> end = addr + len;
+  if (end < addr) {
+    end = remote_ptr<void>(UINTPTR_MAX);
+  }
+  remote_ptr<void> p = addr;
+  while (p < end && has_mapping(p)) {
+    const KernelMapping& m = mapping_of(p).map;
+    if ((m.prot() & prot) != prot) {
+      break;
+    }
+    p = m.end();
+  }
+  return min(p, end) - addr;
+}
+
+vector<MemoryRange> AddressSpace::writable_ranges(remote_ptr<void> addr,
+                                                  size_t len,
+                                                  size_t gap_limit) const {
+  remote_ptr<void> end = addr + len;
+  if (end < addr) {
+    end = remote_ptr<void>(UINTPTR_MAX);
+  }
+  remote_ptr<void> gap_end = addr + min(len, gap_limit);
+  if (gap_end < addr) {
+    gap_end = end;
+  }
+  const Mapping* first = has_mapping(addr) ? &mapping_of(addr) : nullptr;
+  bool in_rr_mapping = first && first->flags;
+  vector<MemoryRange> ranges;
+  // The walk stops here. That's |gap_end| once we've seen memory that the
+  // tracee can't write.
+  remote_ptr<void> limit = end;
+  remote_ptr<void> p = addr;
+  for (const auto& m : Maps(*this, first ? first->map.start() : addr)) {
+    remote_ptr<void> start = max(m.map.start(), addr);
+    if (start > p) {
+      limit = min(limit, gap_end);
+    }
+    if (start >= limit) {
+      break;
+    }
+    remote_ptr<void> stop = min(m.map.end(), limit);
+    p = stop;
+    // Don't cross the boundary of a mapping that rr creates for itself.
+    if (!(m.map.prot() & PROT_WRITE) ||
+        (in_rr_mapping ? &m != first : m.flags != 0)) {
+      limit = min(limit, gap_end);
+      continue;
+    }
+    if (!ranges.empty() && ranges.back().end() == start) {
+      ranges.back() = MemoryRange(ranges.back().start(), stop);
+    } else {
+      ranges.push_back(MemoryRange(start, stop));
+    }
+  }
+  return ranges;
+}
+
 bool AddressSpace::has_mapping(remote_ptr<void> addr) const {
   if (addr + page_size() < addr) {
     // Assume the last byte in the address space is never mapped; avoid overflow
