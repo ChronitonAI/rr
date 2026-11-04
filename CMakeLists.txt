@@ -1490,6 +1490,7 @@ set(BASIC_TESTS
   timerfd
   times
   x86/tpause
+  traced_syscall_efault
   truncate_temp
   tty_tostop
   tun

@@ -96,6 +96,7 @@ Task::Task(Session& session, pid_t _tid, pid_t _rec_tid, uint32_t serial,
       in_unexpected_exit(false),
       in_injectable_signal_stop_(false),
       seccomp_bpf_enabled(false),
+      tagged_addr_abi(false),
       registers_dirty(false),
       orig_syscallno_dirty(false),
       extra_registers(a),
@@ -697,6 +698,12 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
           }
           did_prctl_set_prname(regs.arg2());
           break;
+        case PR_SET_TAGGED_ADDR_CTRL:
+          if (regs.syscall_failed()) {
+            return;
+          }
+          tagged_addr_abi = regs.arg2() & PR_TAGGED_ADDR_ENABLE;
+          break;
         case PR_SET_VMA: {
           switch ((unsigned long)regs.arg2()) {
             case PR_SET_VMA_ANON_NAME: {
@@ -1116,6 +1123,8 @@ void Task::post_exec(const string& exe_file) {
   syscallbuf_size = 0;
   scratch_ptr = nullptr;
   cloned_file_data_fd_child = -1;
+  // The kernel disables the tagged address ABI at exec.
+  tagged_addr_abi = false;
   desched_fd_child = -1;
   preload_globals = nullptr;
   rseq_state = nullptr;
@@ -1156,6 +1165,16 @@ void Task::post_exec_syscall(const std::string& original_exe_file) {
 }
 
 bool Task::execed() const { return tg->execed; }
+
+size_t Task::syscall_accessible_prefix(remote_ptr<void> addr, size_t len,
+                                       int prot) {
+  if (tagged_addr_abi) {
+    // The kernel ignores the tag (see access_ok() in
+    // arch/arm64/include/asm/uaccess.h).
+    addr = aarch64_untagged_addr(addr);
+  }
+  return vm()->accessible_prefix(addr, len, prot);
+}
 
 void Task::unmap_dead_syscallbufs_if_required() {
   if (!as->regions_pending_unmap.empty()) {
@@ -2696,6 +2715,7 @@ Task* Task::clone(CloneReason reason, int flags, remote_ptr<void> stack,
   t->syscallbuf_size = syscallbuf_size;
   t->preload_globals = preload_globals;
   t->seccomp_bpf_enabled = seccomp_bpf_enabled;
+  t->tagged_addr_abi = tagged_addr_abi;
 
   // FdTable is either shared or copied, so the contents of
   // syscallbuf_fds_disabled_child are still valid.
@@ -2965,6 +2985,7 @@ Task::CapturedState Task::capture_state() {
   state.wait_status = wait_status;
   state.ticks = ticks;
   state.top_of_stack = top_of_stack;
+  state.tagged_addr_abi = tagged_addr_abi;
   return state;
 }
 
@@ -3011,6 +3032,7 @@ void Task::copy_state(const CapturedState& state) {
 
   ticks = state.ticks;
   own_namespace_rec_tid = state.own_namespace_rec_tid;
+  tagged_addr_abi = state.tagged_addr_abi;
   if (state.rseq_state) {
     rseq_state = make_unique<RseqState>(*state.rseq_state);
   }

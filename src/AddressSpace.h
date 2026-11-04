@@ -470,6 +470,11 @@ public:
    * Return true if there is some mapping for the byte at 'addr'.
    */
   bool has_mapping(remote_ptr<void> addr) const;
+  /**
+   * Return the size of the longest prefix of [addr, addr + len) that the
+   * tracee can access with |prot|, according to our model of its memory.
+   */
+  size_t accessible_prefix(remote_ptr<void> addr, size_t len, int prot) const;
 
   /**
    * If the given memory region is mapped into the local address space, obtain

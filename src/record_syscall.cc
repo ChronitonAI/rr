@@ -571,6 +571,11 @@ struct TaskSyscallState : TaskSyscallStateBase {
    *  Only valid when preparation_done is true.
    */
   bool scratch_enabled;
+  /** When true, we didn't use the scratch area because the tracee can't
+   *  access some of the parameters.
+   *  Only valid when preparation_done is true.
+   */
+  bool params_inaccessible;
 
   /** Miscellaneous saved data that can be used by particular syscalls */
   vector<uint8_t> saved_data;
@@ -581,7 +586,8 @@ struct TaskSyscallState : TaskSyscallStateBase {
         expect_errno(0),
         should_emulate_result(false),
         preparation_done(false),
-        scratch_enabled(false) {}
+        scratch_enabled(false),
+        params_inaccessible(false) {}
 };
 
 template <typename Arch>
@@ -689,6 +695,26 @@ Switchable TaskSyscallState::done_preparing_internal(Switchable sw) {
   write_back = WRITE_BACK;
   switchable = sw;
 
+  // We read and write the parameters with ptrace, which ignores the memory's
+  // protection. Note whether the tracee can access them.
+  for (auto& param : param_list) {
+    size_t size = param.num_bytes.incoming_size;
+    int prot = PROT_READ | PROT_WRITE;
+    if (param.mode == IN) {
+      prot = PROT_READ;
+    } else if (param.mode == OUT) {
+      prot = PROT_WRITE;
+    } else if (param.mode == IN_OUT_NO_SCRATCH || size == size_t(-1)) {
+      continue;
+    }
+    if (t->syscall_accessible_prefix(param.dest, size, prot) < size) {
+      LOG(debug) << "`" << t->ev().Syscall().syscall_name()
+                 << "': tracee can't access " << param.dest;
+      params_inaccessible = true;
+      break;
+    }
+  }
+
   if (!t->scratch_ptr) {
     return switchable;
   }
@@ -705,6 +731,15 @@ Switchable TaskSyscallState::done_preparing_internal(Switchable sw) {
     return switchable;
   }
   if (switchable == PREVENT_SWITCH || param_list.empty()) {
+    return switchable;
+  }
+  if (params_inaccessible) {
+    // If the kernel touches the memory that the tracee can't access, it fails
+    // the syscall with EFAULT as it would without rr. If it doesn't, the
+    // syscall works, but without scratch, as above.
+    LOG(warn) << "`" << t->ev().Syscall().syscall_name()
+              << "' has a parameter that the tracee can't access. Allowing "
+                 "the syscall to proceed without scratch, which may race.";
     return switchable;
   }
 
@@ -892,12 +927,31 @@ void TaskSyscallState::process_syscall_results() {
     }
     ASSERT(t, saved_data.empty());
     // Step 3: record all output memory areas
+    // If a parameter is inaccessible, the kernel may have written to the
+    // others before it failed, e.g. a recvfrom() that received data into its
+    // buffer and then failed to store the source address. Or it may have
+    // written more than their sizes say, e.g. a recvmmsg() that received a
+    // second message and then failed to store its flags, so that its msg_len
+    // is stale. We can't tell how much, so record those parameters in full,
+    // except where the tracee can't write.
+    bool failed = t->regs().syscall_failed();
     for (size_t i = 0; i < param_list.size(); ++i) {
       auto& param = param_list[i];
       size_t size = actual_sizes[i];
-      if (param.mode != IN) {
-        t->record_remote(param.dest, size);
+      if (param.mode == IN) {
+        continue;
       }
+      if (!params_inaccessible) {
+        t->record_remote(param.dest, size);
+        continue;
+      }
+      if ((param.mode == OUT || param.mode == IN_OUT) &&
+          param.num_bytes.incoming_size < size_t(-1) &&
+          (failed || !param.num_bytes.mem_ptr.is_null())) {
+        size = max(size, param.num_bytes.incoming_size);
+      }
+      size = t->syscall_accessible_prefix(param.dest, size, PROT_WRITE);
+      t->record_remote_fallible(param.dest, size);
     }
   }
 

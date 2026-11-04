@@ -949,6 +949,23 @@ void* AddressSpace::detach_local_mapping(remote_ptr<void> addr) {
   return p;
 }
 
+size_t AddressSpace::accessible_prefix(remote_ptr<void> addr, size_t len,
+                                       int prot) const {
+  remote_ptr<void> end = addr + len;
+  if (end < addr) {
+    end = remote_ptr<void>(UINTPTR_MAX);
+  }
+  remote_ptr<void> p = addr;
+  while (p < end && has_mapping(p)) {
+    const KernelMapping& m = mapping_of(p).map;
+    if ((m.prot() & prot) != prot) {
+      break;
+    }
+    p = m.end();
+  }
+  return min(p, end) - addr;
+}
+
 bool AddressSpace::has_mapping(remote_ptr<void> addr) const {
   if (addr + page_size() < addr) {
     // Assume the last byte in the address space is never mapped; avoid overflow
