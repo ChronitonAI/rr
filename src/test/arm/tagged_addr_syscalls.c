@@ -68,8 +68,23 @@ static void check_tag(uintptr_t tag) {
 }
 
 int main(void) {
+  int fds[2];
+  char buf[16];
+  struct iovec iov;
   size_t i;
   int ret;
+
+  /* Without the tagged address ABI, the kernel rejects tagged pointers. */
+  test_assert(0 == pipe(fds));
+  test_assert(5 == write(fds[1], "hello", 5));
+  for (i = 0; i < sizeof(tags) / sizeof(tags[0]); ++i) {
+    iov.iov_base = tagged(buf, tags[i]);
+    iov.iov_len = sizeof(buf);
+    ret = readv(fds[0], &iov, 1);
+    test_assert(ret == -1 && errno == EFAULT);
+  }
+  test_assert(0 == close(fds[0]));
+  test_assert(0 == close(fds[1]));
 
   ret = prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE, 0, 0, 0);
   if (ret == -1 && errno == EINVAL) {
