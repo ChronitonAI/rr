@@ -21,6 +21,9 @@ public:
 
   virtual Type type() override { return Mmapped; }
   void revive() { dead_ = false; }
+  // The monitored file's device and inode (the recorded ones during replay).
+  dev_t device() const { return device_; }
+  ino_t inode() const { return inode_; }
   // If this write could potentially affect memory we need to PREVENT_SWITCH,
   // since the timing of the write is otherwise unpredictable from our
   // perspective.

@@ -6,6 +6,7 @@
 #include <sys/types.h>
 
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <stack>
 #include <string>
@@ -223,6 +224,12 @@ struct OpenedFd {
   ino_t inode;
 };
 
+struct ResizedFile {
+  dev_t device;
+  ino_t inode;
+  uint64_t size;
+};
+
 struct SyscallEvent {
   /** Syscall |syscallno| is the syscall number. */
   SyscallEvent(int syscallno, SupportedArch arch)
@@ -267,6 +274,9 @@ struct SyscallEvent {
   // the range indicated by its parameters, and an unsuccessful madvise affected
   // nothing.
   std::vector<MemoryRange> madvise_ranges;
+  // For a truncate() or O_TRUNC open of a file that is mapped shared, the
+  // file and its size when the syscall returned.
+  std::optional<ResizedFile> resized_file;
 
   SyscallState state;
   // Syscall number.

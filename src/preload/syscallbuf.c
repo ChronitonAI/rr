@@ -2500,11 +2500,11 @@ static int supported_open(const char* file_name, int flags) {
        syscall buffering. */
     return 0;
   }
-  /* Writeable opens need to go to rr to be checked in case
-     they could write to a mapped file.
+  /* Writeable and truncating opens need to go to rr to be checked in
+     case they could write to or truncate a mapped file.
      But if they're O_EXCL | O_CREAT, a new file must be created
      so that will be fine. */
-  return !(flags & (O_RDWR | O_WRONLY)) ||
+  return !(flags & (O_RDWR | O_WRONLY | O_TRUNC)) ||
     (flags & (O_EXCL | O_CREAT)) == (O_EXCL | O_CREAT);
 }
 
@@ -4332,7 +4332,6 @@ case SYS_epoll_pwait:
 #if defined(SYS_time)
     CASE(time);
 #endif
-    CASE_GENERIC_NONBLOCKING(truncate);
     CASE(uname);
 #if defined(SYS_unlink)
     CASE_GENERIC_NONBLOCKING(unlink);

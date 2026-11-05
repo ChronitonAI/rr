@@ -575,6 +575,23 @@ struct TaskSyscallState : TaskSyscallStateBase {
   /** Miscellaneous saved data that can be used by particular syscalls */
   vector<uint8_t> saved_data;
 
+  /** For a syscall that may change the size of a file whose last page is
+   *  mapped shared, the file and its size when the syscall started. See
+   *  prepare_file_tail. */
+  struct FileTail {
+    dev_t device;
+    ino_t inode;
+    uint64_t size;
+    // The fd that the syscall changes the file through, or -1 for
+    // truncate().
+    int fd;
+  };
+  std::optional<FileTail> file_tail;
+
+  /** For truncate(), the file that its path named when the syscall
+   *  started, if any file was mapped shared. */
+  ScopedFd truncated_file;
+
   TaskSyscallState()
       : t(nullptr),
         emulate_wait_for_child(nullptr),
@@ -6022,6 +6039,186 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
   }
 }
 
+// Returns a task of |vm| that hasn't exited, or null.
+static RecordTask* live_task_of(AddressSpace* vm) {
+  for (Task* t : vm->task_set()) {
+    if (!t->already_exited()) {
+      return static_cast<RecordTask*>(t);
+    }
+  }
+  return nullptr;
+}
+
+// Whether a live address space maps any file MAP_SHARED.
+static bool has_shared_file_mappings(RecordTask* t) {
+  for (AddressSpace* vm : t->session().vms()) {
+    if (!live_task_of(vm)) {
+      continue;
+    }
+    for (auto& m : vm->maps()) {
+      if ((m.map.flags() & MAP_SHARED) && m.mapped_file_stat) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Finds a MAP_SHARED mapping of the file in a live address space: one
+// that maps file offset |offset|, or any one if |offset| is negative.
+// Returns a live task of that address space, and in |addr|, if it isn't
+// null, the address that |offset| is mapped at.
+static RecordTask* find_shared_mapping(RecordTask* t, dev_t device,
+                                       ino_t inode, int64_t offset,
+                                       remote_ptr<void>* addr) {
+  for (AddressSpace* vm : t->session().vms()) {
+    RecordTask* vm_task = live_task_of(vm);
+    if (!vm_task) {
+      continue;
+    }
+    for (auto& m : vm->maps()) {
+      const KernelMapping& km = m.map;
+      if (!(km.flags() & MAP_SHARED) || !m.mapped_file_stat ||
+          km.device() != device || km.inode() != inode) {
+        continue;
+      }
+      if (offset < 0) {
+        return vm_task;
+      }
+      uint64_t start = km.file_offset_bytes();
+      if (uint64_t(offset) >= start && uint64_t(offset) - start < km.size()) {
+        if (addr) {
+          *addr = km.start() + (uint64_t(offset) - start);
+        }
+        return vm_task;
+      }
+    }
+  }
+  return nullptr;
+}
+
+// Opens, with O_PATH, the file that |path| names in the tracee, so that
+// its root, working directory and /proc/self apply.
+static ScopedFd open_tracee_path(RecordTask* t, remote_ptr<char> path) {
+  AutoRemoteSyscalls remote(t);
+  int fd = remote.syscall(syscall_number_for_openat(t->arch()), AT_FDCWD,
+                          path, O_PATH | O_CLOEXEC);
+  if (fd < 0) {
+    LOG(debug) << "Can't open the path of a truncated file: "
+               << errno_name(-fd);
+    return ScopedFd();
+  }
+  ScopedFd file = t->open_fd(fd, O_PATH | O_CLOEXEC);
+  remote.infallible_close_syscall_if_alive(fd);
+  return file;
+}
+
+// Returns the length that ftruncate() or truncate() sets.
+template <typename Arch>
+static uint64_t truncate_length(int syscallno, const Registers& regs) {
+  if (syscallno == Arch::ftruncate64 || syscallno == Arch::truncate64) {
+    // x86-32 passes the 64-bit length in two registers.
+    return uint32_t(regs.arg2()) | (uint64_t(uint32_t(regs.arg3())) << 32);
+  }
+  return typename Arch::unsigned_word(regs.arg2());
+}
+
+// Bytes past the end of a file, in its last page, can be written through
+// MAP_SHARED mappings. Syscalls that change the file's size clear some or
+// all of them on btrfs and ext4 and keep them on tmpfs; fallocate() and
+// ftruncate() to the same size can clear them too, and so can writeback
+// on btrfs and ext4, at times rr doesn't see. Replay's EmuFile keeps
+// them, unless replay sets its size below the end of that page. So for a
+// syscall that may change the size of a file whose last page is mapped
+// shared, note the file and its size, and after the syscall record those
+// bytes through the mapping (see record_file_tail). Shrinking the file
+// clears them everywhere, so ftruncate() and truncate() to a smaller size
+// need nothing.
+template <typename Arch>
+static void prepare_file_tail(RecordTask* t, TaskSyscallState& syscall_state,
+                              const struct stat& st, int fd) {
+  uint64_t size = st.st_size;
+  if (!S_ISREG(st.st_mode) || size == ceil_page_size(size)) {
+    return;
+  }
+  int syscallno = t->ev().Syscall().number;
+  if ((syscallno == Arch::ftruncate || syscallno == Arch::ftruncate64 ||
+       syscallno == Arch::truncate || syscallno == Arch::truncate64) &&
+      truncate_length<Arch>(syscallno, syscall_state.syscall_entry_registers) <
+          size) {
+    return;
+  }
+  if (!find_shared_mapping(t, st.st_dev, st.st_ino, size, nullptr)) {
+    return;
+  }
+  syscall_state.file_tail =
+      TaskSyscallState::FileTail{ st.st_dev, st.st_ino, size, fd };
+}
+
+template <typename Arch>
+static void prepare_file_size_change_arch(RecordTask* t,
+                                          TaskSyscallState& syscall_state) {
+  const Registers& regs = syscall_state.syscall_entry_registers;
+  int fd;
+  switch (t->ev().Syscall().number) {
+    case Arch::truncate:
+    case Arch::truncate64: {
+      if (!has_shared_file_mappings(t)) {
+        return;
+      }
+      ScopedFd file = open_tracee_path(t, remote_ptr<char>(regs.orig_arg1()));
+      struct stat st;
+      if (!file.is_open() || fstat(file, &st) < 0) {
+        return;
+      }
+      syscall_state.truncated_file = std::move(file);
+      prepare_file_tail<Arch>(t, syscall_state, st, -1);
+      return;
+    }
+    case Arch::ftruncate:
+    case Arch::ftruncate64:
+    case Arch::fallocate:
+    case Arch::write:
+    case Arch::writev:
+    case Arch::pwrite64:
+    case Arch::pwritev:
+    case Arch::pwritev2:
+    case Arch::sendfile:
+    case Arch::sendfile64:
+      fd = (int)regs.orig_arg1_signed();
+      break;
+    case Arch::splice:
+      fd = (int)regs.arg3_signed();
+      break;
+    default:
+      return;
+  }
+  FileMonitor* monitor = t->fd_table()->get_monitor(fd);
+  if (!monitor || monitor->type() != FileMonitor::Mmapped) {
+    return;
+  }
+  auto mmapped = static_cast<MmappedFileMonitor*>(monitor);
+  if (!find_shared_mapping(t, mmapped->device(), mmapped->inode(), -1,
+                           nullptr)) {
+    return;
+  }
+  struct stat st;
+  if (stat(t->proc_fd_path(fd).c_str(), &st) < 0) {
+    return;
+  }
+  prepare_file_tail<Arch>(t, syscall_state, st, fd);
+}
+
+static void prepare_file_size_change(RecordTask* t,
+                                     TaskSyscallState& syscall_state) {
+  if (t->regs().original_syscallno() == SECCOMP_MAGIC_SKIP_ORIGINAL_SYSCALLNO ||
+      t->desched_rec()) {
+    return;
+  }
+  RR_ARCH_FUNCTION(prepare_file_size_change_arch, t->ev().Syscall().arch(),
+                   t, syscall_state);
+}
+
 static Switchable rec_prepare_syscall_internal(
     RecordTask* t, TaskSyscallState& syscall_state) {
   SupportedArch arch = t->ev().Syscall().arch();
@@ -6038,7 +6235,9 @@ Switchable rec_prepare_syscall(RecordTask* t) {
   syscall_state.init(t);
 
   Switchable s = rec_prepare_syscall_internal(t, syscall_state);
-  return syscall_state.done_preparing(s);
+  s = syscall_state.done_preparing(s);
+  prepare_file_size_change(t, syscall_state);
+  return s;
 }
 
 void rec_abort_prepared_syscall(RecordTask* t) {
@@ -7147,11 +7346,87 @@ static bool is_mapped_shared(RecordTask* t, const struct stat& st) {
   return false;
 }
 
+// Record the file and its size in the trace, so replay can resize its
+// EmuFile, if it is a regular file that is mapped shared.
+static void record_resized_file(RecordTask* t, const struct stat& st) {
+  if (S_ISREG(st.st_mode) && is_mapped_shared(t, st)) {
+    t->ev().Syscall().resized_file =
+        ResizedFile{ st.st_dev, st.st_ino, (uint64_t)st.st_size };
+  }
+}
+
+// See prepare_file_tail. After a syscall that may have changed the bytes
+// past the end of the file in its old last page, record them through a
+// mapping. ftruncate(), truncate() and fallocate() can change them while
+// keeping the size; writes change them only by growing the file. Zeroes
+// at the end of those bytes, often all of them, are recorded as a hole:
+// the trace stores no data for them, and replay writes zeroes.
+template <typename Arch>
+static void record_file_tail(RecordTask* t, TaskSyscallState& syscall_state) {
+  const TaskSyscallState::FileTail& tail = *syscall_state.file_tail;
+  int syscallno = t->ev().Syscall().number;
+  if (t->regs().syscall_failed()) {
+    return;
+  }
+  if (syscallno != Arch::ftruncate && syscallno != Arch::ftruncate64 &&
+      syscallno != Arch::truncate && syscallno != Arch::truncate64 &&
+      syscallno != Arch::fallocate) {
+    int64_t offset = -1;
+    if (syscallno == Arch::pwrite64 || syscallno == Arch::pwritev ||
+        syscallno == Arch::pwritev2) {
+      FileMonitor::LazyOffset lazy_offset(
+          t, syscall_state.syscall_entry_registers, syscallno);
+      offset = lazy_offset.retrieve(false);
+    }
+    // A write at an offset that ends past the old end grew the file. Other
+    // writes may have grown it too, by appending (O_APPEND).
+    int64_t written = t->regs().syscall_result_signed();
+    if (offset < 0 || written <= 0 || uint64_t(offset + written) <= tail.size) {
+      struct stat st;
+      if (stat(t->proc_fd_path(tail.fd).c_str(), &st) < 0 ||
+          st.st_dev != tail.device || st.st_ino != tail.inode ||
+          uint64_t(st.st_size) <= tail.size) {
+        return;
+      }
+    }
+  }
+  remote_ptr<void> addr;
+  RecordTask* mapping_task =
+      find_shared_mapping(t, tail.device, tail.inode, tail.size, &addr);
+  if (!mapping_task) {
+    return;
+  }
+  size_t size = ceil_page_size(tail.size) - tail.size;
+  vector<uint8_t> bytes(size);
+  if (mapping_task->read_bytes_fallible(addr, size, bytes.data()) !=
+      ssize_t(size)) {
+    return;
+  }
+  size_t data_size = size;
+  while (data_size > 0 && !bytes[data_size - 1]) {
+    --data_size;
+  }
+  vector<WriteHole> holes;
+  if (data_size < size) {
+    holes.push_back(WriteHole{ data_size, size - data_size });
+  }
+  TraceWriter& trace = mapping_task->trace_writer();
+  trace.write_raw_data(bytes.data(), data_size);
+  trace.write_raw_header(mapping_task->rec_tid, size, addr, holes);
+}
+
 // Returns the file path. This could be a blacklisted file so don't
 // do anything for blacklisted files.
 static string handle_opened_file(RecordTask* t, int fd, int flags) {
   string pathname = t->file_name_of_fd(fd);
   struct stat st = t->stat_fd(fd);
+
+  if ((flags & O_TRUNC) && !(flags & O_PATH)) {
+    // The open truncated the file (O_RDONLY | O_TRUNC does too). Other
+    // tasks may have run and written to it since, so record the size it
+    // has now.
+    record_resized_file(t, st);
+  }
 
   // This must be kept in sync with replay_syscall's handle_opened_files.
   FileMonitor* file_monitor = nullptr;
@@ -7381,6 +7656,10 @@ static void rec_process_syscall_arch(RecordTask* t,
       t->session().scheduler().did_exit_execve(t);
     }
     return;
+  }
+
+  if (syscall_state.file_tail) {
+    record_file_tail<Arch>(t, syscall_state);
   }
 
   // Here we handle syscalls that need work that can only happen after the
@@ -7625,6 +7904,18 @@ static void rec_process_syscall_arch(RecordTask* t,
       }
       break;
     }
+
+    case Arch::truncate:
+    case Arch::truncate64:
+      // The file and its size when the syscall returned.
+      if (!t->regs().syscall_failed() &&
+          syscall_state.truncated_file.is_open()) {
+        struct stat st;
+        if (fstat(syscall_state.truncated_file, &st) == 0) {
+          record_resized_file(t, st);
+        }
+      }
+      break;
 
     case SYS_rrcall_notify_control_msg: {
       auto msg =

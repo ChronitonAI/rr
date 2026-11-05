@@ -1105,6 +1105,36 @@ static void handle_opened_files(ReplayTask* t, int flags) {
   }
 }
 
+// Returns the EmuFile that a monitored fd refers to, if there is one.
+static EmuFile::shr_ptr emu_file_for_fd(ReplayTask* t, int fd) {
+  FileMonitor* monitor = t->fd_table()->get_monitor(fd);
+  if (!monitor || monitor->type() != FileMonitor::Type::Mmapped) {
+    return nullptr;
+  }
+  auto mmapped = static_cast<MmappedFileMonitor*>(monitor);
+  return t->session().emufs().find(mmapped->device(), mmapped->inode());
+}
+
+template <typename Arch>
+static uint64_t ftruncate_length(int syscallno, const Registers& regs) {
+  if (syscallno == Arch::ftruncate64) {
+    // x86-32 passes the 64-bit length in two registers.
+    return uint32_t(regs.arg2()) | (uint64_t(uint32_t(regs.arg3())) << 32);
+  }
+  return typename Arch::unsigned_word(regs.arg2());
+}
+
+// Returns fallocate()'s offset and length.
+template <typename Arch>
+static pair<uint64_t, uint64_t> fallocate_range(const Registers& regs) {
+  if (sizeof(typename Arch::unsigned_word) == 4) {
+    // x86-32 passes the 64-bit offset and length in two registers each.
+    return { uint32_t(regs.arg3()) | (uint64_t(uint32_t(regs.arg4())) << 32),
+             uint32_t(regs.arg5()) | (uint64_t(uint32_t(regs.arg6())) << 32) };
+  }
+  return { regs.arg3(), regs.arg4() };
+}
+
 template <typename Arch>
 static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
                                      const Registers& trace_regs) {
@@ -1157,6 +1187,17 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
         break;
       default:
         return;
+    }
+  }
+
+  // A truncate() or an O_TRUNC open recorded the size of a file that is
+  // mapped shared.
+  const auto& resized = trace_frame.event().Syscall().resized_file;
+  if (resized) {
+    EmuFile::shr_ptr emu_file =
+        t->session().emufs().find(resized->device, resized->inode);
+    if (emu_file) {
+      emu_file->set_size(resized->size);
     }
   }
 
@@ -1355,6 +1396,34 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
     case Arch::creat:
       handle_opened_files(t, O_CREAT | O_WRONLY | O_TRUNC);
       break;
+
+    case Arch::ftruncate:
+    case Arch::ftruncate64: {
+      EmuFile::shr_ptr emu_file =
+          emu_file_for_fd(t, (int)trace_regs.orig_arg1());
+      if (emu_file) {
+        emu_file->set_size(ftruncate_length<Arch>(sys, trace_regs));
+      }
+      break;
+    }
+
+    case Arch::fallocate: {
+      // Grow the EmuFile where fallocate() grew the file.
+      int mode = (int)trace_regs.arg2();
+      EmuFile::shr_ptr emu_file =
+          emu_file_for_fd(t, (int)trace_regs.orig_arg1());
+      if (emu_file && !(mode & FALLOC_FL_KEEP_SIZE)) {
+        auto range = fallocate_range<Arch>(trace_regs);
+        if (mode & FALLOC_FL_INSERT_RANGE) {
+          // The file grew by the length.
+          emu_file->ensure_size(emu_file->size() + range.second);
+        } else if (!(mode & FALLOC_FL_COLLAPSE_RANGE)) {
+          // The file grew to at least the end of the range.
+          emu_file->ensure_size(range.first + range.second);
+        }
+      }
+      break;
+    }
 
     case Arch::write:
     case Arch::writev:

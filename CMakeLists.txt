@@ -1218,8 +1218,11 @@ set(BASIC_TESTS
   mmap_shared_grow
   mmap_shared_grow_under_map
   mmap_shared_multiple
+  mmap_shared_past_eof
   mmap_shared_sendfile
   mmap_shared_subpage
+  mmap_shared_tail
+  mmap_shared_truncate
   mmap_shared_write
   mmap_shared_write_fork
   mmap_short_file
@@ -1800,6 +1803,7 @@ set(TESTS_WITHOUT_PROGRAM
   checkpoint_async_signal_syscalls_1000
   checkpoint_invalid
   checkpoint_mmap_shared
+  checkpoint_mmap_shared_tail
   checkpoint_prctl_name
   checkpoint_simple
   checksum_block_open

@@ -81,24 +81,24 @@ void MmappedFileMonitor::did_write(Task* t, const std::vector<Range>& ranges,
       for (auto r : ranges) {
         remote_ptr<void> start = km.start() + local_offset - mapping_offset;
         MemoryRange mr(start, r.length);
-        if (km.intersects(mr)) {
-          if (is_replay) {
-            // If we're writing beyond the EmuFile's end, resize it.
-            m.emu_file->ensure_size(local_offset + r.length);
-          } else {
-            ASSERT(t, !v->task_set().empty());
-            // We will record multiple writes if the file is mapped multiple
-            // times. This is inefficient --- one is sufficient --- but not
-            // wrong.
-            // Make sure we use a task for this address space. `t` might have
-            // a different address space.
-            for (auto tt : v->task_set()) {
-              // If the task here has execed, we may not be able to record its
-              // memory any longer, so loop through all tasks in this address
-              // space in turn in case any *didn't* exec.
-              if (!tt->already_exited() && static_cast<RecordTask*>(tt)->record_remote_fallible(km.intersect(mr)) > 0) {
-                break;
-              }
+        if (is_replay) {
+          // If we're writing beyond the EmuFile's end, resize it. This
+          // includes writes outside the mapping, since after a truncation
+          // the EmuFile can end before the mapping does.
+          m.emu_file->ensure_size(local_offset + r.length);
+        } else if (km.intersects(mr)) {
+          ASSERT(t, !v->task_set().empty());
+          // We will record multiple writes if the file is mapped multiple
+          // times. This is inefficient --- one is sufficient --- but not
+          // wrong.
+          // Make sure we use a task for this address space. `t` might have
+          // a different address space.
+          for (auto tt : v->task_set()) {
+            // If the task here has execed, we may not be able to record its
+            // memory any longer, so loop through all tasks in this address
+            // space in turn in case any *didn't* exec.
+            if (!tt->already_exited() && static_cast<RecordTask*>(tt)->record_remote_fallible(km.intersect(mr)) > 0) {
+              break;
             }
           }
         }
