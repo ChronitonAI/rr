@@ -542,6 +542,12 @@ void TraceWriter::write_frame(RecordTask* t, const Event& ev,
           r.setEnd(mr.end().as_int());
         }
       }
+      if (e.resized_file) {
+        auto f = syscall.initResizedFile();
+        f.setDevice(e.resized_file->device);
+        f.setInode(e.resized_file->inode);
+        f.setSize(e.resized_file->size);
+      }
       break;
     }
     default:
@@ -694,6 +700,11 @@ TraceFrame TraceReader::read_frame(FrameTime skip_before) {
       syscall_ev.state = from_trace_syscall_state(syscall.getState());
       syscall_ev.failed_during_preparation =
           syscall.getFailedDuringPreparation();
+      if (syscall.hasResizedFile()) {
+        auto f = syscall.getResizedFile();
+        syscall_ev.resized_file =
+            ResizedFile{ f.getDevice(), f.getInode(), f.getSize() };
+      }
       auto data = syscall.getExtra();
       switch (data.which()) {
         case trace::Frame::Event::Syscall::Extra::NONE:

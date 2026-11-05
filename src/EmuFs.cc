@@ -95,6 +95,24 @@ EmuFile::shr_ptr EmuFile::clone(EmuFs& owner) {
     }
   }
 
+  // Shared mappings see the bytes past the end of the file in its last
+  // page, but reads don't return them. Copy them through mappings.
+  uint64_t last_page = floor_page_size(size_);
+  if (last_page < size_) {
+    void* src = mmap(nullptr, page_size(), PROT_READ, MAP_SHARED, fd(),
+                     last_page);
+    void* dest = mmap(nullptr, page_size(), PROT_READ | PROT_WRITE,
+                      MAP_SHARED, f->fd(), last_page);
+    if (src == MAP_FAILED || dest == MAP_FAILED) {
+      FATAL() << "Couldn't map the last page of " << real_path();
+    }
+    uint64_t in_page = size_ - last_page;
+    memcpy(static_cast<uint8_t*>(dest) + in_page,
+           static_cast<uint8_t*>(src) + in_page, page_size() - in_page);
+    munmap(src, page_size());
+    munmap(dest, page_size());
+  }
+
   return f;
 }
 
@@ -111,9 +129,13 @@ void EmuFile::update(dev_t device, ino_t inode, uint64_t size) {
 
 void EmuFile::ensure_size(uint64_t size) {
   if (size_ < size) {
-    resize_shmem_segment(file, size);
-    size_ = size;
+    set_size(size);
   }
+}
+
+void EmuFile::set_size(uint64_t size) {
+  resize_shmem_segment(file, size);
+  size_ = size;
 }
 
 std::string make_temp_name(const string& orig_path, dev_t orig_device,

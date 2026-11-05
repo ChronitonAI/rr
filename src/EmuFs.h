@@ -102,8 +102,14 @@ public:
 
   dev_t device() const { return device_; }
   ino_t inode() const { return inode_; }
+  uint64_t size() const { return size_; }
 
   void ensure_size(uint64_t size);
+
+  /**
+   * Set the file's size to |size|, like ftruncate().
+   */
+  void set_size(uint64_t size);
 
 private:
   friend class EmuFs;

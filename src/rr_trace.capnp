@@ -329,6 +329,12 @@ struct MemRange {
   end @1 :RemotePtr;
 }
 
+struct ResizedFile {
+  device @0 :Device;
+  inode @1 :Inode;
+  size @2 :UInt64;
+}
+
 # The 'events' file is a sequence of these.
 struct Frame {
   tid @0 :Tid;
@@ -394,6 +400,9 @@ struct Frame {
         # and REMOVE.
         madviseRanges @32 :List(MemRange);
       }
+      # A file that a truncate() or an O_TRUNC open changed the size of, if
+      # it is mapped MAP_SHARED, and its size when the syscall returned.
+      resizedFile @33 :ResizedFile;
     }
     patchAfterSyscall @26: Void;
     patchVsyscall @27: Void;
