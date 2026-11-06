@@ -1462,23 +1462,50 @@ void AddressSpace::advise(Task*, remote_ptr<void> addr, ssize_t num_bytes,
                           int advice) {
   LOG(debug) << "madvise(" << addr << ", " << num_bytes << ", " << advice
              << ")";
-  num_bytes = ceil_page_size(num_bytes);
-
+  set<MemoryRange>* ranges;
+  bool add;
   switch (advice) {
     case MADV_DONTFORK:
-      add_range(dont_fork, MemoryRange(addr, num_bytes));
+      ranges = &dont_fork;
+      add = true;
       break;
     case MADV_DOFORK:
-      remove_range(dont_fork, MemoryRange(addr, num_bytes));
+      ranges = &dont_fork;
+      add = false;
       break;
     case MADV_WIPEONFORK:
-      add_range(wipe_on_fork, MemoryRange(addr, num_bytes));
+      ranges = &wipe_on_fork;
+      add = true;
       break;
     case MADV_KEEPONFORK:
-      remove_range(wipe_on_fork, MemoryRange(addr, num_bytes));
+      ranges = &wipe_on_fork;
+      add = false;
       break;
     default:
+      return;
+  }
+
+  // The kernel applies the advice to the mapped parts of the range (and
+  // madvise fails with ENOMEM if there are unmapped parts).
+  MemoryRange range(addr, ceil_page_size(num_bytes));
+  vector<MemoryRange> mapped;
+  for (const auto& m : maps_containing_or_after(range.start())) {
+    MemoryRange r = m.map.intersect(range);
+    if (!r.size()) {
       break;
+    }
+    if (!mapped.empty() && mapped.back().end() == r.start()) {
+      mapped.back() = MemoryRange(mapped.back().start(), r.end());
+    } else {
+      mapped.push_back(r);
+    }
+  }
+  for (const auto& r : mapped) {
+    if (add) {
+      add_range(*ranges, r);
+    } else {
+      remove_range(*ranges, r);
+    }
   }
 }
 
