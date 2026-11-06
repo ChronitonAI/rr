@@ -1,0 +1,37 @@
+# Scratch: rr's software-ticks tests on GitHub's arm64 runners (not for upstream).
+name: arm64 software ticks (scratch)
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: Packages
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y cmake g++ pkg-config zlib1g-dev python-dev-is-python3 libacl1-dev ninja-build capnproto libcapnp-dev gdb lldb python3-pexpect libzstd-dev
+          grep -m3 -i -E 'model name|CPU part|Features' /proc/cpuinfo || true
+          nproc; uname -r
+          echo 0 | sudo tee /proc/sys/kernel/perf_event_paranoid
+          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+      - name: Build
+        run: |
+          mkdir obj && cd obj
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=DEBUG -Dstaticlibs=FALSE ..
+          ninja
+      - name: Software-ticks tests, repeated
+        run: |
+          cd obj
+          set +e
+          set +e
+          status=0
+          for t in software_ticks software_ticks_jit_loop software_ticks_async_kill software_ticks_break_in_tick software_ticks_replace_page software_ticks_script software_ticks_disarmed; do
+            for v in "" -no-syscallbuf; do
+              out=$(ctest -R "^$t$v\$" --repeat until-fail:15 --output-on-failure 2>&1)
+              if echo "$out" | grep -q '100% tests passed'; then echo "PASS x15: $t$v"; else status=1; echo "FAIL: $t$v"; echo "$out" | grep -E 'FATAL|FAILED|overshot|mismatch|Assertion' | head -8; fi
+            done
+          done
+          exit $status
