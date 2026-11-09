@@ -1517,7 +1517,16 @@ splice = IrregularEmulatedSyscall(x86=313, x64=275, generic=76)
 
 sync_file_range = IrregularEmulatedSyscall(x86=314, x64=277, generic=84)
 tee = UnsupportedSyscall(x86=315, x64=276, generic=77)
-vmsplice = UnsupportedSyscall(x86=316, x64=278, generic=75)
+
+#  ssize_t vmsplice(int fd, const struct iovec *iov, unsigned long nr_segs,
+#                   unsigned int flags);
+#
+# With fd open for writing (the write end of a pipe), vmsplice() moves the
+# user memory the iovecs describe into the pipe (with SPLICE_F_GIFT it may map
+# those pages there) and writes no user memory. With fd open only for reading
+# (the read end of a pipe), it copies data from the pipe into the iovecs, like
+# readv(). Recent GNU coreutils' yes uses it when its output is a pipe.
+vmsplice = IrregularEmulatedSyscall(x86=316, x64=278, generic=75)
 move_pages = UnsupportedSyscall(x86=317, x64=279, generic=239)
 getcpu = EmulatedSyscall(x86=318, x64=309, generic=168, arg1="unsigned int", arg2="unsigned int")
 epoll_pwait = IrregularEmulatedSyscall(x86=319, x64=281, generic=22)

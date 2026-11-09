@@ -4189,6 +4189,30 @@ static Switchable maybe_emulate_proc_mem_write(RecordTask* t,
   return PREVENT_SWITCH;
 }
 
+/**
+ * The access mode (O_RDONLY, O_WRONLY or O_RDWR) of |fd|'s open file
+ * description in |t|, from /proc/<tid>/fdinfo/<fd>'s "flags:" (octal), or -1
+ * when |fd| is not open.
+ */
+static int fd_access_mode(RecordTask* t, int fd) {
+  char buf[1024];
+  snprintf(buf, sizeof(buf), "/proc/%d/fdinfo/%d", t->tid, fd);
+  ScopedFd info(buf, O_RDONLY);
+  if (!info.is_open()) {
+    return -1;
+  }
+  ssize_t bytes = read(info, buf, sizeof(buf) - 1);
+  if (bytes <= 0) {
+    return -1;
+  }
+  buf[bytes] = 0;
+  const char* flags = strstr(buf, "flags:");
+  if (!flags) {
+    return -1;
+  }
+  return (int)(strtoul(flags + strlen("flags:"), nullptr, 8) & O_ACCMODE);
+}
+
 template <typename Arch>
 static Switchable rec_prepare_syscall_arch(RecordTask* t,
                                            TaskSyscallState& syscall_state,
@@ -4246,6 +4270,37 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
     case Arch::splice: {
       syscall_state.reg_parameter<loff_t>(2, IN_OUT);
       syscall_state.reg_parameter<loff_t>(4, IN_OUT);
+      return ALLOW_SWITCH;
+    }
+
+    /* ssize_t vmsplice(int fd, const struct iovec *iov, unsigned long nr_segs,
+                        unsigned int flags); */
+    case Arch::vmsplice: {
+      // The kernel writes user memory only when fd is not open for writing
+      // (vmsplice_to_user: the read end of a pipe), and then like readv().
+      // Into a pipe it only reads the iovecs' memory: nothing to record. When
+      // fd's mode can't be read (fd not open) or nr_segs is out of range, the
+      // syscall fails without touching memory.
+      int fd = (int)regs.arg1_signed();
+      unsigned long nr_segs = (unsigned long)regs.arg3();
+      if (fd_access_mode(t, fd) != O_RDONLY || nr_segs == 0 ||
+          nr_segs > IOV_MAX) {
+        return ALLOW_SWITCH;
+      }
+      remote_ptr<void> iovecsp_void = syscall_state.reg_parameter(
+          2, sizeof(typename Arch::iovec) * nr_segs, IN);
+      auto iovecsp = iovecsp_void.cast<typename Arch::iovec>();
+      bool ok = true;
+      auto iovecs = t->read_mem(iovecsp, nr_segs, &ok);
+      if (!ok) {
+        return ALLOW_SWITCH;
+      }
+      ParamSize io_size =
+          ParamSize::from_syscall_result<typename Arch::ssize_t>();
+      for (unsigned long i = 0; i < nr_segs; ++i) {
+        syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(iovecsp + i, iov_base),
+                                        io_size.limit_size(iovecs[i].iov_len));
+      }
       return ALLOW_SWITCH;
     }
 
@@ -7790,7 +7845,8 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::readv:
     case Arch::rseq:
     case Arch::sched_setaffinity:
-    case Arch::userfaultfd: {
+    case Arch::userfaultfd:
+    case Arch::vmsplice: {
       // Restore the registers that we may have altered.
       Registers r = t->regs();
       r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
