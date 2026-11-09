@@ -21,11 +21,13 @@ int main(void) {
   atomic_puts("replacing the countdown's page");
   syscall(RR_mmap, RR_SOFTTICKS_COUNTDOWN_ADDR & ~4095L, 4096L, PROT_NONE,
           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1L, 0L);
-  /* No ticks from here on: they would fault. */
+  /* No ticks from here on: they would fault. A C library built for software
+     ticks ticks in syscall() too, so make the system calls directly. */
   for (i = 0; i < 3; ++i) {
-    syscall(RR_getpid);
+    unbufferable_syscall(RR_getpid, 0, 0, 0);
   }
-  syscall(RR_write, STDOUT_FILENO, "EXIT-SUCCESS\n", 13);
-  syscall(RR_exit_group, 0);
+  unbufferable_syscall(RR_write, STDOUT_FILENO, (uintptr_t)"EXIT-SUCCESS\n",
+                       13);
+  unbufferable_syscall(RR_exit_group, 0, 0, 0);
   return 1;
 }

@@ -15,9 +15,11 @@
 #error Unknown architecture
 #endif
 
-static inline uintptr_t unbufferable_syscall(uintptr_t syscall, uintptr_t arg1,
-                                             uintptr_t arg2,
-                                             uintptr_t arg3) {
+/* Always inlined, so a function a software-ticks compiler pass leaves
+   uninstrumented can make system calls without ticking. */
+static inline __attribute__((always_inline)) uintptr_t
+unbufferable_syscall(uintptr_t syscall, uintptr_t arg1, uintptr_t arg2,
+                     uintptr_t arg3) {
   uintptr_t ret;
 #ifdef __x86_64__
   __asm__ volatile("syscall\n\t"
