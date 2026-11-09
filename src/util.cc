@@ -503,6 +503,48 @@ static void use_own_thread_locals(Task* t, const AddressSpace::Mapping& m,
   }
 }
 
+/**
+ * The x86 syscall stubs save the flags of the code that made the syscall in
+ * the preload_thread_locals page (saved_flags, with pushfw) and restore them
+ * after the hook. The status flags a software tick leaves depend on the
+ * countdown (include/rr/softticks.h), which recording and replay program
+ * differently: recording arms it for time slices, and replay arms it again
+ * at stops recording does not make, such as the syscallbuf flush breakpoint.
+ * So when nothing between a tick and the syscall writes the flags (an
+ * assembled syscall wrapper that ticks at its entry), saved_flags can differ
+ * between the two. Code may not rely on the flags a tick left: leave them out
+ * of the checksum of a task that counts software ticks.
+ */
+template <typename Arch>
+static void normalize_saved_flags_arch(vector<uint8_t>& mem) {
+  static const uint16_t status_flags = 0x8d5; // CF PF AF ZF SF OF
+  size_t off = offsetof(preload_thread_locals<Arch>, saved_flags);
+  if (mem.size() >= off + sizeof(uint16_t)) {
+    uint16_t flags;
+    memcpy(&flags, mem.data() + off, sizeof(flags));
+    flags &= ~status_flags;
+    memcpy(mem.data() + off, &flags, sizeof(flags));
+  }
+}
+
+static void normalize_software_ticks_saved_flags(Task* t,
+                                                 vector<uint8_t>& mem) {
+  if (!t->hpc.is_software()) {
+    return;
+  }
+  switch (t->arch()) {
+    case x86:
+      normalize_saved_flags_arch<X86Arch>(mem);
+      break;
+    case x86_64:
+      normalize_saved_flags_arch<X64Arch>(mem);
+      break;
+    default:
+      // aarch64's ticks keep the flags.
+      break;
+  }
+}
+
 void checksum_process_memory(RecordTask* t, FrameTime global_time) {
   string filename = format_dump_filename(t, global_time, "mem_checksums");
   FILE* checksums_file = fopen64(filename.c_str(), "w");
@@ -542,6 +584,7 @@ void checksum_process_memory(RecordTask* t, FrameTime global_time) {
     use_own_thread_locals(t, m, mem);
     if (m.flags & AddressSpace::Mapping::IS_THREAD_LOCALS) {
       normalize_software_ticks_slot(mem.data(), mem.size());
+      normalize_software_ticks_saved_flags(t, mem);
     }
 
     uint32_t checksum = compute_checksum(mem.data(), mem.size());
@@ -606,6 +649,7 @@ void validate_process_memory(ReplayTask* t, FrameTime global_time) {
     use_own_thread_locals(t, m, mem);
     if (m.flags & AddressSpace::Mapping::IS_THREAD_LOCALS) {
       normalize_software_ticks_slot(mem.data(), mem.size());
+      normalize_software_ticks_saved_flags(t, mem);
     }
 
     uint32_t our_checksum = compute_checksum(mem.data(), mem.size());

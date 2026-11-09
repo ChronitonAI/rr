@@ -1,0 +1,10 @@
+source `dirname $0`/util.sh
+# The flags reach memory through the syscall buffer's syscall stub.
+skip_if_no_syscall_buf
+# Time slices also make recording program the countdown differently from
+# replay.
+RECORD_ARGS="--chaos"
+GLOBAL_OPTIONS="$GLOBAL_OPTIONS --checksum=on-all-events"
+record $TESTNAME
+replay
+check EXIT-SUCCESS

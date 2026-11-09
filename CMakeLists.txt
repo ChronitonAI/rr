@@ -1721,6 +1721,7 @@ set(TESTS_WITH_PROGRAM
   software_ticks_break_in_tick
   software_ticks_disarmed
   software_ticks_replace_page
+  x86/software_ticks_syscall_flags
   x86/singlestep_pushf
   stack_growth
   step_into_lib
