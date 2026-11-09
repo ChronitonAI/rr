@@ -1,3 +1,23 @@
+/* When a software-ticks compiler pass builds the preload library (the pass
+   predefines __RR_SOFTTICKS__ as the tracee ABI version it implements, for
+   assembler sources too), the library's compiled code ticks and the library
+   carries the note that promises include/rr/softticks.h's guarantee: no
+   instrumented instruction executes twice at the same pc and stack pointer
+   without a tick in between. The pass cannot place ticks here, and
+   _raw_syscall is called several times from one frame with no tick in
+   between (e.g. start_commit_buffered_syscall's getpid, gettid and getuid
+   calls), so it ticks at its entry, as compiled functions do. The sequences
+   are the ABI's, byte for byte (RR_SOFTTICKS_*_TICK_ASM), so a trap in one is
+   an ordinary tick trap. They clobber only the flags (x86) or x16 and x17
+   (aarch64), which are dead at a function's entry; the flags are set again
+   before the system call. Every call of _raw_syscall happens in replay as in
+   recording (the instruction it calls differs, not the path to it), so the
+   tick counts match. */
+#include "rr/softticks.h"
+#if defined(__RR_SOFTTICKS__) && __RR_SOFTTICKS__ != RR_SOFTTICKS_ABI_VERSION
+#error "raw_syscall.S implements software ticks ABI version 1 only"
+#endif
+
 #if defined(__i386__)
         .text
         .globl _raw_syscall
@@ -5,6 +25,16 @@
         .type _raw_syscall, @function
 _raw_syscall:     /* syscallno = 4(%esp) */
         .cfi_startproc
+#if defined(__RR_SOFTTICKS__)
+        testb $0x80, 0x70001807
+        jnz 1f
+        subl $1, 0x70001800
+        jnz 1f
+        subl $1, 0x70001804
+        jae 1f
+        int3
+1:
+#endif
         pushl %ebx        /* syscallno = 8(%esp) */
         .cfi_adjust_cfa_offset 4
         .cfi_rel_offset %ebx, 0
@@ -58,6 +88,14 @@ _raw_syscall:     /* syscallno = 4(%esp) */
         .type _raw_syscall, @function
 _raw_syscall:
         .cfi_startproc
+#if defined(__RR_SOFTTICKS__)
+        testb $0x80, 0x70001807
+        jnz 1f
+        decq 0x70001800
+        jnz 1f
+        int3
+1:
+#endif
         /* Incoming args are in %rdi, %rsi, %rdx, %rcx, %r8, %r9, and 8(%rsp).
 	       Syscall arguments are %rdi, %rsi, %rdx, %r10, %r8, %r9. */
         movq %rdi, %rax         /* syscall number */
@@ -143,6 +181,17 @@ _raw_syscall:
         .type _raw_syscall, @function
 _raw_syscall:
         .cfi_startproc
+#if defined(__RR_SOFTTICKS__)
+        movz x16, #0x7001, lsl #16
+        ldr x17, [x16, #0x800]
+        tbnz x17, #63, 1f
+        sub x17, x17, #1
+        str x17, [x16, #0x800]
+        cbnz x17, 1f
+        brk #0x5354
+1:
+        mov x17, xzr
+#endif
         // The two stack arguments needs to be at sp + 8 and sp + 16
         // but they are currently at sp and sp + 8.
         // Since sp needs to be 16 bytes aligned we need to load and push them again.
