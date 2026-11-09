@@ -503,6 +503,51 @@ static void use_own_thread_locals(Task* t, const AddressSpace::Mapping& m,
   }
 }
 
+/**
+ * The syscall stubs save the flags of the patched syscall's code in the
+ * preload_thread_locals page (saved_flags: pushfw before the hook, popfw
+ * after it). With software ticks on x86, a tick clobbers the arithmetic flags
+ * (include/rr/softticks.h), and after its decrement they depend on the
+ * countdown, which recording and replay program differently: a syscall made
+ * right after a tick, with no instruction in between that writes the flags
+ * (an assembled syscall wrapper that ticks at its entry), saves different
+ * arithmetic flags in recording and replay. Nothing can observe them (the stub
+ * restores them, and code may not rely on the flags a tick left), so leave
+ * them out of the page's checksum.
+ */
+static const uint16_t X86_ARITHMETIC_FLAGS = 0x8d5; // CF PF AF ZF SF OF
+
+template <typename Arch>
+static void normalize_saved_flags_arch(vector<uint8_t>& mem) {
+  size_t off = offsetof(preload_thread_locals<Arch>, saved_flags);
+  if (mem.size() >= off + sizeof(uint16_t)) {
+    uint16_t flags;
+    memcpy(&flags, mem.data() + off, sizeof(flags));
+    flags &= ~X86_ARITHMETIC_FLAGS;
+    memcpy(mem.data() + off, &flags, sizeof(flags));
+  }
+}
+
+static void normalize_software_ticks_saved_flags(Task* t,
+                                                 const AddressSpace::Mapping& m,
+                                                 vector<uint8_t>& mem) {
+  if (!(m.flags & AddressSpace::Mapping::IS_THREAD_LOCALS) ||
+      !t->hpc.is_software()) {
+    return;
+  }
+  switch (t->arch()) {
+    case x86:
+      normalize_saved_flags_arch<X86Arch>(mem);
+      break;
+    case x86_64:
+      normalize_saved_flags_arch<X64Arch>(mem);
+      break;
+    default:
+      // aarch64's ticks keep the flags.
+      break;
+  }
+}
+
 void checksum_process_memory(RecordTask* t, FrameTime global_time) {
   string filename = format_dump_filename(t, global_time, "mem_checksums");
   FILE* checksums_file = fopen64(filename.c_str(), "w");
@@ -543,6 +588,7 @@ void checksum_process_memory(RecordTask* t, FrameTime global_time) {
     if (m.flags & AddressSpace::Mapping::IS_THREAD_LOCALS) {
       normalize_software_ticks_slot(mem.data(), mem.size());
     }
+    normalize_software_ticks_saved_flags(t, m, mem);
 
     uint32_t checksum = compute_checksum(mem.data(), mem.size());
     fprintf(checksums_file, "(%x) %s\n", checksum, raw_map_line.c_str());
@@ -607,6 +653,7 @@ void validate_process_memory(ReplayTask* t, FrameTime global_time) {
     if (m.flags & AddressSpace::Mapping::IS_THREAD_LOCALS) {
       normalize_software_ticks_slot(mem.data(), mem.size());
     }
+    normalize_software_ticks_saved_flags(t, m, mem);
 
     uint32_t our_checksum = compute_checksum(mem.data(), mem.size());
 
