@@ -745,6 +745,19 @@ Completion ReplaySession::enter_syscall(ReplayTask* t,
 }
 
 /**
+ * Canonicalize the registers as recording does after it records the exit
+ * of any syscall but a sigreturn (RecordSession::syscall_state_changed).
+ * They may have been set during the syscall, e.g. by an emulated ptracer
+ * at the syscall-entry stop.
+ */
+static void canonicalize_regs_after_syscall_exit(ReplayTask* t,
+                                                 const SyscallEvent& sys_ev) {
+  if (!is_sigreturn(sys_ev.number, sys_ev.arch())) {
+    t->canonicalize_regs(sys_ev.arch());
+  }
+}
+
+/**
  * Advance past the reti (or virtual reti) according to |step|.
  * Return COMPLETE if successful, or INCOMPLETE if an unhandled trap occurred.
  */
@@ -762,6 +775,8 @@ Completion ReplaySession::exit_syscall(ReplayTask* t) {
     flags |= ReplayTask::IGNORE_ESI;
   }
   t->validate_regs(flags);
+  canonicalize_regs_after_syscall_exit(t,
+                                       current_trace_frame().event().Syscall());
 
   return COMPLETE;
 }
@@ -2019,6 +2034,7 @@ ReplayTask* ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
             r.apply_aarch64_syscall_restart();
             t->set_regs(r);
           }
+          canonicalize_regs_after_syscall_exit(t, sys_ev);
         }
       }
       break;
