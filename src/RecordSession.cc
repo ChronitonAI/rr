@@ -962,6 +962,24 @@ void RecordSession::task_continue(const StepState& step_state) {
       }
     }
   }
+#ifdef DEBUG
+  if (ticks_request != RESUME_NO_TICKS) {
+    // Replay runs what a task executes between two of its events when it
+    // replays the second one, in trace order. So once a task has executed
+    // anything since its last recorded event (e.g. until its timeslice
+    // expired), we must record an event for it before another task of its
+    // address space executes anything, or replay runs that task's code first.
+    for (Task* ot : t->vm()->task_set()) {
+      auto rot = static_cast<RecordTask*>(ot);
+      ASSERT(t, rot == t || rot->detached_proxy ||
+                    rot->tick_count() == rot->ticks_at_last_recorded_event)
+          << "Resuming " << t->tid << " while " << rot->tid << " has run "
+          << rot->tick_count() - rot->ticks_at_last_recorded_event
+          << " ticks since its last recorded event (now at " << rot->ev()
+          << ")";
+    }
+  }
+#endif
   t->resume_execution(resume, RESUME_NONBLOCKING, ticks_request);
 }
 
@@ -2832,14 +2850,11 @@ RecordSession::RecordResult RecordSession::record_step() {
     // to do something (e.g. terminate the recording).
     return result;
   }
-  // If the task has been reaped prematurely then it's not running
-  // and we can't get registers etc, so minimize what we do between here
-  // to handle_ptrace_exit_event().
-  if (t->waiting_for_reap) {
-    // Give it another chance to be reaped
-    t->did_reach_zombie();
-    return result;
-  }
+  // Do this before anything that returns early: if we switched away from a
+  // task whose timeslice expired, its SCHED marks where it stopped, and the
+  // tasks we run next may run before we get back to it. Even switching to a
+  // task that we only reap below (which then leaves us with no current task,
+  // so the next step wouldn't see `prev_task` any more) is such a switch.
   RecordTask* prev_task = find_task(prev_task_tuid);
   if (prev_task && prev_task->ev().type() == EV_SCHED) {
     if (prev_task != t) {
@@ -2848,6 +2863,14 @@ RecordSession::RecordResult RecordSession::record_step() {
       prev_task->record_current_event();
     }
     prev_task->pop_event(EV_SCHED);
+  }
+  // If the task has been reaped prematurely then it's not running
+  // and we can't get registers etc, so minimize what we do between here
+  // to handle_ptrace_exit_event().
+  if (t->waiting_for_reap) {
+    // Give it another chance to be reaped
+    t->did_reach_zombie();
+    return result;
   }
   if (t->tuid() != prev_task_tuid) {
     t->will_schedule();

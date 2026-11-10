@@ -746,6 +746,10 @@ public:
   uint64_t scheduler_token;
   std::unique_ptr<TaskSyscallStateBase> syscall_state;
   Ticks ticks_at_last_recorded_syscall_exit;
+  // tick_count() when we last recorded an event for this task. In DEBUG builds
+  // RecordSession::task_continue() checks that no other task of the address
+  // space runs while this task has run since then.
+  Ticks ticks_at_last_recorded_event;
   remote_code_ptr ip_at_last_recorded_syscall_exit;
 
   // Scheduler state
