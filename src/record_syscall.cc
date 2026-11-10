@@ -6705,7 +6705,39 @@ static vector<WriteHole> find_holes(RecordTask* t, int desc, uint64_t offset, ui
   return ret;
 }
 
-static void check_outside_mappings(RecordTask* t, remote_ptr<void> addr) {
+// Returns true if we can tell that nobody has the file open for writing.
+// Then nobody can have a writable shared mapping of it either, since such a
+// mapping keeps the file it was created from, which was opened for writing.
+static bool file_has_no_writers(RecordTask* t, int fd, const struct stat& st) {
+  // Don't open devices or FIFOs. The kernel doesn't count the writers of
+  // memfds (which have no links).
+  if (!S_ISREG(st.st_mode) || st.st_nlink == 0) {
+    return false;
+  }
+  // With O_NONBLOCK, if someone holds a write lease on the file, the open
+  // fails instead of waiting for the holder to release it.
+  ScopedFd file = t->open_fd(fd, O_RDONLY | O_NONBLOCK);
+  if (!file.is_open()) {
+    return false;
+  }
+  // On overlayfs and FUSE, a mapping can hold its write access through a
+  // backing file on another filesystem, which a lease on this file doesn't
+  // see.
+  struct statfs sfs;
+  if (fstatfs(file, &sfs) != 0 || sfs.f_type == OVERLAYFS_SUPER_MAGIC ||
+      sfs.f_type == FUSE_SUPER_MAGIC) {
+    return false;
+  }
+  // The kernel grants a read lease only if nobody has the file open for
+  // writing. Closing `file` releases it. Until then, an open for writing or
+  // a truncate breaks it and signals us; make that SIGURG, which is ignored
+  // by default, instead of SIGIO, which would kill us.
+  return fcntl(file, F_SETSIG, SIGURG) == 0 &&
+         fcntl(file, F_SETLEASE, F_RDLCK) == 0;
+}
+
+static void check_outside_mappings(RecordTask* t, remote_ptr<void> addr,
+                                   int fd, const struct stat& st) {
 #if defined(__i386__)
   struct utsname buf;
   if (uname(&buf) != 0) {
@@ -6717,6 +6749,9 @@ static void check_outside_mappings(RecordTask* t, remote_ptr<void> addr) {
       FATAL() << "Cannot use --check_outside_mmaps with 32-bit rr at 64-bit kernel.";
   }
 #endif
+  if (file_has_no_writers(t, fd, st)) {
+    return;
+  }
   // On btrfs, /proc/<pid>/maps shows a different device number than fstat()
   // (see KernelMapping::device_), so compare the other processes' entries
   // with the tracee's own /proc/<tid>/maps entry.
@@ -6883,7 +6918,7 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
     }
 
     if (t->session().check_outside_mmaps()) {
-      check_outside_mappings(t, addr);
+      check_outside_mappings(t, addr, fd, st);
     }
   }
 

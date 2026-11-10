@@ -1658,6 +1658,7 @@ set(TESTS_WITH_PROGRAM
   mmap_fd_reuse_checkpoint
   mmap_replace_most_mappings
   mmap_shared_extern
+  mmap_shared_extern_readonly
   mmap_shared_prot
   mmap_shared_write_exec_race
   mmap_tmpfs
