@@ -447,6 +447,7 @@ void ReplaySession::advance_to_next_trace_frame() {
   }
 
   trace_frame = trace_in.read_frame();
+  maybe_revive_task_for_exec();
 }
 
 bool ReplaySession::is_ignored_signal(int sig) {
@@ -1828,12 +1829,15 @@ Completion ReplaySession::exit_task(ReplayTask* t) {
   return COMPLETE;
 }
 
-ReplayTask* ReplaySession::revive_task_for_exec() {
+void ReplaySession::maybe_revive_task_for_exec() {
   const Event& ev = trace_frame.event();
-  if (!ev.is_syscall_event() || !ev.Syscall().is_exec()) {
-    FATAL() << "Can't find task, but we're not in an execve";
+  if (!ev.is_syscall_event() || !ev.Syscall().is_exec() ||
+      find_task(trace_frame.tid())) {
+    return;
   }
 
+  // A thread other than the thread-group leader exec'd and took over the
+  // leader's tid, and this is its first frame under that tid.
   ThreadGroup* tg = nullptr;
   for (auto& p : thread_group_map_) {
     if (p.second->tgid == trace_frame.tid()) {
@@ -1856,8 +1860,6 @@ ReplayTask* ReplaySession::revive_task_for_exec() {
   t->rec_tid = trace_frame.tid();
   t->serial = next_task_serial();
   task_map.insert(make_pair(t->rec_tid, t));
-  // The real tid is not changing yet. It will, in process_execve.
-  return t;
 }
 
 /**
@@ -1872,7 +1874,7 @@ ReplayTask* ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
   const Event& ev = trace_frame.event();
 
   if (!t) {
-    t = revive_task_for_exec();
+    FATAL() << "Can't find task, but we're not in an execve";
   }
 
   if (t->tuid() != last_task_tuid) {
