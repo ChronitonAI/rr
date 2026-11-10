@@ -922,6 +922,25 @@ void RecordSession::task_continue(const StepState& step_state) {
       }
     }
   }
+#ifdef DEBUG
+  if (ticks_request != RESUME_NO_TICKS) {
+    // Replay runs what a task executes between two of its events when it
+    // replays the second one, in trace order. So once a task has executed
+    // anything since its last recorded event (e.g. until its timeslice
+    // expired), we must record an event for it before another task of its
+    // address space executes anything, or replay runs the other task's code
+    // first.
+    for (Task* ot : t->vm()->task_set()) {
+      auto rot = static_cast<RecordTask*>(ot);
+      ASSERT(t, rot == t || rot->detached_proxy ||
+                    rot->tick_count() == rot->ticks_at_last_recorded_event)
+          << "Resuming " << t->tid << " while " << rot->tid << " has run "
+          << rot->tick_count() - rot->ticks_at_last_recorded_event
+          << " ticks since its last recorded event (now at " << rot->ev()
+          << ")";
+    }
+  }
+#endif
   t->resume_execution(resume, RESUME_NONBLOCKING, ticks_request);
 }
 

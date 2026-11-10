@@ -162,6 +162,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
     : Task(session, _tid, _tid, serial, a),
       scheduler_token(0),
       ticks_at_last_recorded_syscall_exit(0),
+      ticks_at_last_recorded_event(0),
       ip_at_last_recorded_syscall_exit(nullptr),
       time_at_start_of_last_timeslice(0),
       priority(0),
@@ -2169,6 +2170,7 @@ void RecordTask::record_event(Event ev, FlushSyscallbuf flush,
   }
 
   trace_writer().write_frame(this, ev, registers, extra_registers);
+  ticks_at_last_recorded_event = tick_count();
   LOG(debug) << "Wrote event " << ev << " for time " << current_time;
 
   if (rseq_new_ip != ip()) {
