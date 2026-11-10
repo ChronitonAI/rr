@@ -1,0 +1,55 @@
+source `dirname $0`/util.sh
+
+skip_if_rr_32_bit_with_shell_64_bit
+
+EXE=mmap_shared_extern_readonly$bitness
+RECORD_ARGS="--check-outside-mmaps"
+
+# Runs `$EXE $1 $2` outside the recording and records `$EXE map <path>`
+# with the path it prints.
+function record_with_helper { mode=$1; file=$2;
+  $EXE $mode $file > helper.out &
+  helper=$!
+  until grep -q ready helper.out; do
+    sleep 0
+    if ! kill -0 $helper 2>/dev/null; then
+      failed "helper exited"
+      exit
+    fi
+  done
+  record $EXE map $(sed -n 's/^ready //p' helper.out)
+  kill -KILL $helper
+  wait $helper 2>/dev/null
+}
+
+head -c 4096 /dev/zero > $workdir/map_file
+record $EXE map $workdir/map_file
+mv record.out record.out.1
+mv record.err record.err.1
+if ! grep -q EXIT-SUCCESS record.out.1; then
+  failed "recording without outside writers failed"
+fi
+if grep -q "could cause diversion" record.out.1; then
+  failed "\"could cause diversion\" was returned when nothing outside the recording maps the file."
+fi
+
+rm -f $workdir/map_file
+record_with_helper write $workdir/map_file
+mv record.out record.out.2
+mv record.err record.err.2
+if ! grep -q EXIT-SUCCESS record.out.2; then
+  failed "recording with an outside writer failed"
+fi
+if ! grep -q "could cause diversion" record.out.2; then
+  failed "\"could cause diversion\" was not returned when a process outside the recording maps the file writable."
+fi
+
+record_with_helper memfd -
+mv record.out record.out.3
+mv record.err record.err.3
+if ! grep -q EXIT-SUCCESS record.out.3; then
+  failed "recording with an outside memfd writer failed"
+fi
+if ! grep -q "could cause diversion" record.out.3; then
+  failed "\"could cause diversion\" was not returned when a process outside the recording maps the memfd writable."
+fi

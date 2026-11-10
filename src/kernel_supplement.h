@@ -644,6 +644,14 @@ struct dma_buf_export_sync_file {
 #define ZFS_SUPER_MAGIC 0x2fc12fc1
 #endif
 
+#ifndef OVERLAYFS_SUPER_MAGIC
+#define OVERLAYFS_SUPER_MAGIC 0x794c7630
+#endif
+
+#ifndef FUSE_SUPER_MAGIC
+#define FUSE_SUPER_MAGIC 0x65735546
+#endif
+
 #ifndef FUSE_DEV_IOC_MAGIC
 #define FUSE_DEV_IOC_MAGIC		229
 #endif
