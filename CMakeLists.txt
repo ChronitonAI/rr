@@ -1099,6 +1099,7 @@ set(BASIC_TESTS
   exit_killed_during_preparation
   exit_with_syscallbuf_signal
   fadvise
+  failed_syscall_outputs
   fatal_init_signal
   fatal_sigsegv_thread
   x86/fault_in_code_page

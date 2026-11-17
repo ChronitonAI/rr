@@ -949,30 +949,26 @@ void TaskSyscallState::process_syscall_results() {
       }
     }
     ASSERT(t, saved_data.empty());
-    // Step 3: record all output memory areas, except the OUT parameters of a
-    // failed syscall. If a parameter is inaccessible, though, the kernel may
-    // have written to the others before it failed, e.g. a recvfrom() that
-    // received data into its buffer and then failed to store the source
-    // address. Or it may have written more than their sizes say, e.g. a
-    // recvmmsg() that received a second message and then failed to store its
-    // flags, so that its msg_len is stale. We can't tell how much, so record
-    // those parameters in full, except where the tracee can't write. The
-    // memory of a failed syscall may not even be mapped, so record its
-    // outputs only where the tracee can write, too.
+    // Step 3: record all output memory areas. A failed syscall may have
+    // stored OUT parameters before it failed, e.g. timer_create() stores the
+    // timer id before the clock creates the timer. If a parameter is
+    // inaccessible, the kernel may have written to the others before it
+    // failed, e.g. a recvfrom() that received data into its buffer and then
+    // failed to store the source address. Or it may have written more than
+    // their sizes say, e.g. a recvmmsg() that received a second message and
+    // then failed to store its flags, so that its msg_len is stale. We can't
+    // tell how much, so record those parameters in full. Record the outputs
+    // of a failed syscall, and of one with an inaccessible parameter, only
+    // where the tracee can write, and as far as we can read them.
     for (size_t i = 0; i < param_list.size(); ++i) {
       auto& param = param_list[i];
       size_t size = actual_sizes[i];
       if (param.mode == IN) {
         continue;
       }
-      if (!params_inaccessible) {
-        if (!syscall_failed) {
-          t->record_remote(param.dest, size);
-          continue;
-        }
-        if (param.mode == OUT) {
-          continue;
-        }
+      if (!params_inaccessible && !syscall_failed) {
+        t->record_remote(param.dest, size);
+        continue;
       }
       if (params_inaccessible && (param.mode == OUT || param.mode == IN_OUT) &&
           param.num_bytes.incoming_size < size_t(-1) &&
