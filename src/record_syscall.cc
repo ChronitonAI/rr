@@ -892,11 +892,18 @@ void TaskSyscallState::process_syscall_results() {
       }
     }
     ASSERT(t, saved_data.empty());
-    // Step 3: record all output memory areas
+    // Step 3: record all output memory areas. A failed syscall may have
+    // stored OUT parameters before it failed, e.g. timer_create() stores the
+    // timer id before the clock creates the timer. Record those only where
+    // the tracee can write, and as far as we can read them: the syscall may
+    // have failed because it couldn't store them.
     for (size_t i = 0; i < param_list.size(); ++i) {
       auto& param = param_list[i];
       size_t size = actual_sizes[i];
-      if (param.mode != IN && (param.mode != OUT || !syscall_failed)) {
+      if (param.mode == OUT && syscall_failed) {
+        size = t->vm()->accessible_prefix(param.dest, size, PROT_WRITE);
+        t->record_remote_fallible(param.dest, size);
+      } else if (param.mode != IN) {
         t->record_remote(param.dest, size);
       }
     }
