@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <sstream>
@@ -172,6 +173,34 @@ static vector<RobustFutexWrite> robust_futex_exit_writes(RecordTask* t) {
 static bool may_be_dumping_core(RecordTask* t) {
   auto core_dumping = read_proc_status_fields(t->tid, "CoreDumping");
   return core_dumping.empty() || core_dumping[0] != "0";
+}
+
+/**
+ * Waits until `t`, which we've resumed from its PTRACE_EVENT_EXIT stop, has
+ * dropped its mm in exit_mm(). Before that, exit_mm_release() has made the
+ * kernel's robust futex writes and woken the futexes' waiters, and, if the mm
+ * has other users, cleared the child tid and woken its waiters.
+ */
+static void wait_exit_mm(RecordTask* t) {
+  WaitOptions options(t->tid);
+  options.block_seconds = 0;
+  options.consume = false;
+  // Reading the /proc/<tid>/exe link fails once the task has no mm (or is
+  // gone). Since Linux 4.8 (cd81a9170e69) that takes no reference on the mm,
+  // which mm_release() would count as another user when it decides whether
+  // to clear the child tid.
+  string exe_link = t->proc_exe_path();
+  char c;
+  while (readlink(exe_link.c_str(), &c, 1) >= 0) {
+    // `t` can't stop again, so if there's a status for its tid, or no such
+    // child, `t` has exited, or another thread has exec'd and taken over the
+    // tid after `t` exited (de_thread()).
+    if (WaitManager::wait_stop_or_exit(options).code != WAIT_NO_STATUS) {
+      return;
+    }
+    // Let `t` run; we're usually bound to its CPU.
+    sleep_time(0.0001);
+  }
 }
 
 static bool looks_like_syscall_entry(RecordTask* t) {
@@ -357,34 +386,42 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
   t->hpc.stop(t);
 
   // If we died because of a coredumping signal while the core dump is in
-  // progress, we can't wait for this task to exit: before Linux 5.16
-  // (92307383082d) the task waits for the dump in exit_mm(), after its
-  // PTRACE_EVENT_EXIT stop, and the dump waits for every task in the address
-  // space to pass its PTRACE_EVENT_EXIT stop and get there.
-  // Similarly we can't wait for this task to exit if there are other
+  // progress, we can't wait for this task to exit, or to drop its mm: before
+  // Linux 5.16 (92307383082d) the task waits for the dump in exit_mm(), after
+  // its PTRACE_EVENT_EXIT stop, and the dump waits for every task in the
+  // address space to pass its PTRACE_EVENT_EXIT stop and get there.
+  bool may_wait_exit_mm = !t->was_reaped() &&
+    !(is_coredumping_signal(exit_status.fatal_sig()) && may_be_dumping_core(t));
+  // We also can't wait for this task to exit if there are other
   // tasks in its pid namespace that need to exit and this is the last thread
   // of pid-1 in that namespace, because the kernel must reap them before
-  // letting this task complete its exit.
-  bool may_wait_exit = !t->was_reaped() &&
-    !(is_coredumping_signal(exit_status.fatal_sig()) && may_be_dumping_core(t)) &&
+  // letting this task complete its exit. It drops its mm before that.
+  bool may_wait_exit = may_wait_exit_mm &&
     !t->waiting_for_pid_namespace_tasks_to_exit();
-  // If we wait for this task to exit, the kernel makes its robust futex writes
-  // while we wait, so they can't race with other tracees, and wakes the
+  // If we wait for this task to drop its mm, the kernel makes its robust futex
+  // writes while we wait, so they can't race with other tracees, and wakes the
   // futexes' waiters. Otherwise make the writes now so that the kernel doesn't
   // make them later, at a time that might race with other tracee execution.
   for (auto& w : robust_futex_writes) {
-    if (!may_wait_exit) {
+    if (!may_wait_exit_mm) {
       t->write_mem(w.futex, w.value);
     }
     t->record_local(w.futex, &w.value);
   }
   t->record_exit_trace_event(exit_status);
+  // record_exit_event() records a child tid clear if the address space has
+  // other tasks, while the kernel clears it only if the mm has other users.
+  // Tasks we didn't wait for to exit stay in the address space until we reap
+  // them, so unless we wait for this task to exit, make the clear ourselves.
   t->record_exit_event(
     (!t->was_reaped() && !may_wait_exit) ? RecordTask::WRITE_CHILD_TID : RecordTask::KERNEL_WRITES_CHILD_TID);
   // Linux detaches a ptracer's tracees before the ptracer becomes a zombie.
   t->detach_emulated_ptrace_tracees();
   if (!t->was_reaped()) {
     t->proceed_to_exit(may_wait_exit);
+  }
+  if (may_wait_exit_mm && !may_wait_exit) {
+    wait_exit_mm(t);
   }
   t->do_ptrace_exit_stop(exit_status);
   if (may_wait_exit) {
