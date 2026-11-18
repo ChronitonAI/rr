@@ -1549,7 +1549,9 @@ endif()
 
 if(HAVE_ROBUST_MUTEX)
   set(BASIC_TESTS ${BASIC_TESTS} robust_futex robust_futex_owner_crashed
-      robust_futex_owner_died robust_futex_owner_died_thread)
+      robust_futex_owner_died robust_futex_owner_died_pid_ns
+      robust_futex_owner_died_pid_ns_exec robust_futex_owner_died_pid_ns_thread
+      robust_futex_owner_died_thread)
 endif()
 
 set(BASIC_CPP_TESTS
