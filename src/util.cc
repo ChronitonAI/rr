@@ -1710,6 +1710,19 @@ static bool get_address(int domain, const string& host, struct sockaddr* addr) {
   return true;
 }
 
+static ScopedFd create_listen_socket(int domain) {
+  ScopedFd fd(socket(domain, SOCK_STREAM | SOCK_CLOEXEC, 0));
+  if (fd.is_open()) {
+    int reuseaddr = 1;
+    int ret = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuseaddr,
+                         sizeof(reuseaddr));
+    if (ret < 0) {
+      FATAL() << "Couldn't set SO_REUSEADDR";
+    }
+  }
+  return fd;
+}
+
 OpenedSocket open_socket(const string& host, unsigned short port,
                          ProbePort probe) {
   string host4 = host;
@@ -1727,26 +1740,19 @@ OpenedSocket open_socket(const string& host, unsigned short port,
   int domain = -1;
   ScopedFd listen_fd;
   if (ipv4_ok) {
-    listen_fd = ScopedFd(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    listen_fd = create_listen_socket(AF_INET);
     if (listen_fd.is_open()) {
       domain = AF_INET;
     }
   }
   if (!listen_fd.is_open() && ipv6_ok) {
-    listen_fd = ScopedFd(socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    listen_fd = create_listen_socket(AF_INET6);
     if (listen_fd.is_open()) {
       domain = AF_INET6;
     }
   }
   if (!listen_fd.is_open()) {
     FATAL() << "Couldn't create socket";
-  }
-
-  int reuseaddr = 1;
-  int ret = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuseaddr,
-                       sizeof(reuseaddr));
-  if (ret < 0) {
-    FATAL() << "Couldn't set SO_REUSEADDR";
   }
 
   struct sockaddr* addr;
@@ -1769,8 +1775,9 @@ OpenedSocket open_socket(const string& host, unsigned short port,
 
   do {
     *addr_port = htons(port);
-    ret = ::bind(listen_fd, addr, addr_size);
-    if (ret && probe == PROBE_PORT && (EADDRINUSE == errno || EACCES == errno || EINVAL == errno)) {
+    int ret = ::bind(listen_fd, addr, addr_size);
+    if (ret && probe == PROBE_PORT &&
+        (EADDRINUSE == errno || EACCES == errno)) {
       port = 0;
       continue;
     }
@@ -1780,6 +1787,12 @@ OpenedSocket open_socket(const string& host, unsigned short port,
 
     ret = listen(listen_fd, 1 /*backlogged connection*/);
     if (ret && probe == PROBE_PORT && EADDRINUSE == errno) {
+      // Another socket bound this port too and started listening first.
+      // Ours stays bound to the port, so retry with a new one.
+      listen_fd = create_listen_socket(domain);
+      if (!listen_fd.is_open()) {
+        FATAL() << "Couldn't create socket";
+      }
       port = 0;
       continue;
     }
