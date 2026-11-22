@@ -1315,7 +1315,7 @@ std::shared_ptr<BpfAccelerator> BpfAccelerator::singleton;
     initialized = -1;
 
     libbpf_set_strict_mode(LIBBPF_STRICT_DIRECT_ERRS);
-    string path = resource_path() + "share/rr/asyncfd_async_signal_accelerator_event_filter.o";
+    string path = resource_path() + "share/rr/async_event_filter.o";
     struct bpf_object* obj = bpf_object__open(path.c_str());
     if ((intptr_t)obj <= 0) {
       LOG(error) << "Failed to find bpf at " << path;
