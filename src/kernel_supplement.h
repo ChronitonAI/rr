@@ -300,6 +300,16 @@ struct rr_input_mask {
 #define BUS_MCEERR_AO 5
 #endif
 
+#ifndef MSG_STAT_ANY
+#define MSG_STAT_ANY 13
+#endif
+#ifndef SEM_STAT_ANY
+#define SEM_STAT_ANY 20
+#endif
+#ifndef SHM_STAT_ANY
+#define SHM_STAT_ANY 15
+#endif
+
 // Defined in the ip_tables header for each protocol, but always to the same,
 // value, so it should be fine to set this here
 #ifndef IPT_SO_SET_REPLACE

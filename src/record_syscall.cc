@@ -1262,6 +1262,7 @@ static Switchable prepare_msgctl(TaskSyscallState& syscall_state, int cmd,
   switch (cmd) {
     case IPC_STAT:
     case MSG_STAT:
+    case MSG_STAT_ANY:
       syscall_state.reg_parameter<typename Arch::msqid64_ds>(ptr_reg);
       break;
     case IPC_INFO:
@@ -1292,6 +1293,7 @@ static Switchable prepare_shmctl(TaskSyscallState& syscall_state, int cmd,
 
     case IPC_STAT:
     case SHM_STAT:
+    case SHM_STAT_ANY:
       syscall_state.reg_parameter<typename Arch::shmid64_ds>(ptr_reg);
       break;
 
@@ -1329,6 +1331,7 @@ static Switchable prepare_semctl(RecordTask* t, TaskSyscallState& syscall_state,
 
     case IPC_STAT:
     case SEM_STAT:
+    case SEM_STAT_ANY:
       if (deref == DEREFERENCE) {
         syscall_state.mem_ptr_parameter<typename Arch::semid64_ds>(
             syscall_state.reg_parameter<typename Arch::unsigned_long>(ptr_reg));
