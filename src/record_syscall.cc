@@ -135,49 +135,6 @@ struct termios2 {
 
 namespace rr {
 
-union _semun {
-  int val;
-  struct semid64_ds* buf;
-  unsigned short int* array;
-  struct seminfo* __buf;
-};
-
-/* We can't include <sys/shm.h> to get shmctl because it clashes with
- * linux/shm.h.
- */
-static int _shmctl(int shmid, int cmd, shmid64_ds* buf) {
-#ifdef SYS_shmctl
-  int ret = syscall(SYS_shmctl, shmid, cmd, buf);
-  if (ret >= 0 || errno != ENOSYS) {
-    return ret;
-  }
-#endif
-#ifdef SYS_ipc
-  if (sizeof(void*) == 4) {
-    cmd |= IPC_64;
-  }
-  return syscall(SYS_ipc, SHMCTL, shmid, cmd, 0, buf);
-#else
-  return ret;
-#endif
-}
-static int _semctl(int semid, int semnum, int cmd, _semun un_arg) {
-#ifdef SYS_semctl
-  int ret = syscall(SYS_semctl, semid, semnum, cmd, un_arg);
-  if (ret >= 0 || errno != ENOSYS) {
-    return ret;
-  }
-#endif
-#ifdef SYS_ipc
-  if (sizeof(void*) == 4) {
-    cmd |= IPC_64;
-  }
-  return syscall(SYS_ipc, SEMCTL, semid, semnum, cmd, &un_arg);
-#else
-  return ret;
-#endif
-}
-
 /**
  * Modes used to register syscall memory parameter with TaskSyscallState.
  */
@@ -1312,6 +1269,44 @@ static Switchable prepare_shmctl(TaskSyscallState& syscall_state, int cmd,
 
 enum SemctlDereference { DEREFERENCE, USE_DIRECTLY };
 
+/**
+ * Returns the number of semaphores in set `semid` as t sees it (in its IPC
+ * namespace, with its credentials), or -1 if t can't IPC_STAT the set.
+ */
+template <typename Arch>
+static int tracee_sem_nsems_arch(RecordTask* t, int semid) {
+  AutoRemoteSyscalls remote(t);
+  AutoRestoreMem ds_mem(remote, nullptr, sizeof(typename Arch::semid64_ds));
+  if (ds_mem.get().is_null()) {
+    return -1;
+  }
+  long ret;
+  if (has_ipc_syscall(Arch::arch())) {
+    // x86-32 has a direct semctl syscall only since Linux 5.1:
+    // https://github.com/torvalds/linux/commit/0d6040d4681735dfc47565de288525de405a5c99
+    // ipc(SEMCTL) reads the semid64_ds pointer from memory.
+    typename Arch::unsigned_long cell = ds_mem.get().as_int();
+    AutoRestoreMem cell_mem(remote, &cell, sizeof(cell));
+    ret = remote.syscall(Arch::ipc, SEMCTL, semid, 0, IPC_STAT | IPC_64,
+                         cell_mem.get());
+  } else {
+    ret = remote.syscall(Arch::semctl, semid, 0, IPC_STAT, ds_mem.get());
+  }
+  if (ret < 0) {
+    return -1;
+  }
+  auto ds = t->read_mem(ds_mem.get().cast<typename Arch::semid64_ds>());
+  return ds.sem_nsems;
+}
+
+/**
+ * Remote syscalls use t's own arch, which differs from the recorded
+ * syscall's arch for int $0x80 in a 64-bit task.
+ */
+static int tracee_sem_nsems(RecordTask* t, int semid) {
+  RR_ARCH_FUNCTION(tracee_sem_nsems_arch, t->arch(), t, semid);
+}
+
 template <typename Arch>
 static Switchable prepare_semctl(RecordTask* t, TaskSyscallState& syscall_state,
                                  int semid, int cmd, int ptr_reg,
@@ -1348,14 +1343,14 @@ static Switchable prepare_semctl(RecordTask* t, TaskSyscallState& syscall_state,
       break;
 
     case GETALL: {
-      semid64_ds ds;
-      _semun un_arg;
-      un_arg.buf = &ds;
-      int ret = _semctl(semid, 0, IPC_STAT, un_arg);
-      msan_unpoison(&ds, sizeof(semid64_ds));
-      ASSERT(t, ret == 0);
+      int nsems = tracee_sem_nsems(t, semid);
+      if (nsems < 0) {
+        // GETALL needs the same read permission as IPC_STAT, so it fails
+        // too and writes nothing.
+        break;
+      }
 
-      ParamSize size = sizeof(unsigned short) * ds.sem_nsems;
+      ParamSize size = sizeof(unsigned short) * nsems;
       if (deref == DEREFERENCE) {
         syscall_state.mem_ptr_parameter(
             syscall_state.reg_parameter<typename Arch::unsigned_long>(ptr_reg),
@@ -7003,28 +6998,25 @@ static void process_mremap(RecordTask* t, remote_ptr<void> old_addr,
   // automatically.
 }
 
-static void process_shmat(RecordTask* t, int shmid, int shm_flags,
+static void process_shmat(RecordTask* t, int shm_flags,
                           remote_ptr<void> addr) {
   if (t->regs().syscall_failed()) {
     // We purely emulate failed shmats.
     return;
   }
 
-  struct shmid64_ds ds;
-  int ret = _shmctl(shmid, IPC_STAT, &ds);
-  msan_unpoison(&ds, sizeof(semid64_ds));
-  ASSERT(t, !ret) << "shmid should be readable by rr since rr has the same "
-                     "UID as tracees";
-  size_t size = ceil_page_size(ds.shm_segsz);
-
   int prot = shm_flags_to_mmap_prot(shm_flags);
   int flags = MAP_SHARED;
 
-  // Read the kernel's mapping for the shm segment. There doesn't seem to be
-  // any other way to get the correct device number. (The inode number seems to
-  // be the shm key.) This should be OK since SysV shmem is not used very much
-  // and reading /proc/<pid>/maps should be reasonably cheap.
+  // Read the kernel's mapping for the shm segment. It covers the whole
+  // segment, so it gives the size, and there doesn't seem to be any other way
+  // to get the correct device number. (The inode number seems to be the shm
+  // key.) This should be OK since SysV shmem is not used very much and
+  // reading /proc/<pid>/maps should be reasonably cheap.
   KernelMapping kernel_info = t->vm()->read_kernel_mapping(t, addr);
+  ASSERT(t, kernel_info.start() == addr)
+      << "No mapping starts at the shmat address " << addr;
+  size_t size = kernel_info.size();
   KernelMapping km =
       t->vm()->map(t, addr, size, prot, flags, 0, kernel_info.fsname(),
                    kernel_info.device(), kernel_info.inode());
@@ -7551,8 +7543,8 @@ static void rec_process_syscall_arch(RecordTask* t,
       break;
 
     case Arch::shmat:
-      process_shmat(t, (int)t->regs().orig_arg1_signed(),
-                    (int)t->regs().arg3_signed(), t->regs().syscall_result());
+      process_shmat(t, (int)t->regs().arg3_signed(),
+                    t->regs().syscall_result());
       break;
 
     case Arch::ipc:
@@ -7560,8 +7552,7 @@ static void rec_process_syscall_arch(RecordTask* t,
         case SHMAT: {
           auto out_ptr = t->read_mem(
               remote_ptr<typename Arch::unsigned_long>(t->regs().arg4()));
-          process_shmat(t, (int)t->regs().arg2_signed(),
-                        (int)t->regs().arg3_signed(), out_ptr);
+          process_shmat(t, (int)t->regs().arg3_signed(), out_ptr);
           break;
         }
         default:

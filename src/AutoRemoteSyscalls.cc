@@ -433,11 +433,33 @@ long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
     callregs.set_ip(initial_regs.ip());
   }
 
+  bool from_seccomp = initial_at_seccomp && t->ptrace_event() == PTRACE_EVENT_SECCOMP;
+  SupportedArch stopped_arch;
+  if (from_seccomp &&
+      get_syscall_instruction_arch(
+          t, initial_ip.decrement_by_syscall_insn_length(arch),
+          &stopped_arch) &&
+      stopped_arch != arch) {
+    // Resuming from this seccomp stop would run our syscall the way the
+    // stopped one runs (e.g. int $0x80 in a 64-bit task), with that arch's
+    // syscall numbers and argument registers. Finish the stopped syscall as
+    // a gettid and enter ours from its exit instead. restore_state_to()
+    // returns to the seccomp stop.
+    Registers r = t->regs();
+    r.set_original_syscallno(syscall_number_for_gettid(stopped_arch));
+    t->set_regs(r);
+    if (!t->exit_syscall(stopped_arch)) {
+      // Tracee was killed, there is nothing more we can do.
+      ASSERT(t, t->stopped_or_unexpected_exit()) << "couldn't exit syscall";
+      return -ESRCH;
+    }
+    from_seccomp = false;
+  }
+
   callregs.set_original_syscallno(syscallno);
   callregs.set_syscallno(syscallno);
   t->set_regs(callregs);
 
-  bool from_seccomp = initial_at_seccomp && t->ptrace_event() == PTRACE_EVENT_SECCOMP;
   if (use_singlestep_path && !from_seccomp) {
     while (true) {
       if (!t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
