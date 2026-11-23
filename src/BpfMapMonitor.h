@@ -8,20 +8,34 @@
 namespace rr {
 
 /**
- * A FileMonitor attached to BPF map fds to record their key and value size.
+ * The type, key size and value size of a BPF map.
+ */
+struct BpfMapParams {
+  uint32_t map_type;
+  uint64_t key_size;
+  uint64_t value_size;
+
+  /**
+   * The number of bytes BPF_MAP_LOOKUP_ELEM with |flags| writes to its
+   * value buffer.
+   */
+  uint64_t lookup_value_size(uint64_t flags) const;
+};
+
+/**
+ * A FileMonitor attached to BPF map fds to record their type, key size and
+ * value size.
  */
 class BpfMapMonitor : public FileMonitor {
 public:
-  BpfMapMonitor(uint64_t key_size, uint64_t value_size) : key_size_(key_size), value_size_(value_size) {}
+  explicit BpfMapMonitor(const BpfMapParams& params) : params_(params) {}
 
   virtual Type type() override { return BpfMap; }
 
-  uint64_t key_size() const { return key_size_; }
-  uint64_t value_size() const { return value_size_; }
+  const BpfMapParams& params() const { return params_; }
 
 private:
-  uint64_t key_size_;
-  uint64_t value_size_;
+  BpfMapParams params_;
 };
 
 } // namespace rr

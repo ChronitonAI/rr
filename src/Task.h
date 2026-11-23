@@ -258,6 +258,11 @@ public:
    */
   pid_t pid_of_pidfd(int fd);
   /**
+   * Get the decimal value of |field| (e.g. "map_type:") in the fdinfo of
+   * |fd|, or -1 if |fd| is not open or its fdinfo has no such field.
+   */
+  int64_t fdinfo_value(int fd, const char* field);
+  /**
    * Get the file status flags of |fd| (as open(2) takes them, including the
    * access mode), or -1 if |fd| is not open.
    */

@@ -608,6 +608,7 @@ endif()
 set(RR_SOURCES
   src/AddressSpace.cc
   src/AutoRemoteSyscalls.cc
+  src/BpfMapMonitor.cc
   src/BuildidCommand.cc
   src/Command.cc
   src/CompressedReader.cc
@@ -1031,6 +1032,7 @@ set(BASIC_TESTS
   block_open
   bpf
   bpf_map
+  bpf_map_percpu_scm
   bpf_prog_map
   bpf_query
   brk

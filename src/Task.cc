@@ -2976,6 +2976,10 @@ pid_t Task::pid_of_pidfd(int fd) {
   return fdinfo_field(this, fd, "Pid:", false);
 }
 
+int64_t Task::fdinfo_value(int fd, const char* field) {
+  return fdinfo_field(this, fd, field, false);
+}
+
 int Task::fd_flags(int fd) {
   return fdinfo_field(this, fd, "flags:", false, 8);
 }

@@ -2288,15 +2288,25 @@ static Switchable prepare_ioctl(RecordTask* t,
   return PREVENT_SWITCH;
 }
 
-template <typename Arch> static BpfMapMonitor* bpf_map_monitor(RecordTask* t,
-    TaskSyscallState& syscall_state, remote_ptr<typename Arch::bpf_attr>* argsp_out) {
-  auto argsp = syscall_state.reg_parameter<typename Arch::bpf_attr>(2, IN);
-  auto args = t->read_mem(argsp);
-  FileMonitor* monitor = t->fd_table()->get_monitor(args.map_fd);
-  ASSERT(t, monitor) << "We need a BpfMapMonitor to handle this, but couldn't find it for fd " << args.map_fd;
-  ASSERT(t, monitor->type() == FileMonitor::BpfMap);
-  *argsp_out = argsp;
-  return static_cast<BpfMapMonitor*>(monitor);
+/**
+ * Returns the type and sizes of the BPF map |fd|, from its BpfMapMonitor or,
+ * for a map whose creation rr didn't see (e.g. one received through
+ * SCM_RIGHTS or opened with BPF_OBJ_GET), from its fdinfo. Returns nullopt
+ * if |fd| is not a BPF map; the syscall fails then.
+ */
+static optional<BpfMapParams> bpf_map_params(RecordTask* t, int fd) {
+  FileMonitor* monitor = t->fd_table()->get_monitor(fd);
+  if (monitor && monitor->type() == FileMonitor::BpfMap) {
+    return static_cast<BpfMapMonitor*>(monitor)->params();
+  }
+  int64_t map_type = t->fdinfo_value(fd, "map_type:");
+  int64_t key_size = t->fdinfo_value(fd, "key_size:");
+  int64_t value_size = t->fdinfo_value(fd, "value_size:");
+  if (map_type < 0 || key_size < 0 || value_size < 0) {
+    return nullopt;
+  }
+  return BpfMapParams{ (uint32_t)map_type, (uint64_t)key_size,
+                       (uint64_t)value_size };
 }
 
 template <typename Arch>
@@ -2325,17 +2335,23 @@ static Switchable prepare_bpf(RecordTask* t,
       break;
     }
     case RR_BPF_MAP_LOOKUP_ELEM: {
-      remote_ptr<typename Arch::bpf_attr> argsp;
-      BpfMapMonitor* monitor = bpf_map_monitor<Arch>(t, syscall_state, &argsp);
-      syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(argsp, value),
-                                      monitor->value_size());
+      auto argsp =
+          syscall_state.reg_parameter<typename Arch::bpf_attr>(2, IN);
+      auto args = t->read_mem(argsp);
+      if (auto map = bpf_map_params(t, args.map_fd)) {
+        syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(argsp, value),
+                                        map->lookup_value_size(args.flags));
+      }
       break;
     }
     case RR_BPF_MAP_GET_NEXT_KEY: {
-      remote_ptr<typename Arch::bpf_attr> argsp;
-      BpfMapMonitor* monitor = bpf_map_monitor<Arch>(t, syscall_state, &argsp);
-      syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(argsp, next_key),
-                                      monitor->key_size());
+      auto argsp =
+          syscall_state.reg_parameter<typename Arch::bpf_attr>(2, IN);
+      auto args = t->read_mem(argsp);
+      if (auto map = bpf_map_params(t, args.map_fd)) {
+        syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(argsp, next_key),
+                                        map->key_size);
+      }
       break;
     }
     case RR_BPF_PROG_QUERY: {
@@ -7575,7 +7591,9 @@ static void rec_process_syscall_arch(RecordTask* t,
           case RR_BPF_MAP_CREATE: {
             int fd = t->regs().syscall_result_signed();
             auto attr = t->read_mem(remote_ptr<typename Arch::bpf_attr>(t->regs().arg2()));
-            t->fd_table()->add_monitor(t, fd, new BpfMapMonitor(attr.key_size, attr.value_size));
+            t->fd_table()->add_monitor(t, fd,
+                new BpfMapMonitor({ attr.map_type, attr.key_size,
+                                    attr.value_size }));
             break;
           }
           default:

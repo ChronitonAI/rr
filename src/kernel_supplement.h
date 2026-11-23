@@ -482,6 +482,19 @@ enum {
   RR_BPF_TOKEN_CREATE,
 };
 
+enum {
+  RR_BPF_MAP_TYPE_PERCPU_HASH = 5,
+  RR_BPF_MAP_TYPE_PERCPU_ARRAY = 6,
+  RR_BPF_MAP_TYPE_LRU_PERCPU_HASH = 10,
+  RR_BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE = 21,
+};
+
+// Map element flags that bpf_map_value_size() checks
+enum {
+  RR_BPF_F_CPU = 8,
+  RR_BPF_F_ALL_CPUS = 16,
+};
+
 #ifndef O_PATH
 #define O_PATH 040000000
 #endif
