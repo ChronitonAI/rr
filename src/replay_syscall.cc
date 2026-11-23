@@ -1289,7 +1289,8 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
     }
 
     case Arch::ipc:
-      switch ((int)trace_regs.orig_arg1_signed()) {
+      // The high 16 bits of the call are a version number.
+      switch (trace_regs.orig_arg1() & 0xffff) {
         case SHMAT:
           return process_shmat(t, trace_frame, trace_regs.arg3(), step);
         case SHMDT:

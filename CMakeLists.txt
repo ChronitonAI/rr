@@ -1495,6 +1495,7 @@ set(BASIC_TESTS
   x86/sysfs
   sysinfo
   syslog
+  x86/sysv_ipc_raw
   arm/tagged_addr_ctrl
   arm/tagged_addr_syscalls
   arm/sve_vl

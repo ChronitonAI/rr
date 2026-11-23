@@ -1256,6 +1256,26 @@ static Switchable prepare_socketcall(RecordTask* t,
   return PREVENT_SWITCH;
 }
 
+/**
+ * Returns true if |Arch| tracees make their syscalls through the compat
+ * entry points of an x86-64 kernel.
+ */
+template <typename Arch> static bool uses_compat_syscalls() {
+  if (Arch::arch() != x86) {
+    return false;
+  }
+#if defined(__i386__)
+  struct utsname buf;
+  if (uname(&buf) != 0) {
+    FATAL() << "Failed to call uname";
+  }
+  return strcmp(buf.machine, "x86_64") == 0;
+#else
+  // A 64-bit rr runs on a 64-bit kernel.
+  return true;
+#endif
+}
+
 template <typename Arch>
 static Switchable prepare_msgctl(TaskSyscallState& syscall_state, int cmd,
                                  int ptr_reg) {
@@ -4537,8 +4557,11 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       syscall_state.reg_parameter<typename Arch::user_desc>(1, IN_OUT);
       return PREVENT_SWITCH;
 
-    case Arch::ipc:
-      switch ((int)regs.arg1_signed()) {
+    case Arch::ipc: {
+      // The high 16 bits of the call are a version number.
+      uint32_t call = regs.arg1();
+      int version = call >> 16;
+      switch (call & 0xffff) {
         case MSGGET:
         case SHMDT:
         case SHMGET:
@@ -4557,16 +4580,27 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
 
         case MSGRCV: {
           size_t msgsize = regs.arg3();
-          auto kluge_args =
-              syscall_state.reg_parameter<typename Arch::ipc_kludge_args>(5,
-                                                                          IN);
-          syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(kluge_args, msgbuf),
-                                          sizeof(typename Arch::signed_long) +
-                                              msgsize);
+          if (version == 0) {
+            auto kluge_args =
+                syscall_state.reg_parameter<typename Arch::ipc_kludge_args>(
+                    5, IN);
+            syscall_state.mem_ptr_parameter(
+                REMOTE_PTR_FIELD(kluge_args, msgbuf),
+                sizeof(typename Arch::signed_long) + msgsize);
+          } else {
+            // The message buffer is passed directly, msgtyp in the sixth
+            // argument.
+            syscall_state.reg_parameter(
+                5, sizeof(typename Arch::signed_long) + msgsize);
+          }
           return ALLOW_SWITCH;
         }
 
         case SHMAT: {
+          if (version == 1) {
+            syscall_state.expect_errno = EINVAL;
+            break;
+          }
           // Insane legacy feature: ipc SHMAT returns its pointer via an
           // in-memory out parameter.
           syscall_state.reg_parameter<typename Arch::unsigned_long>(4);
@@ -4589,9 +4623,16 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
           break;
       }
       return PREVENT_SWITCH;
+    }
 
-    case Arch::msgctl:
-      return prepare_msgctl<Arch>(syscall_state, (int)regs.arg2_signed(), 3);
+    case Arch::msgctl: {
+      int cmd = regs.arg2_signed();
+      // compat_ksys_msgctl switches on cmd & ~IPC_64.
+      if ((cmd & IPC_64) && uses_compat_syscalls<Arch>()) {
+        cmd &= ~IPC_64;
+      }
+      return prepare_msgctl<Arch>(syscall_state, cmd, 3);
+    }
 
     case Arch::msgrcv: {
       size_t msgsize = regs.arg3();
@@ -5684,9 +5725,20 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
     case Arch::shmctl:
       return prepare_shmctl<Arch>(syscall_state, (int)regs.arg2_signed(), 3);
 
-    case Arch::semctl:
+    case Arch::semctl: {
+      int cmd = regs.arg3_signed();
+      // compat_ksys_semctl switches on cmd & ~IPC_64 but passes cmd on
+      // to semctl_main unmasked, which fails GETALL | IPC_64 without
+      // writing the array.
+      if ((cmd & IPC_64) && uses_compat_syscalls<Arch>()) {
+        if (cmd == (GETALL | IPC_64)) {
+          return PREVENT_SWITCH;
+        }
+        cmd &= ~IPC_64;
+      }
       return prepare_semctl<Arch>(t, syscall_state, (int)regs.arg1_signed(),
-                                  (int)regs.arg3_signed(), 4, USE_DIRECTLY);
+                                  cmd, 4, USE_DIRECTLY);
+    }
 
     case Arch::seccomp:
       switch ((unsigned int)regs.arg1()) {
@@ -7556,7 +7608,8 @@ static void rec_process_syscall_arch(RecordTask* t,
       break;
 
     case Arch::ipc:
-      switch ((int)t->regs().orig_arg1_signed()) {
+      // The high 16 bits of the call are a version number.
+      switch (t->regs().orig_arg1() & 0xffff) {
         case SHMAT: {
           auto out_ptr = t->read_mem(
               remote_ptr<typename Arch::unsigned_long>(t->regs().arg4()));

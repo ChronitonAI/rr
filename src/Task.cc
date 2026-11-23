@@ -689,7 +689,8 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
       return vm()->advise(this, addr, num_bytes, advice);
     }
     case Arch::ipc: {
-      switch ((int)regs.orig_arg1_signed()) {
+      // The high 16 bits of the call are a version number.
+      switch (regs.orig_arg1() & 0xffff) {
         case SHMDT:
           return process_shmdt(this, regs.arg5());
         default:
