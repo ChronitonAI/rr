@@ -4416,12 +4416,15 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       switch ((int)regs.arg2_signed()) {
         case Arch::DUPFD:
         case Arch::DUPFD_CLOEXEC:
+        case Arch::DUPFD_QUERY:
+        case Arch::CREATED_QUERY:
         case Arch::GETFD:
         case Arch::GETFL:
         case Arch::SETFL:
         case Arch::SETLK:
         case Arch::SETLK64:
         case Arch::OFD_SETLK:
+        case Arch::GETOWN:
         case Arch::SETOWN:
         case Arch::SETOWN_EX:
         case Arch::GETSIG:
@@ -4435,6 +4438,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         case Arch::SET_FILE_RW_HINT:
         case Arch::SETLEASE:
         case Arch::GETLEASE:
+        case Arch::SETDELEG:
           break;
 
         case Arch::SETFD:
@@ -4465,6 +4469,14 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
 
         case Arch::GETOWN_EX:
           syscall_state.reg_parameter<typename Arch::f_owner_ex>(3);
+          break;
+
+        case Arch::GETOWNER_UIDS:
+          syscall_state.reg_parameter(3, sizeof(typename Arch::uid_t) * 2);
+          break;
+
+        case Arch::GETDELEG:
+          syscall_state.reg_parameter<typename Arch::delegation>(3, IN_OUT);
           break;
 
         case Arch::SETLKW:

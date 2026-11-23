@@ -172,6 +172,7 @@ struct FcntlConstants {
     SETLKW64 = 14,
     SETOWN_EX = 15,
     GETOWN_EX = 16,
+    GETOWNER_UIDS = 17,
     // Open File descriptor locks (Linux specific)
     OFD_GETLK = 36,
     OFD_SETLK = 37,
@@ -180,6 +181,8 @@ struct FcntlConstants {
     SETLEASE = 0x400,
     GETLEASE = 0x400 + 1,
     NOTIFY = 0x400 + 2,
+    DUPFD_QUERY = 0x400 + 3,
+    CREATED_QUERY = 0x400 + 4,
     DUPFD_CLOEXEC = 0x400 + 6,
     SETPIPE_SZ = 0x400 + 7,
     GETPIPE_SZ = 0x400 + 8,
@@ -189,6 +192,8 @@ struct FcntlConstants {
     SET_RW_HINT = 0x400 + 12,
     GET_FILE_RW_HINT = 0x400 + 13,
     SET_FILE_RW_HINT = 0x400 + 14,
+    GETDELEG = 0x400 + 15,
+    SETDELEG = 0x400 + 16,
   };
 };
 
@@ -1125,6 +1130,15 @@ struct BaseArch : public wordsize,
     __kernel_pid_t pid;
   };
   RR_VERIFY_TYPE(f_owner_ex);
+
+  struct delegation {
+    uint32_t d_flags;
+    uint16_t d_type;
+    uint16_t __pad;
+  };
+  // delegation was added in kernel 6.19
+  // (https://github.com/torvalds/linux/commit/1602bad16d7df82faca6d7c70821117684a66f49)
+  // so don't try to verify it yet.
 
   // Define various structures that package up syscall arguments.
   // The types of their members are part of the ABI, and defining

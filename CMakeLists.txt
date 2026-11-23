@@ -1107,6 +1107,7 @@ set(BASIC_TESTS
   fcntl_misc
   fcntl_notify
   fcntl_owner_ex
+  fcntl_query_commands
   fcntl_rw_hints
   fcntl_seals
   fcntl_sig
