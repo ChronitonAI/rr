@@ -1795,6 +1795,12 @@ static Switchable prepare_ioctl(RecordTask* t,
       syscall_state.reg_parameter<typename Arch::timespec>(3);
       return PREVENT_SWITCH;
 
+    // These write a struct __kernel_timespec on every architecture.
+    case SIOCGSTAMP_NEW:
+    case SIOCGSTAMPNS_NEW:
+      syscall_state.reg_parameter<typename Arch::Arch64::timespec>(3);
+      return PREVENT_SWITCH;
+
     case TCGETS:
     case TIOCGLCKTRMIOS:
       syscall_state.reg_parameter<typename Arch::termios>(3);

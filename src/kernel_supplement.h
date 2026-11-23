@@ -12,6 +12,7 @@
 #include <linux/if_tun.h>
 #include <linux/mman.h>
 #include <linux/seccomp.h>
+#include <linux/sockios.h>
 #include <linux/usbdevice_fs.h>
 #include <sched.h>
 #include <signal.h>
@@ -224,6 +225,13 @@ struct usbdevfs_streams {
 #endif
 #ifndef TUNGETVNETBE
 #define TUNGETVNETBE _IOR('T', 223, int)
+#endif
+
+#ifndef SIOCGSTAMP_NEW
+#define SIOCGSTAMP_NEW _IOR(0x89, 0x06, long long[2])
+#endif
+#ifndef SIOCGSTAMPNS_NEW
+#define SIOCGSTAMPNS_NEW _IOR(0x89, 0x07, long long[2])
 #endif
 
 #ifndef TIOCGPKT

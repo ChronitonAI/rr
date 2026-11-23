@@ -1172,6 +1172,7 @@ set(BASIC_TESTS
   ioctl_fs
   ioctl_pty
   ioctl_sg
+  ioctl_sock_stamp
   ioctl_tty
   ioctl_ttyS
   ioctl_vt
