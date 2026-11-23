@@ -6146,13 +6146,15 @@ static void rec_prepare_restart_syscall_arch(RecordTask* t,
     case Arch::pselect6_time64:
       t->invalidate_sigmask();
       RR_FALLTHROUGH;
+    case Arch::poll:
     case Arch::select:
     case Arch::_newselect:
     case Arch::nanosleep:
     case Arch::clock_nanosleep:
     case Arch::clock_nanosleep_time64:
-      /* When a signal interrupts these, the kernel writes the remaining time
-       * to the timeout argument of select(), pselect6 and ppoll, or to the
+      /* When a signal interrupts these, the kernel writes the revents of
+       * every pollfd of poll() and ppoll(), and the remaining time to the
+       * timeout argument of select(), pselect6 and ppoll or to the
        * remaining-time argument of a relative sleep, whether the syscall
        * then fails with EINTR or is restarted. A restarted select(),
        * pselect6 or ppoll waits only for the remaining time. */

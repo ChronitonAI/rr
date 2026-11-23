@@ -1152,6 +1152,7 @@ set(BASIC_TESTS
   int3
   intr_futex_wait_restart
   intr_poll
+  intr_poll_revents
   intr_ppoll
   intr_pselect
   intr_read_no_restart
