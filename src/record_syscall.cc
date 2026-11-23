@@ -1220,6 +1220,15 @@ static Switchable prepare_socketcall(RecordTask* t,
           sizeof(typename Arch::mmsghdr) * args.vlen, IN_OUT);
       auto mmsgp = mmsgp_void.cast<typename Arch::mmsghdr>();
       prepare_recvmmsg<Arch>(t, syscall_state, mmsgp, args.vlen);
+      // The kernel writes the remaining time back after it receives at least
+      // one message. When it can't write the timeout, the call fails with
+      // EFAULT and leaves it unchanged, so there is nothing to record, and a
+      // copy in scratch memory would hide the EFAULT.
+      if (t->kernel_can_access(args.timeout, sizeof(typename Arch::timespec),
+                               true)) {
+        syscall_state.mem_ptr_parameter_inferred(
+            REMOTE_PTR_FIELD(argsp, timeout), IN_OUT);
+      }
       if (!(args.flags & MSG_DONTWAIT)) {
         return ALLOW_SWITCH;
       }
@@ -4718,6 +4727,16 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
               .reg_parameter(2, sizeof(typename Arch::mmsghdr) * vlen, IN_OUT)
               .cast<typename Arch::mmsghdr>();
       prepare_recvmmsg<Arch>(t, syscall_state, mmsgp, vlen);
+      // The kernel writes the remaining time back after it receives at least
+      // one message. When it can't write the timeout, the call fails with
+      // EFAULT and leaves it unchanged, so there is nothing to record, and a
+      // copy in scratch memory would hide the EFAULT.
+      size_t timeout_size = syscallno == Arch::recvmmsg
+                                ? sizeof(typename Arch::timespec)
+                                : sizeof(typename Arch::Arch64::timespec);
+      if (t->kernel_can_access(regs.arg5(), timeout_size, true)) {
+        syscall_state.reg_parameter(5, timeout_size, IN_OUT);
+      }
       if (!((unsigned int)regs.arg4() & MSG_DONTWAIT)) {
         return ALLOW_SWITCH;
       }

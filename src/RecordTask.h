@@ -472,6 +472,13 @@ public:
   // exists
   bool record_remote_by_local_map(remote_ptr<void> addr, size_t num_bytes);
 
+  /**
+   * Whether the kernel's own accesses to the `size` bytes at `addr` work: it
+   * reads only readable memory and writes only writable memory, unlike our
+   * accesses through /proc/<pid>/mem.
+   */
+  bool kernel_can_access(remote_ptr<void> addr, size_t size, bool write);
+
   template <typename T>
   void write_and_record(remote_ptr<T> addr, const T& value, bool* ok = nullptr,
                         uint32_t flags = 0) {

@@ -1845,6 +1845,20 @@ bool RecordTask::record_remote_by_local_map(remote_ptr<void> addr,
   return false;
 }
 
+bool RecordTask::kernel_can_access(remote_ptr<void> addr, size_t size,
+                                   bool write) {
+  int prot = write ? PROT_WRITE : PROT_READ | PROT_WRITE;
+  // On aarch64 the kernel ignores the tag of the address when the task has
+  // enabled the tagged address ABI, as tasks that tag pointers do.
+  addr = untagged_addr(arch(), addr);
+  for (remote_ptr<void> p : { addr, addr + (size - 1) }) {
+    if (!vm()->has_mapping(p) || !(vm()->mapping_of(p).map.prot() & prot)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void RecordTask::record_remote(remote_ptr<void> addr, ssize_t num_bytes,
                                MemWriteSizeValidation size_validation) {
   ASSERT(this, num_bytes >= 0);

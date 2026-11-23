@@ -47,26 +47,6 @@ template <typename T> static remote_ptr<T> mask_low_bit(remote_ptr<T> p) {
   return p.as_int() & ~uintptr_t(1);
 }
 
-/**
- * Whether the kernel's own accesses to the `size` bytes at `addr` work: it
- * reads only readable memory and writes only writable memory, unlike our
- * accesses through /proc/<pid>/mem.
- */
-static bool kernel_can_access(RecordTask* t, remote_ptr<void> addr,
-                              size_t size, bool write) {
-  int prot = write ? PROT_WRITE : PROT_READ | PROT_WRITE;
-  // On aarch64 the kernel ignores the tag of the address when the task has
-  // enabled the tagged address ABI, as tasks that tag pointers do.
-  addr = untagged_addr(t->arch(), addr);
-  for (remote_ptr<void> p : { addr, addr + (size - 1) }) {
-    if (!t->vm()->has_mapping(p) ||
-        !(t->vm()->mapping_of(p).map.prot() & prot)) {
-      return false;
-    }
-  }
-  return true;
-}
-
 struct RobustFutexWrite {
   remote_ptr<uint32_t> futex;
   uint32_t value;
@@ -80,7 +60,7 @@ struct RobustFutexWrite {
 static bool robust_futex_exit_write(RecordTask* t, remote_ptr<uint32_t> futex,
                                     vector<RobustFutexWrite>& writes) {
   if (futex.as_int() % sizeof(uint32_t) ||
-      !kernel_can_access(t, futex, sizeof(uint32_t), false)) {
+      !t->kernel_can_access(futex, sizeof(uint32_t), false)) {
     return false;
   }
   bool ok = true;
@@ -91,7 +71,7 @@ static bool robust_futex_exit_write(RecordTask* t, remote_ptr<uint32_t> futex,
   if (pid_t(val & FUTEX_TID_MASK) != t->own_namespace_rec_tid) {
     return true;
   }
-  if (!kernel_can_access(t, futex, sizeof(uint32_t), true)) {
+  if (!t->kernel_can_access(futex, sizeof(uint32_t), true)) {
     return false;
   }
   writes.push_back({ futex, (val & FUTEX_WAITERS) | FUTEX_OWNER_DIED });
@@ -121,7 +101,7 @@ static vector<RobustFutexWrite> robust_futex_exit_writes_arch(RecordTask* t) {
     return writes;
   }
   ASSERT(t, t->robust_list_len() == sizeof(robust_list_head));
-  bool ok = kernel_can_access(t, head_ptr, sizeof(robust_list_head), false);
+  bool ok = t->kernel_can_access(head_ptr, sizeof(robust_list_head), false);
   if (!ok) {
     return writes;
   }
@@ -142,7 +122,7 @@ static vector<RobustFutexWrite> robust_futex_exit_writes_arch(RecordTask* t) {
     // The kernel reads the next entry before it handles this one, and it
     // handles the pending futex, which may be on the list, last.
     remote_ptr<robust_list> next;
-    ok = kernel_can_access(t, current, sizeof(robust_list), false);
+    ok = t->kernel_can_access(current, sizeof(robust_list), false);
     if (ok) {
       next = mask_low_bit(t->read_mem(current, &ok).next.rptr());
     }

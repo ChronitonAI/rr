@@ -1364,6 +1364,7 @@ set(BASIC_TESTS
   readv
   record_replay_subject
   recvfrom
+  recvmmsg_timeout
   recvmsg_short_namelen
   redzone_integrity
   rename
