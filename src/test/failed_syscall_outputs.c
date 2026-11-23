@@ -4,12 +4,17 @@
 #include "nsutils.h"
 
 #include <linux/fuse.h>
+#include <linux/if_alg.h>
 #include <linux/net.h>
+#include <netinet/in.h>
 #include <sys/timex.h>
 
 /* Each case makes a syscall that stores an output and then fails, and prints
    what it finds in the output. Replay must store the output too. */
 
+#ifndef SOL_ALG
+#define SOL_ALG 279
+#endif
 #ifndef AT_HANDLE_MNT_ID_UNIQUE
 #define AT_HANDLE_MNT_ID_UNIQUE 0x001
 #endif
@@ -21,7 +26,18 @@
 #define RR_BPF_PROG_LOAD 5
 #define RR_BPF_BTF_LOAD 18
 
+/* Larger than rr's scratch memory and its syscall buffer, so that the
+   kernel stores the output in the buffer directly under rr too. */
+#define BIG_BUFFER_SIZE (4 * 1024 * 1024)
+
 static size_t page_size;
+
+static char* map_big_buffer(void) {
+  char* p = (char*)mmap(NULL, BIG_BUFFER_SIZE, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  test_assert(p != MAP_FAILED);
+  return p;
+}
 
 static int count_bytes(const char* p, size_t size, char c) {
   int count = 0;
@@ -150,6 +166,102 @@ static void waitid_case(void) {
   atomic_printf("waitid: si_signo %d si_code %d si_pid %d\n", info.si_signo,
                 info.si_code, info.si_pid);
   test_assert(0 == close(pidfd));
+}
+
+static void recvfrom_case(void) {
+  int fds[2];
+  struct sockaddr_un addr;
+  socklen_t addrlen = (socklen_t)-1;
+  char* buf = (char*)mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  test_assert(buf != MAP_FAILED);
+
+  test_assert(0 == socketpair(AF_UNIX, SOCK_DGRAM, 0, fds));
+  test_assert(5 == send(fds[1], "hello", 5, 0));
+
+  /* recvfrom() receives the datagram before it finds that *addrlen is
+     negative. */
+  test_assert(-1 == recvfrom(fds[0], buf, page_size, 0,
+                             (struct sockaddr*)&addr, &addrlen));
+  test_assert(errno == EINVAL);
+  test_assert(0 == memcmp(buf, "hello", 5));
+  atomic_printf("recvfrom: received \"%s\"\n", buf);
+  test_assert(0 == close(fds[0]));
+  test_assert(0 == close(fds[1]));
+  test_assert(0 == munmap(buf, page_size));
+}
+
+static void af_alg_case(void) {
+  struct sockaddr_alg sa;
+  unsigned char key[16];
+  char data[32 + 16];
+  char control[CMSG_SPACE(sizeof(uint32_t)) +
+               CMSG_SPACE(sizeof(struct af_alg_iv) + 12) +
+               CMSG_SPACE(sizeof(uint32_t))];
+  struct iovec iov = { data, sizeof(data) };
+  struct msghdr msg;
+  struct cmsghdr* cmsg;
+  struct af_alg_iv* iv;
+  char* buf;
+  int op;
+  int tfm = socket(AF_ALG, SOCK_SEQPACKET, 0);
+  if (tfm < 0) {
+    atomic_puts("AF_ALG: not supported");
+    return;
+  }
+  memset(&sa, 0, sizeof(sa));
+  sa.salg_family = AF_ALG;
+  strcpy((char*)sa.salg_type, "aead");
+  strcpy((char*)sa.salg_name, "gcm(aes)");
+  if (bind(tfm, (struct sockaddr*)&sa, sizeof(sa))) {
+    atomic_puts("AF_ALG: gcm(aes) not available");
+    test_assert(0 == close(tfm));
+    return;
+  }
+  memset(key, 0x11, sizeof(key));
+  test_assert(0 == setsockopt(tfm, SOL_ALG, ALG_SET_KEY, key, sizeof(key)));
+  test_assert(0 == setsockopt(tfm, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, NULL, 16));
+  op = accept(tfm, NULL, 0);
+  test_assert(op >= 0);
+
+  /* Decrypt 32 bytes with a wrong authentication tag */
+  memset(data, 'C', 32);
+  memset(data + 32, 'T', 16);
+  memset(control, 0, sizeof(control));
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+  cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_level = SOL_ALG;
+  cmsg->cmsg_type = ALG_SET_OP;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(uint32_t));
+  *(uint32_t*)CMSG_DATA(cmsg) = ALG_OP_DECRYPT;
+  cmsg = CMSG_NXTHDR(&msg, cmsg);
+  cmsg->cmsg_level = SOL_ALG;
+  cmsg->cmsg_type = ALG_SET_IV;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(struct af_alg_iv) + 12);
+  iv = (struct af_alg_iv*)CMSG_DATA(cmsg);
+  iv->ivlen = 12;
+  memset(iv->iv, 0x22, 12);
+  cmsg = CMSG_NXTHDR(&msg, cmsg);
+  cmsg->cmsg_level = SOL_ALG;
+  cmsg->cmsg_type = ALG_SET_AEAD_ASSOCLEN;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(uint32_t));
+  *(uint32_t*)CMSG_DATA(cmsg) = 0;
+  test_assert((ssize_t)sizeof(data) == sendmsg(op, &msg, 0));
+
+  /* The kernel decrypts into the buffer before it checks the tag. */
+  buf = map_big_buffer();
+  test_assert(-1 == read(op, buf, BIG_BUFFER_SIZE));
+  test_assert(errno == EBADMSG);
+  atomic_printf("AF_ALG: decrypted %02x %02x %02x %02x\n",
+                (unsigned char)buf[0], (unsigned char)buf[1],
+                (unsigned char)buf[2], (unsigned char)buf[3]);
+  test_assert(0 == munmap(buf, BIG_BUFFER_SIZE));
+  test_assert(0 == close(op));
+  test_assert(0 == close(tfm));
 }
 
 static void perf_event_open_case(void) {
@@ -327,6 +439,132 @@ static void bpf_case(void) {
   atomic_printf("bpf(BPF_BTF_LOAD): btf_log_true_size %u log %d bytes\n",
                 btf_attr.btf_log_true_size, (int)strlen(log));
   free(log);
+}
+
+static uint16_t checksum(const void* p, size_t size) {
+  const uint16_t* w = (const uint16_t*)p;
+  uint32_t sum = 0;
+  for (; size > 1; size -= 2) {
+    sum += *w++;
+  }
+  if (size) {
+    sum += *(const uint8_t*)w;
+  }
+  while (sum >> 16) {
+    sum = (sum & 0xffff) + (sum >> 16);
+  }
+  return ~sum;
+}
+
+#define UDP_PORT 5555
+#define UDP_PAYLOAD_SIZE 200
+
+/* Send a UDP datagram to UDP_PORT with a wrong checksum. It's longer than
+   76 bytes, so UDP checks the checksum only while it copies the datagram to
+   the receiver's buffer. */
+static void send_bad_datagram(int raw_fd, char fill) {
+  unsigned char packet[20 + 8 + UDP_PAYLOAD_SIZE];
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  memset(packet, 0, sizeof(packet));
+  packet[0] = 0x45;
+  *(uint16_t*)(packet + 2) = htons(sizeof(packet));
+  packet[8] = 64;
+  packet[9] = IPPROTO_UDP;
+  *(uint32_t*)(packet + 12) = htonl(INADDR_LOOPBACK);
+  *(uint32_t*)(packet + 16) = htonl(INADDR_LOOPBACK);
+  *(uint16_t*)(packet + 10) = checksum(packet, 20);
+  *(uint16_t*)(packet + 20) = htons(1234);
+  *(uint16_t*)(packet + 22) = htons(UDP_PORT);
+  *(uint16_t*)(packet + 24) = htons(8 + UDP_PAYLOAD_SIZE);
+  *(uint16_t*)(packet + 26) = htons(0x1234);
+  memset(packet + 28, fill, UDP_PAYLOAD_SIZE);
+  test_assert((ssize_t)sizeof(packet) == sendto(raw_fd, packet, sizeof(packet),
+                                                0, (struct sockaddr*)&addr,
+                                                sizeof(addr)));
+}
+
+/* A nonblocking socket's poll() doesn't check the checksum. */
+static void wait_for_datagram(int fd) {
+  struct pollfd pfd = { fd, POLLIN, 0 };
+  int flags = fcntl(fd, F_GETFL);
+  test_assert(flags >= 0);
+  test_assert(0 == fcntl(fd, F_SETFL, flags | O_NONBLOCK));
+  test_assert(1 == poll(&pfd, 1, -1));
+  test_assert(0 == fcntl(fd, F_SETFL, flags));
+}
+
+static void handle_sigusr1(__attribute__((unused)) int sig) {}
+
+static void* interrupt_recvfrom(void* arg) {
+  int* args = (int*)arg;
+  pid_t tid = __atomic_load_n(&args[0], __ATOMIC_SEQ_CST);
+  int fd = __atomic_load_n(&args[1], __ATOMIC_SEQ_CST);
+  test_assert(tid > 1);
+  wait_for_task_asleep_in_syscall(tid, RR_recvfrom, fd);
+  test_assert(0 == syscall(SYS_tgkill, getpid(), tid, SIGUSR1));
+  return NULL;
+}
+
+static void udp_case(void) {
+  struct ifreq ifr;
+  struct sockaddr_in addr;
+  struct sigaction sa;
+  pthread_t thread;
+  int args[2];
+  char* buf;
+  int fd;
+  int raw_fd;
+
+  if (-1 == try_setup_ns(CLONE_NEWNET)) {
+    return;
+  }
+  fd = socket(AF_INET, SOCK_DGRAM, 0);
+  test_assert(fd >= 0);
+  memset(&ifr, 0, sizeof(ifr));
+  strcpy(ifr.ifr_name, "lo");
+  test_assert(0 == ioctl(fd, SIOCGIFFLAGS, &ifr));
+  ifr.ifr_flags |= IFF_UP;
+  raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+  if (raw_fd < 0 || ioctl(fd, SIOCSIFFLAGS, &ifr)) {
+    test_assert(errno == EPERM || errno == EACCES);
+    atomic_puts("UDP: raw sockets or interface changes not permitted");
+    return;
+  }
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(UDP_PORT);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  test_assert(0 == bind(fd, (struct sockaddr*)&addr, sizeof(addr)));
+  buf = map_big_buffer();
+
+  /* UDP drops the datagram, but leaves it in the buffer, and fails with
+     EAGAIN because no other datagram is queued. */
+  send_bad_datagram(raw_fd, 'P');
+  wait_for_datagram(fd);
+  test_assert(-1 == recv(fd, buf, BIG_BUFFER_SIZE, MSG_DONTWAIT));
+  test_assert(errno == EAGAIN);
+  atomic_printf("UDP: EAGAIN with %d bytes of the datagram\n",
+                count_bytes(buf, UDP_PAYLOAD_SIZE, 'P'));
+
+  /* UDP drops the datagram, leaves it in the buffer and waits for the next
+     one, until a signal interrupts it. */
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = handle_sigusr1;
+  test_assert(0 == sigaction(SIGUSR1, &sa, NULL));
+  send_bad_datagram(raw_fd, 'Q');
+  wait_for_datagram(fd);
+  __atomic_store_n(&args[0], sys_gettid(), __ATOMIC_SEQ_CST);
+  __atomic_store_n(&args[1], fd, __ATOMIC_SEQ_CST);
+  test_assert(0 == pthread_create(&thread, NULL, interrupt_recvfrom, args));
+  test_assert(-1 == syscall(RR_recvfrom, fd, buf, BIG_BUFFER_SIZE, 0, NULL,
+                            NULL));
+  test_assert(errno == EINTR);
+  test_assert(0 == pthread_join(thread, NULL));
+  atomic_printf("UDP: EINTR with %d bytes of the datagram\n",
+                count_bytes(buf, UDP_PAYLOAD_SIZE, 'Q'));
 }
 
 #define FUSE_FILE_NODEID 2
@@ -524,10 +762,13 @@ int main(void) {
   adjtimex_case();
   socketpair_case();
   waitid_case();
+  recvfrom_case();
+  af_alg_case();
   perf_event_open_case();
   sched_setattr_case();
   name_to_handle_at_case();
   bpf_case();
+  run_in_child(udp_case);
   run_in_child(fuse_case);
 
   atomic_puts("EXIT-SUCCESS");

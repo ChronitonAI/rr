@@ -489,6 +489,9 @@ enum {
 #ifndef MAX_HANDLE_SZ
 #define MAX_HANDLE_SZ 128
 #endif
+#ifndef SO_MEMINFO
+#define SO_MEMINFO 55
+#endif
 // Not in the uapi headers; see fs/fuse/control.c.
 #ifndef FUSE_CTL_SUPER_MAGIC
 #define FUSE_CTL_SUPER_MAGIC 0x65735543

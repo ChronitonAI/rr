@@ -949,6 +949,11 @@ public:
   // signal. Used for testing (RRCALL_KILL_AFTER_DESCHED_STOP_WAIT).
   bool in_desched_handling;
 
+  // For sockets that checksum the datagrams they receive, by inode: how many
+  // datagrams each one had dropped when a receive by this task from it last
+  // failed. See may_have_dropped_datagram() in record_syscall.cc.
+  std::unordered_map<unsigned long, uint32_t> datagram_socket_drops;
+
 private:
   // See arm_kill().
   std::unique_ptr<ArmedKill> armed_kill;

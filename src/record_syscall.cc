@@ -38,6 +38,7 @@
 #include <linux/seccomp.h>
 #include <linux/sem.h>
 #include <linux/shm.h>
+#include <linux/sock_diag.h>
 #include <linux/sockios.h>
 #include <linux/videodev2.h>
 #include <linux/vt.h>
@@ -208,12 +209,14 @@ enum ArgMode {
  * and final sizes is used, if both are present.
  */
 struct ParamSize {
-  ParamSize() : incoming_size(size_t(-1)), from_syscall_multiplier(0) {}
+  ParamSize()
+      : incoming_size(size_t(-1)), from_syscall_multiplier(0),
+        receives_data(false) {}
   // Clamp incoming_size to INTPTR_MAX. No system call can read more data
   // than that in practice (to a single output parameter).
   ParamSize(size_t incoming_size)
       : incoming_size(min<size_t>(INTPTR_MAX, incoming_size)),
-        from_syscall_multiplier(0) {}
+        from_syscall_multiplier(0), receives_data(false) {}
   /**
    * p points to a tracee location that is already initialized with a
    * "maximum buffer size" passed in by the tracee, and which will be filled
@@ -266,6 +269,15 @@ struct ParamSize {
     r.incoming_size = min(r.incoming_size, max);
     return r;
   }
+  /**
+   * Indicate that the parameter is a buffer that receives data from a file,
+   * e.g. for read() or recvmsg(). See TaskSyscallState::receive_fd.
+   */
+  ParamSize receive_buffer() const {
+    ParamSize r(*this);
+    r.receives_data = true;
+    return r;
+  }
 
   /**
    * Return true if 'other' takes its dynamic size from the same source as
@@ -296,6 +308,8 @@ struct ParamSize {
   /** If from_syscall_multiplier > 0, the size is limited by the value of
    * the syscall result * from_syscall_multiplier. */
   uint32_t from_syscall_multiplier;
+  /** True if the parameter is a buffer that receives data from a file. */
+  bool receives_data;
 };
 
 size_t ParamSize::eval(RecordTask* t, size_t already_consumed) const {
@@ -590,6 +604,14 @@ struct TaskSyscallState : TaskSyscallStateBase {
    *  Only valid when preparation_done is true.
    */
   bool params_inaccessible;
+  /** For syscalls that receive data from a file, e.g. read() and recvmsg():
+   *  the fd, otherwise -1. Some errors can come after the kernel copied data
+   *  into the parameters marked with ParamSize::receive_buffer(); see
+   *  received_data_before_failure().
+   */
+  int receive_fd;
+  /** When true, the syscall is a recvfrom() whose *addrlen was negative. */
+  bool negative_addrlen;
   /** For ioctl()s whose request has _IOC_READ: the fd, otherwise -1. See
    *  ioctl_goes_to_fuse_server().
    */
@@ -606,6 +628,8 @@ struct TaskSyscallState : TaskSyscallStateBase {
         preparation_done(false),
         scratch_enabled(false),
         params_inaccessible(false),
+        receive_fd(-1),
+        negative_addrlen(false),
         ioctl_fd(-1) {}
 };
 
@@ -874,6 +898,154 @@ static void record_writable_fallible(RecordTask* t, remote_ptr<void> addr,
 }
 
 /**
+ * Returns the inode of the socket |fd| if its protocol checksums a datagram
+ * while it copies it into the receive buffer: UDP and UDP-Lite, over IPv4
+ * and IPv6, and raw IPv6. Otherwise returns 0. When the checksum is bad, UDP
+ * drops the datagram and waits for the next one, which can fail with EAGAIN
+ * or EINTR or be restarted (udp_recvmsg(), udpv6_recvmsg()), and raw IPv6
+ * fails with EAGAIN (rawv6_recvmsg()). The dropped datagram stays in the
+ * buffer.
+ */
+static unsigned long checksumming_datagram_socket(RecordTask* t, int fd) {
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), "/proc/%d/fd/%d", t->tid, fd);
+  // Check that the file is a socket first: getxattr() on a FUSE file sends
+  // a request to the FUSE server, which can be one of our tracees.
+  char link[64];
+  ssize_t len = readlink(path, link, sizeof(link) - 1);
+  if (len < 0) {
+    return 0;
+  }
+  link[len] = 0;
+  unsigned long inode;
+  if (sscanf(link, "socket:[%lu]", &inode) != 1) {
+    return 0;
+  }
+  // A socket's file has the name of the socket's protocol (see
+  // sock_alloc_file()).
+  char name[32];
+  ssize_t name_len = getxattr(path, "system.sockprotoname", name, sizeof(name));
+  if (name_len <= 0) {
+    return 0;
+  }
+  string protocol(name, strnlen(name, name_len));
+  if (protocol == "UDP" || protocol == "UDPv6" || protocol == "UDP-Lite" ||
+      protocol == "UDPLITEv6" || protocol == "RAWv6") {
+    return inode;
+  }
+  return 0;
+}
+
+/**
+ * Returns how many datagrams the socket |fd| of |t| has dropped, including
+ * those with a bad checksum (__sk_queue_drop_skb()), or -1 if we can't tell.
+ */
+static int64_t socket_drops(RecordTask* t, int fd) {
+  // pidfd_getfd() needs a thread group leader that has |fd|.
+  Task* leader = nullptr;
+  for (Task* tt : t->fd_table()->task_set()) {
+    if (tt->tgid() == tt->rec_tid && !tt->seen_ptrace_exit_event()) {
+      leader = tt;
+      break;
+    }
+  }
+  if (!leader) {
+    return -1;
+  }
+  ScopedFd pidfd(::syscall(NativeArch::pidfd_open, leader->tid, 0));
+  if (!pidfd.is_open()) {
+    return -1;
+  }
+  ScopedFd sock(::syscall(NativeArch::pidfd_getfd, pidfd.get(), fd, 0));
+  if (!sock.is_open()) {
+    return -1;
+  }
+  uint32_t meminfo[SK_MEMINFO_VARS];
+  socklen_t len = sizeof(meminfo);
+  if (getsockopt(sock, SOL_SOCKET, SO_MEMINFO, meminfo, &len) < 0 ||
+      len <= SK_MEMINFO_DROPS * sizeof(uint32_t)) {
+    return -1;
+  }
+  return meminfo[SK_MEMINFO_DROPS];
+}
+
+/**
+ * Returns true if |fd| is a socket whose protocol checksums datagrams as it
+ * copies them (see checksumming_datagram_socket()) and that may have dropped
+ * one during a receive by |t| that just failed.
+ */
+static bool may_have_dropped_datagram(RecordTask* t, int fd) {
+  unsigned long inode = checksumming_datagram_socket(t, fd);
+  if (!inode) {
+    return false;
+  }
+  // If the socket never dropped a datagram, or dropped as many as when a
+  // receive by |t| from it last failed, it dropped none since.
+  int64_t drops = socket_drops(t, fd);
+  if (drops < 0) {
+    return true;
+  }
+  if (drops == 0) {
+    return false;
+  }
+  auto& seen = t->datagram_socket_drops;
+  auto it = seen.find(inode);
+  if (it != seen.end() && it->second == drops) {
+    return false;
+  }
+  if (seen.size() >= 1024) {
+    // Forgetting sockets only makes us record more.
+    seen.clear();
+  }
+  seen[inode] = drops;
+  return true;
+}
+
+/**
+ * Returns how many bytes a syscall that receives data from |fd| may have
+ * copied into its buffers before it failed with |err|, or 0. Buffers whose
+ * sizes come from the same place (the result, msg_len or msg_controllen)
+ * share that limit. Data can come before these errors:
+ * - EBADMSG: AF_ALG AEAD sockets and kTLS decrypt into the buffer before they
+ *   check the authentication tag.
+ * - EHOSTUNREACH: raw IPv6 sockets copy a datagram before they check its
+ *   checksum.
+ * - EOVERFLOW: N_HDLC ttys copy the part of a frame that fits.
+ * - ECONNABORTED, ENODEV: /dev/fuse copies a request, then finds that the
+ *   connection was aborted.
+ * - EIO: DMA filled part of the buffer of an O_DIRECT read before a later
+ *   part failed.
+ * - ENOMEM: recvfrom() and recvmsg() received the data before auditing the
+ *   source address failed.
+ * - EINVAL: recvfrom() received the data before it found that *addrlen is
+ *   negative.
+ * - EAGAIN, EINTR, ERESTARTSYS: see may_have_dropped_datagram(). The IP
+ *   header limits a datagram to 65535 bytes (IPv6 jumbograms need a link MTU
+ *   above that).
+ */
+static size_t received_data_before_failure(RecordTask* t, int fd, int err,
+                                           bool negative_addrlen) {
+  switch (err) {
+    case EBADMSG:
+    case EHOSTUNREACH:
+    case EOVERFLOW:
+    case ECONNABORTED:
+    case ENODEV:
+    case EIO:
+    case ENOMEM:
+      return SIZE_MAX;
+    case EINVAL:
+      return negative_addrlen ? SIZE_MAX : 0;
+    case EAGAIN:
+    case EINTR:
+    case ERESTARTSYS:
+      return may_have_dropped_datagram(t, fd) ? 65535 : 0;
+    default:
+      return 0;
+  }
+}
+
+/**
  * Returns true if the kernel has the filesystem type |name|, or if we can't
  * tell.
  */
@@ -1094,12 +1266,21 @@ void TaskSyscallState::process_syscall_results() {
     // can't tell how much, so record those parameters in full, except where
     // the tracee can't write. The memory of a failed syscall may not even be
     // mapped, so record its outputs only where the tracee can write, too.
-    // The OUT parameters of a failed ioctl() that goes to a FUSE server hold
-    // the data that the server sent with its error, so record those in full
-    // too.
-    bool efault = (should_emulate_result ? (int64_t)emulated_result
-                                         : t->regs().syscall_result_signed()) ==
-                  -EFAULT;
+    // Some other errors come after the kernel stored data in OUT parameters,
+    // depending on the file: a syscall that receives data may have copied
+    // some into its buffers (see received_data_before_failure()), and the
+    // OUT parameters of an ioctl() that goes to a FUSE server hold the data
+    // that the server sent with its error. Record those in full too, since
+    // their sizes can come from the result or from msg_len, but no more than
+    // a syscall that receives data can have copied.
+    int64_t result = should_emulate_result ? (int64_t)emulated_result
+                                           : t->regs().syscall_result_signed();
+    bool efault = result == -EFAULT;
+    size_t received_size =
+        syscall_failed && !efault && receive_fd >= 0
+            ? received_data_before_failure(t, receive_fd, -result,
+                                           negative_addrlen)
+            : 0;
     bool fuse_ioctl_outputs = false;
     if (syscall_failed && !efault && ioctl_fd >= 0) {
       for (auto& param : param_list) {
@@ -1109,11 +1290,15 @@ void TaskSyscallState::process_syscall_results() {
         }
       }
     }
+    // What is left of received_size for the buffers that share a size, by
+    // the size's ParamSize::mem_ptr. The kernel fills them in order.
+    map<remote_ptr<void>, size_t> received_left;
     for (size_t i = 0; i < param_list.size(); ++i) {
       auto& param = param_list[i];
       size_t size = actual_sizes[i];
+      bool received = received_size > 0 && param.num_bytes.receives_data;
       if (param.mode == IN ||
-          (param.mode == OUT && syscall_failed && !efault &&
+          (param.mode == OUT && syscall_failed && !efault && !received &&
            !fuse_ioctl_outputs)) {
         continue;
       }
@@ -1121,11 +1306,18 @@ void TaskSyscallState::process_syscall_results() {
         t->record_remote(param.dest, size);
         continue;
       }
-      if ((efault || fuse_ioctl_outputs ||
+      if ((efault || received || fuse_ioctl_outputs ||
            (!syscall_failed && !param.num_bytes.mem_ptr.is_null())) &&
           (param.mode == OUT || param.mode == IN_OUT) &&
           param.num_bytes.incoming_size < size_t(-1)) {
         size = max(size, param.num_bytes.incoming_size);
+      }
+      if (received) {
+        size_t& left =
+            received_left.emplace(param.num_bytes.mem_ptr, received_size)
+                .first->second;
+        size = min(size, left);
+        left -= size;
       }
       record_writable_fallible(t, param.dest, size, efault);
     }
@@ -1171,6 +1363,21 @@ void TaskSyscallState::abort_syscall_results() {
 }
 
 /**
+ * Returns true if recvfrom() with these arguments will fail with EINVAL after
+ * it received data, because *addrlen_ptr is negative.
+ */
+template <typename T>
+static bool has_negative_addrlen(RecordTask* t, remote_ptr<void> src_addr,
+                                 remote_ptr<T> addrlen_ptr) {
+  if (src_addr.is_null() || addrlen_ptr.is_null()) {
+    return false;
+  }
+  bool ok = true;
+  int addrlen = t->read_mem(addrlen_ptr.template cast<int>(), &ok);
+  return ok && addrlen < 0;
+}
+
+/**
  * Returns false if the kernel will fail to receive a message with |msgp|
  * because it can't read it or its iovecs, or they are invalid.
  */
@@ -1203,9 +1410,13 @@ static bool prepare_recvmsg(RecordTask* t, TaskSyscallState& syscall_state,
   }
 
   auto controllen_ptr = REMOTE_PTR_FIELD(msgp, msg_controllen);
-  syscall_state.mem_ptr_parameter(
-      REMOTE_PTR_FIELD(msgp, msg_control),
-      ParamSize::from_initialized_mem(t, controllen_ptr));
+  ParamSize control_size = ParamSize::from_initialized_mem(t, controllen_ptr);
+  if (io_size.receives_data) {
+    // The kernel can store control messages before it fails, too.
+    control_size = control_size.receive_buffer();
+  }
+  syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(msgp, msg_control),
+                                  control_size);
   return true;
 }
 
@@ -1213,12 +1424,16 @@ template <typename Arch>
 static void prepare_recvmmsg(RecordTask* t, TaskSyscallState& syscall_state,
                              remote_ptr<typename Arch::mmsghdr> mmsgp,
                              unsigned int vlen) {
-  // The kernel stops at the first message it fails to receive.
+  // The kernel stops at the first message it fails to receive. The syscall
+  // fails only when that is the first message.
   for (unsigned int i = 0; i < min(vlen, (unsigned int)UIO_MAXIOV); ++i) {
     auto msgp = mmsgp + i;
-    if (!prepare_recvmsg<Arch>(
-            t, syscall_state, REMOTE_PTR_FIELD(msgp, msg_hdr),
-            ParamSize::from_mem(REMOTE_PTR_FIELD(msgp, msg_len)))) {
+    ParamSize io_size = ParamSize::from_mem(REMOTE_PTR_FIELD(msgp, msg_len));
+    if (i == 0) {
+      io_size = io_size.receive_buffer();
+    }
+    if (!prepare_recvmsg<Arch>(t, syscall_state,
+                               REMOTE_PTR_FIELD(msgp, msg_hdr), io_size)) {
       break;
     }
   }
@@ -1412,7 +1627,9 @@ static Switchable prepare_socketcall(RecordTask* t,
       auto args = t->read_mem(argsp);
       syscall_state.mem_ptr_parameter(
           REMOTE_PTR_FIELD(argsp, buf),
-          ParamSize::from_syscall_result<typename Arch::ssize_t>(args.len));
+          ParamSize::from_syscall_result<typename Arch::ssize_t>(args.len)
+              .receive_buffer());
+      syscall_state.receive_fd = args.sockfd;
       return ALLOW_SWITCH;
     }
 
@@ -1447,12 +1664,16 @@ static Switchable prepare_socketcall(RecordTask* t,
       auto args = t->read_mem(argsp);
       syscall_state.mem_ptr_parameter(
           REMOTE_PTR_FIELD(argsp, buf),
-          ParamSize::from_syscall_result<typename Arch::ssize_t>(args.len));
+          ParamSize::from_syscall_result<typename Arch::ssize_t>(args.len)
+              .receive_buffer());
       auto addrlen_ptr = syscall_state.mem_ptr_parameter_inferred(
           REMOTE_PTR_FIELD(argsp, addrlen), IN_OUT);
       syscall_state.mem_ptr_parameter(
           REMOTE_PTR_FIELD(argsp, src_addr),
           ParamSize::from_initialized_mem(t, addrlen_ptr));
+      syscall_state.receive_fd = args.sockfd;
+      syscall_state.negative_addrlen =
+          has_negative_addrlen(t, args.src_addr.rptr(), addrlen_ptr);
       return ALLOW_SWITCH;
     }
 
@@ -1463,9 +1684,11 @@ static Switchable prepare_socketcall(RecordTask* t,
           REMOTE_PTR_FIELD(argsp, msg), IN_OUT);
       prepare_recvmsg<Arch>(
           t, syscall_state, msgp,
-          ParamSize::from_syscall_result<typename Arch::ssize_t>());
+          ParamSize::from_syscall_result<typename Arch::ssize_t>()
+              .receive_buffer());
 
       auto args = t->read_mem(argsp);
+      syscall_state.receive_fd = args.fd;
       if (!(args.flags & MSG_DONTWAIT)) {
         return ALLOW_SWITCH;
       }
@@ -1481,6 +1704,7 @@ static Switchable prepare_socketcall(RecordTask* t,
           sizeof(typename Arch::mmsghdr) * args.vlen, IN_OUT);
       auto mmsgp = mmsgp_void.cast<typename Arch::mmsghdr>();
       prepare_recvmmsg<Arch>(t, syscall_state, mmsgp, args.vlen);
+      syscall_state.receive_fd = args.sockfd;
       if (!(args.flags & MSG_DONTWAIT)) {
         return ALLOW_SWITCH;
       }
@@ -5034,12 +5258,15 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
 
     case Arch::recvfrom: {
       syscall_state.reg_parameter(
-          2,
-          ParamSize::from_syscall_result<typename Arch::ssize_t>(regs.arg3()));
+          2, ParamSize::from_syscall_result<typename Arch::ssize_t>(regs.arg3())
+                 .receive_buffer());
       auto addrlen_ptr =
           syscall_state.reg_parameter<typename Arch::socklen_t>(6, IN_OUT);
       syscall_state.reg_parameter(
           5, ParamSize::from_initialized_mem(t, addrlen_ptr));
+      syscall_state.receive_fd = regs.arg1_signed();
+      syscall_state.negative_addrlen =
+          has_negative_addrlen(t, regs.arg5(), addrlen_ptr);
       return ALLOW_SWITCH;
     }
 
@@ -5047,7 +5274,9 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       auto msgp = syscall_state.reg_parameter<typename Arch::msghdr>(2, IN_OUT);
       prepare_recvmsg<Arch>(
           t, syscall_state, msgp,
-          ParamSize::from_syscall_result<typename Arch::ssize_t>());
+          ParamSize::from_syscall_result<typename Arch::ssize_t>()
+              .receive_buffer());
+      syscall_state.receive_fd = regs.arg1_signed();
       if (!((int)regs.arg3() & MSG_DONTWAIT)) {
         return ALLOW_SWITCH;
       }
@@ -5062,6 +5291,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
               .reg_parameter(2, sizeof(typename Arch::mmsghdr) * vlen, IN_OUT)
               .cast<typename Arch::mmsghdr>();
       prepare_recvmmsg<Arch>(t, syscall_state, mmsgp, vlen);
+      syscall_state.receive_fd = regs.arg1_signed();
       if (!((unsigned int)regs.arg4() & MSG_DONTWAIT)) {
         return ALLOW_SWITCH;
       }
@@ -5133,7 +5363,8 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       }
       syscall_state.reg_parameter(
           2, ParamSize::from_syscall_result<typename Arch::ssize_t>(
-                 (size_t)regs.arg3()));
+                 (size_t)regs.arg3()).receive_buffer());
+      syscall_state.receive_fd = fd;
       return ALLOW_SWITCH;
     }
 
@@ -5366,11 +5597,13 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         return did_emulate_read<Arch>(syscallno, t, ranges, result, syscall_state);
       }
       ParamSize io_size =
-          ParamSize::from_syscall_result<typename Arch::ssize_t>();
+          ParamSize::from_syscall_result<typename Arch::ssize_t>()
+              .receive_buffer();
       for (int i = 0; i < iovcnt; ++i) {
         syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(iovecsp + i, iov_base),
                                         io_size.limit_size(iovecs[i].iov_len));
       }
+      syscall_state.receive_fd = fd;
       return ALLOW_SWITCH;
     }
 
@@ -6552,6 +6785,22 @@ static void rec_prepare_restart_syscall_arch(RecordTask* t,
        * then fails with EINTR or is restarted. A restarted select(),
        * pselect6 or ppoll waits only for the remaining time. */
       syscall_state.process_syscall_results();
+      break;
+    case Arch::read:
+    case Arch::readv:
+    case Arch::preadv2:
+    case Arch::recvfrom:
+    case Arch::recvmsg:
+    case Arch::recvmmsg:
+    case Arch::recvmmsg_time64:
+    case Arch::socketcall:
+      /* A UDP socket may have copied a datagram with a bad checksum into the
+       * buffer before a signal interrupted it (see
+       * may_have_dropped_datagram()). With scratch, the datagram stays in
+       * scratch. */
+      if (syscall_state.receive_fd >= 0 && !syscall_state.scratch_enabled) {
+        syscall_state.process_syscall_results();
+      }
       break;
     case Arch::sigsuspend:
     case Arch::rt_sigsuspend:
