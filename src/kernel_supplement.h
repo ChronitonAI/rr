@@ -489,6 +489,22 @@ enum {
 #ifndef MAX_HANDLE_SZ
 #define MAX_HANDLE_SZ 128
 #endif
+// Not in the uapi headers; see fs/fuse/control.c.
+#ifndef FUSE_CTL_SUPER_MAGIC
+#define FUSE_CTL_SUPER_MAGIC 0x65735543
+#endif
+
+#ifndef AT_HANDLE_MNT_ID_UNIQUE
+#define AT_HANDLE_MNT_ID_UNIQUE 0x001
+#endif
+
+#ifndef AT_STATX_DONT_SYNC
+#define AT_STATX_DONT_SYNC 0x4000
+#endif
+
+#ifndef STATX_TYPE
+#define STATX_TYPE 0x0001U
+#endif
 
 #ifndef P_PIDFD
 #define P_PIDFD 3

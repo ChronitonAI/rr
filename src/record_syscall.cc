@@ -590,6 +590,10 @@ struct TaskSyscallState : TaskSyscallStateBase {
    *  Only valid when preparation_done is true.
    */
   bool params_inaccessible;
+  /** For ioctl()s whose request has _IOC_READ: the fd, otherwise -1. See
+   *  ioctl_goes_to_fuse_server().
+   */
+  int ioctl_fd;
 
   /** Miscellaneous saved data that can be used by particular syscalls */
   vector<uint8_t> saved_data;
@@ -601,7 +605,8 @@ struct TaskSyscallState : TaskSyscallStateBase {
         should_emulate_result(false),
         preparation_done(false),
         scratch_enabled(false),
-        params_inaccessible(false) {}
+        params_inaccessible(false),
+        ioctl_fd(-1) {}
 };
 
 template <typename Arch>
@@ -868,6 +873,119 @@ static void record_writable_fallible(RecordTask* t, remote_ptr<void> addr,
   }
 }
 
+/**
+ * Returns true if the kernel has the filesystem type |name|, or if we can't
+ * tell.
+ */
+static bool has_filesystem_type(const char* name) {
+  FILE* f = fopen("/proc/filesystems", "r");
+  if (!f) {
+    return true;
+  }
+  bool found = false;
+  char line[256];
+  // Each line is "nodev\t<name>" or "\t<name>".
+  while (!found && fgets(line, sizeof(line), f)) {
+    line[strcspn(line, "\n")] = 0;
+    const char* tab = strchr(line, '\t');
+    found = tab && strcmp(tab + 1, name) == 0;
+  }
+  fclose(f);
+  return found;
+}
+
+/**
+ * Returns true if ioctl()s on |fd| go to a FUSE server, i.e. the file is on a
+ * FUSE filesystem or it is a CUSE device. For a request with _IOC_READ the
+ * kernel copies the output data that the server sent to the caller, then
+ * returns the server's result, which can be an error (fuse_do_ioctl()).
+ * The server can be one of our tracees, so this must not send it a request,
+ * as statfs() of the file would.
+ */
+static bool ioctl_goes_to_fuse_server(RecordTask* t, int fd) {
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), "/proc/%d/fd/%d", t->tid, fd);
+  // With AT_STATX_DONT_SYNC, FUSE answers from its cache. With an empty mask
+  // it reports the device even when it doesn't let us access the file.
+  typename NativeArch::statx_struct stx;
+  if (syscall(syscall_number_for_statx(NativeArch::arch()), AT_FDCWD, path,
+              AT_STATX_DONT_SYNC, 0, &stx) < 0) {
+    return false;
+  }
+  if (stx.stx_mask & STATX_TYPE) {
+    if (S_ISCHR(stx.stx_mode)) {
+      // CUSE devices are in the "cuse" device class.
+      snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/subsystem",
+               stx.stx_rdev_major, stx.stx_rdev_minor);
+      char link[PATH_MAX];
+      ssize_t len = readlink(path, link, sizeof(link) - 1);
+      if (len <= 0) {
+        return false;
+      }
+      link[len] = 0;
+      const char* name = strrchr(link, '/');
+      return name && strcmp(name + 1, "cuse") == 0;
+    }
+    if (!S_ISREG(stx.stx_mode) && !S_ISDIR(stx.stx_mode)) {
+      // The ioctl()s of other special files go to their drivers, also when
+      // the files are on a FUSE filesystem.
+      return false;
+    }
+  }
+  // The FUSE control filesystem has a directory for each connection to a
+  // FUSE device, named after the kernel's dev_t of the connection's
+  // superblock (fuse_ctl_add_conn()), as long as the superblock exists. That
+  // includes filesystems that were unmounted while files are open, and
+  // mounts that the task's mount namespace doesn't have.
+  bool fusectl = false;
+  struct statfs fusectl_stat;
+  if (statfs("/sys/fs/fuse/connections", &fusectl_stat) == 0 &&
+      fusectl_stat.f_type == FUSE_CTL_SUPER_MAGIC) {
+    snprintf(path, sizeof(path), "/sys/fs/fuse/connections/%u",
+             (stx.stx_dev_major << 20) | stx.stx_dev_minor);
+    if (access(path, F_OK) == 0) {
+      return true;
+    }
+    // virtiofs connections are never in the control filesystem.
+    if (!has_filesystem_type("virtiofs")) {
+      return false;
+    }
+    fusectl = true;
+  }
+  // Otherwise look up the type of the file's filesystem in the task's
+  // mounts, by device number: a mount namespace's copy of a mount has a new
+  // mount id.
+  snprintf(path, sizeof(path), "/proc/%d/mountinfo", t->tid);
+  FILE* f = fopen(path, "r");
+  if (!f) {
+    return false;
+  }
+  bool fuse = false;
+  char* line = nullptr;
+  size_t line_size = 0;
+  while (getline(&line, &line_size, f) > 0) {
+    unsigned int major, minor;
+    if (sscanf(line, "%*u %*u %u:%u", &major, &minor) != 2 ||
+        major != stx.stx_dev_major || minor != stx.stx_dev_minor) {
+      continue;
+    }
+    const char* fields = strstr(line, " - ");
+    char type_buf[64];
+    if (!fields || sscanf(fields + 3, "%63s", type_buf) != 1) {
+      continue;
+    }
+    string type(type_buf);
+    fuse = type == "virtiofs" ||
+           (!fusectl && (type == "fuse" || type == "fuseblk" ||
+                         type.compare(0, 5, "fuse.") == 0 ||
+                         type.compare(0, 8, "fuseblk.") == 0));
+    break;
+  }
+  free(line);
+  fclose(f);
+  return fuse;
+}
+
 void TaskSyscallState::process_syscall_results() {
   ASSERT(t, preparation_done);
 
@@ -976,21 +1094,35 @@ void TaskSyscallState::process_syscall_results() {
     // can't tell how much, so record those parameters in full, except where
     // the tracee can't write. The memory of a failed syscall may not even be
     // mapped, so record its outputs only where the tracee can write, too.
+    // The OUT parameters of a failed ioctl() that goes to a FUSE server hold
+    // the data that the server sent with its error, so record those in full
+    // too.
     bool efault = (should_emulate_result ? (int64_t)emulated_result
                                          : t->regs().syscall_result_signed()) ==
                   -EFAULT;
+    bool fuse_ioctl_outputs = false;
+    if (syscall_failed && !efault && ioctl_fd >= 0) {
+      for (auto& param : param_list) {
+        if (param.mode == OUT) {
+          fuse_ioctl_outputs = ioctl_goes_to_fuse_server(t, ioctl_fd);
+          break;
+        }
+      }
+    }
     for (size_t i = 0; i < param_list.size(); ++i) {
       auto& param = param_list[i];
       size_t size = actual_sizes[i];
       if (param.mode == IN ||
-          (param.mode == OUT && syscall_failed && !efault)) {
+          (param.mode == OUT && syscall_failed && !efault &&
+           !fuse_ioctl_outputs)) {
         continue;
       }
       if (!syscall_failed && !params_inaccessible) {
         t->record_remote(param.dest, size);
         continue;
       }
-      if ((efault || (!syscall_failed && !param.num_bytes.mem_ptr.is_null())) &&
+      if ((efault || fuse_ioctl_outputs ||
+           (!syscall_failed && !param.num_bytes.mem_ptr.is_null())) &&
           (param.mode == OUT || param.mode == IN_OUT) &&
           param.num_bytes.incoming_size < size_t(-1)) {
         size = max(size, param.num_bytes.incoming_size);
@@ -1237,9 +1369,10 @@ static Switchable prepare_socketcall(RecordTask* t,
           syscall_state.reg_parameter<typename Arch::getsockopt_args>(2, IN);
       auto optlen_ptr = syscall_state.mem_ptr_parameter_inferred(
           REMOTE_PTR_FIELD(argsp, optlen), IN_OUT);
+      // See Arch::getsockopt.
       syscall_state.mem_ptr_parameter(
           REMOTE_PTR_FIELD(argsp, optval),
-          ParamSize::from_initialized_mem(t, optlen_ptr));
+          ParamSize::from_initialized_mem(t, optlen_ptr), IN_OUT);
       break;
     }
 
@@ -1250,8 +1383,10 @@ static Switchable prepare_socketcall(RecordTask* t,
     case SYS_SOCKETPAIR: {
       auto argsp =
           syscall_state.reg_parameter<typename Arch::socketpair_args>(2, IN);
+      // The kernel stores the fds before it creates the sockets, which can
+      // fail.
       syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(argsp, sv),
-                                      sizeof(int) * 2);
+                                      sizeof(int) * 2, IN_OUT);
       break;
     }
 
@@ -1789,6 +1924,9 @@ static Switchable prepare_ioctl(RecordTask* t,
   int nr = _IOC_NR(request);
   int dir = _IOC_DIR(request);
   int size = _IOC_SIZE(request);
+  if (dir & _IOC_READ) {
+    syscall_state.ioctl_fd = fd;
+  }
 
   LOG(debug) << "handling ioctl(" << HEX(request) << "): type:" << HEX(type)
              << " nr:" << HEX(nr) << " dir:" << HEX(dir) << " size:" << size;
@@ -1971,9 +2109,21 @@ static Switchable prepare_ioctl(RecordTask* t,
       syscall_state.reg_parameter<typename Arch::unsigned_short>(3);
       return PREVENT_SWITCH;
 
+    case BLKREPORTZONE: {
+      // The kernel copies each zone as the driver reports it, and a driver
+      // error can come after some zones were copied.
+      auto reportp = remote_ptr<struct blk_zone_report>(t->regs().arg3());
+      bool ok = true;
+      uint32_t nr_zones = t->read_mem(REMOTE_PTR_FIELD(reportp, nr_zones), &ok);
+      syscall_state.reg_parameter(
+          3, sizeof(struct blk_zone_report) +
+                 (ok ? uint64_t(nr_zones) * sizeof(struct blk_zone) : 0),
+          IN_OUT);
+      return PREVENT_SWITCH;
+    }
+
     case BLKGETNRZONES:
     case BLKGETZONESZ:
-    case BLKREPORTZONE:
     case BLKCLOSEZONE:
     case BLKOPENZONE:
     case BLKRESETZONE:
@@ -2120,6 +2270,12 @@ static Switchable prepare_ioctl(RecordTask* t,
       case IOCTL_MASK_SIZE(USBDEVFS_GETDRIVER):
         // Reads and writes its parameter despite not having the _IOC_READ bit.
         syscall_state.reg_parameter(3, size);
+        return PREVENT_SWITCH;
+      case IOCTL_MASK_SIZE(PERF_EVENT_IOC_MODIFY_ATTRIBUTES):
+        // The parameter is a struct perf_event_attr. As for perf_event_open,
+        // the kernel can store the size it supports in attr->size and fail
+        // with E2BIG.
+        syscall_state.reg_parameter(3, 2 * sizeof(uint32_t), IN_OUT);
         return PREVENT_SWITCH;
       case IOCTL_MASK_SIZE(USBDEVFS_REAPURB):
       case IOCTL_MASK_SIZE(USBDEVFS_REAPURBNDELAY):
@@ -2386,10 +2542,12 @@ static Switchable prepare_ioctl(RecordTask* t,
       auto argsp =
           syscall_state.reg_parameter<typename Arch::mtd_read_req>(3, IN_OUT);
       auto args = t->read_mem(argsp);
+      // A driver error, or an ECC error (EBADMSG, EUCLEAN), can come after
+      // data was copied.
       syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(argsp, usr_data),
-                                      args.len);
+                                      args.len, IN_OUT);
       syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(argsp, usr_oob),
-                                      args.ooblen);
+                                      args.ooblen, IN_OUT);
       return PREVENT_SWITCH;
     }
 
@@ -2425,6 +2583,28 @@ template <typename Arch> static BpfMapMonitor* bpf_map_monitor(RecordTask* t,
   return static_cast<BpfMapMonitor*>(monitor);
 }
 
+/**
+ * The size of the bpf_attr that the kernel reads and may write for a bpf()
+ * syscall, whose size argument is an unsigned int. The kernel fails with
+ * E2BIG when the size is larger than a page.
+ */
+static size_t bpf_attr_size(RecordTask* t) {
+  return min<size_t>((uint32_t)t->regs().arg3(), page_size());
+}
+
+/**
+ * Read the bpf_attr of a bpf() syscall as the kernel does: the fields past
+ * the size the tracee passed are zero.
+ */
+template <typename Arch>
+static typename Arch::bpf_attr read_bpf_attr(
+    RecordTask* t, remote_ptr<typename Arch::bpf_attr> attrp) {
+  typename Arch::bpf_attr attr;
+  memset(&attr, 0, sizeof(attr));
+  t->read_bytes_fallible(attrp, min(sizeof(attr), bpf_attr_size(t)), &attr);
+  return attr;
+}
+
 template <typename Arch>
 static Switchable prepare_bpf(RecordTask* t,
                               TaskSyscallState& syscall_state) {
@@ -2433,7 +2613,6 @@ static Switchable prepare_bpf(RecordTask* t,
     case RR_BPF_MAP_CREATE:
     case RR_BPF_MAP_UPDATE_ELEM:
     case RR_BPF_MAP_DELETE_ELEM:
-    case RR_BPF_BTF_LOAD:
     case RR_BPF_PROG_DETACH:
     case RR_BPF_PROG_ATTACH:
     case RR_BPF_MAP_FREEZE:
@@ -2443,11 +2622,26 @@ static Switchable prepare_bpf(RecordTask* t,
     case RR_BPF_OBJ_GET:
       return ALLOW_SWITCH;
     case RR_BPF_PROG_LOAD: {
-      auto argsp =
-          syscall_state.reg_parameter<typename Arch::bpf_attr>(2, IN);
-      auto args = t->read_mem(argsp);
+      // The kernel stores log_true_size whatever the result, and some
+      // *_rec_size fields when it fails with E2BIG. The verifier writes the
+      // log as it goes, so it holds data when loading fails, too.
+      auto argsp = syscall_state.reg_parameter(2, bpf_attr_size(t), IN_OUT)
+                       .cast<typename Arch::bpf_attr>();
+      auto args = read_bpf_attr<Arch>(t, argsp);
       syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(argsp, log_buf),
-                                      args.log_size);
+                                      args.log_size, IN_OUT);
+      break;
+    }
+    case RR_BPF_BTF_LOAD: {
+      // As for RR_BPF_PROG_LOAD: the kernel stores btf_log_true_size and the
+      // log whatever the result.
+      auto argsp = syscall_state.reg_parameter(2, bpf_attr_size(t), IN_OUT)
+                       .cast<typename Arch::bpf_attr>();
+      auto args = read_bpf_attr<Arch>(t, argsp);
+      if (args.btf_log_level) {
+        syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(argsp, btf_log_buf),
+                                        args.btf_log_size, IN_OUT);
+      }
       break;
     }
     case RR_BPF_MAP_LOOKUP_ELEM: {
@@ -2484,25 +2678,27 @@ static Switchable prepare_bpf(RecordTask* t,
 
       auto buf_size = prog_cnt * sizeof(__u32);
       // for each output array, only track changes if the field is
-      // within the bounds of the user provided buffer
+      // within the bounds of the user provided buffer. When more programs
+      // are attached than prog_cnt allows, the kernel fails with ENOSPC
+      // after it stored prog_cnt entries.
       auto prog_ids_p = REMOTE_PTR_FIELD(attrp, query.prog_ids);
       if (attr_buf.contains(prog_ids_p)) {
-        syscall_state.mem_ptr_parameter(prog_ids_p, buf_size);
+        syscall_state.mem_ptr_parameter(prog_ids_p, buf_size, IN_OUT);
       }
 
       auto prog_attach_flags_p = REMOTE_PTR_FIELD(attrp, query.prog_attach_flags);
       if (attr_buf.contains(prog_attach_flags_p)) {
-        syscall_state.mem_ptr_parameter(prog_attach_flags_p, buf_size);
+        syscall_state.mem_ptr_parameter(prog_attach_flags_p, buf_size, IN_OUT);
       }
 
       auto link_ids_p = REMOTE_PTR_FIELD(attrp, query.link_ids);
       if (attr_buf.contains(link_ids_p)) {
-        syscall_state.mem_ptr_parameter(link_ids_p, buf_size);
+        syscall_state.mem_ptr_parameter(link_ids_p, buf_size, IN_OUT);
       }
 
       auto link_attach_flags_p = REMOTE_PTR_FIELD(attrp, query.link_attach_flags);
       if (attr_buf.contains(link_attach_flags_p)) {
-        syscall_state.mem_ptr_parameter(link_attach_flags_p, buf_size);
+        syscall_state.mem_ptr_parameter(link_attach_flags_p, buf_size, IN_OUT);
       }
       break;
     }
@@ -2527,7 +2723,9 @@ static Switchable prepare_bpf(RecordTask* t,
       // they're little-endian here. That's true for now since x86 is the only
       // 32-bit architecture we support. We could fix this by making
       // mem_ptr_parameter take a remote_ptr<T> and checking the size of T.
-      syscall_state.mem_ptr_parameter(info_p, info_len);
+      // The kernel also reads info, and BTF objects store info before they
+      // fail with ENOSPC when the name buffer is too short.
+      syscall_state.mem_ptr_parameter(info_p, info_len, IN_OUT);
       break;
     }
     default:
@@ -3943,6 +4141,11 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
     if (!t->regs().syscall_may_restart()) {
       LOG(debug) << "clone failed, returning "
                  << errno_name(-t->regs().syscall_result_signed());
+      if (flags & CLONE_PIDFD) {
+        // The kernel stores the pidfd before steps that can still fail, e.g.
+        // when the pids cgroup controller refuses a new task.
+        record_writable_fallible(t, params.ptid, sizeof(int), false);
+      }
       syscall_state.emulate_result(t->regs().syscall_result());
       // clone failed and we're exiting the syscall with an error. Reenter
       // the syscall so that we're in the same state as the normal execution
@@ -4909,8 +5112,11 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
     case Arch::getsockopt: {
       auto optlen_ptr =
           syscall_state.reg_parameter<typename Arch::socklen_t>(5, IN_OUT);
+      // SCTP_GET_PEER_ADDRS stores the addresses that fit and then fails with
+      // ENOMEM, and a cgroup BPF program can fail the syscall after the
+      // protocol stored the option.
       syscall_state.reg_parameter(
-          4, ParamSize::from_initialized_mem(t, optlen_ptr));
+          4, ParamSize::from_initialized_mem(t, optlen_ptr), IN_OUT);
       return PREVENT_SWITCH;
     }
 
@@ -5232,7 +5438,8 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
             // Waiting on a non-tracee; just let it happen as normal
             // We also take this path if pid_of_pidfd returns -1
             // because the fd is not a pidfd.
-            syscall_state.reg_parameter<typename Arch::siginfo_t>(3);
+            // The kernel stores some fields of *infop whatever the result.
+            syscall_state.reg_parameter<typename Arch::siginfo_t>(3, IN_OUT);
             return ALLOW_SWITCH;
           }
           t->in_wait_type = WAIT_TYPE_PID;
@@ -5329,8 +5536,12 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
           int in_flags = (flags & PERF_FLAG_FD_CLOEXEC) ? O_CLOEXEC : 0;
           r.set_arg1(in_flags);
           t->set_regs(r);
+          return PREVENT_SWITCH;
         }
       }
+      // When attr->size (after attr->type) is too small or too large, the
+      // kernel stores the size it supports there and fails with E2BIG.
+      syscall_state.reg_parameter(1, 2 * sizeof(uint32_t), IN_OUT);
       return PREVENT_SWITCH;
     }
 
@@ -5836,8 +6047,10 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       return prepare_ptrace<Arch>(t, syscall_state);
 
     case Arch::mincore:
+      // When the range reaches unmapped memory, the kernel fails with ENOMEM
+      // after it stored the state of the pages before it.
       syscall_state.reg_parameter(
-          3, (regs.arg2() + page_size() - 1) / page_size());
+          3, (regs.arg2() + page_size() - 1) / page_size(), IN_OUT);
       return PREVENT_SWITCH;
 
     case Arch::shmctl:
@@ -5869,7 +6082,9 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       return PREVENT_SWITCH;
 
     case Arch::get_mempolicy: {
-      syscall_state.reg_parameter(1, sizeof(int));
+      // The kernel stores the mode before it fails to copy a nodemask that is
+      // larger than a page.
+      syscall_state.reg_parameter(1, sizeof(int), IN_OUT);
       unsigned long maxnode = t->regs().arg3();
       unsigned long align_mask = 8 * sizeof(typename Arch::unsigned_long) - 1;
       unsigned long aligned_maxnode = (maxnode + align_mask) & ~align_mask;
@@ -6211,9 +6426,25 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
     }
 
     case Arch::name_to_handle_at: {
-      syscall_state.reg_parameter(3,
-                                  sizeof(typename Arch::file_handle) + MAX_HANDLE_SZ);
-      syscall_state.reg_parameter(4, sizeof(int));
+      // The kernel reads handle_bytes. When the handle doesn't fit, it fails
+      // with EOVERFLOW after it stored the mount id and the size the handle
+      // needs.
+      auto handlep = remote_ptr<typename Arch::file_handle>(regs.arg3());
+      bool ok = true;
+      unsigned int handle_bytes =
+          t->read_mem(REMOTE_PTR_FIELD(handlep, handle_bytes), &ok);
+      syscall_state.reg_parameter(
+          3, sizeof(typename Arch::file_handle) +
+                 (ok ? min<unsigned int>(handle_bytes, MAX_HANDLE_SZ) : 0),
+          IN_OUT);
+      // Since Linux 6.12
+      // (https://github.com/torvalds/linux/commit/4356d575ef0f39a3e8e0ce0c40d84ce900ac3b61),
+      // AT_HANDLE_MNT_ID_UNIQUE makes the mount id a u64.
+      if (regs.arg5() & AT_HANDLE_MNT_ID_UNIQUE) {
+        syscall_state.reg_parameter<uint64_t>(4, IN_OUT);
+      } else {
+        syscall_state.reg_parameter<int>(4, IN_OUT);
+      }
       return ALLOW_SWITCH;
     }
 

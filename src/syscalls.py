@@ -49,8 +49,9 @@ class RegularSyscall(BaseSyscall):
     The arguments required for rr to record may be specified directly
     through the arg1...arg6 keyword arguments.  The values for these
     arguments determine the size of the associated arguments to the syscall.
-    The only allowed type for a given argument is a Python string, in which
-    case the size of the argument is sizeof(arg).
+    A value is either a Python string, in which case the size of the
+    argument is sizeof(arg) and the argument is an OUT parameter, or a tuple
+    of such a string and an ArgMode, e.g. ("uint32_t", "IN_OUT").
 
     To ensure correct handling for mixed-arch process groups (e.g. a mix of 32
     and 64-bit processes), types should be specified using Arch instead of
@@ -656,8 +657,9 @@ modify_ldt = IrregularEmulatedSyscall(x86=123, x64=154)
 #  int adjtimex(struct timex *buf);
 #
 # adjtimex() takes a pointer to a timex structure, reads it, and returns
-# the same structure updated with the current kernel values.
-adjtimex = EmulatedSyscall(x86=124, x64=159, generic=171, arg1="typename Arch::timex")
+# the same structure updated with the current kernel values. It writes the
+# structure back when it fails, too.
+adjtimex = EmulatedSyscall(x86=124, x64=159, generic=171, arg1=("typename Arch::timex", "IN_OUT"))
 
 #  int mprotect(const void *addr, size_t len, int prot)
 #
@@ -1219,7 +1221,10 @@ sched_getaffinity = IrregularEmulatedSyscall(x86=242, x64=204, generic=123)
 #
 # XXX Do we want to restrict somehow how this plays with rr's
 # scheduling?
-sched_setattr = EmulatedSyscall(x86=351, x64=314, generic=274)
+#
+# When attr->size is too small or too large, the kernel stores the size it
+# supports there and fails with E2BIG.
+sched_setattr = EmulatedSyscall(x86=351, x64=314, generic=274, arg2=("uint32_t", "IN_OUT"))
 
 # int sched_getattr(pid_t pid, struct sched_attr *attr,
 #                   unsigned int size, unsigned int flags);
@@ -1311,7 +1316,9 @@ remap_file_pages = UnsupportedSyscall(x86=257, x64=216, generic=234)
 # does is writing its PID at this address.
 set_tid_address = EmulatedSyscall(x86=258, x64=218, generic=96)
 
-timer_create = EmulatedSyscall(x86=259, x64=222, generic=107, arg3="typename Arch::__kernel_timer_t")
+# timer_create() stores the timer id before the clock creates the timer,
+# which can fail.
+timer_create = EmulatedSyscall(x86=259, x64=222, generic=107, arg3=("typename Arch::__kernel_timer_t", "IN_OUT"))
 timer_settime = EmulatedSyscall(x86=260, x64=223, generic=110, arg4="typename Arch::itimerspec")
 timer_gettime = EmulatedSyscall(x86=261, x64=224, generic=108, arg2="typename Arch::itimerspec")
 timer_getoverrun = EmulatedSyscall(x86=262, x64=225, generic=109)
@@ -1801,7 +1808,8 @@ bind = EmulatedSyscall(x86=361, x64=49, generic=200)
 listen = EmulatedSyscall(x86=363, x64=50, generic=201)
 getsockname = IrregularEmulatedSyscall(x86=367, x64=51, generic=204)
 getpeername = IrregularEmulatedSyscall(x86=368, x64=52, generic=205)
-socketpair = EmulatedSyscall(x86=360, x64=53, generic=199, arg4="int[2]")
+# socketpair() stores the fds before it creates the sockets, which can fail.
+socketpair = EmulatedSyscall(x86=360, x64=53, generic=199, arg4=("int[2]", "IN_OUT"))
 setsockopt = IrregularEmulatedSyscall(x86=366, x64=54, generic=208)
 getsockopt = IrregularEmulatedSyscall(x86=365, x64=55, generic=209)
 accept4 = IrregularEmulatedSyscall(x86=364, x64=288, generic=242)

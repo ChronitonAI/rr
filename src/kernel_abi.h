@@ -1850,6 +1850,13 @@ struct BaseArch : public wordsize,
       aligned_u64 line_info;
       __u32 line_info_cnt;
     };
+    struct { /* used by BPF_BTF_LOAD */
+      ptr64<void> btf;
+      ptr64<char> btf_log_buf;
+      __u32 btf_size;
+      __u32 btf_log_size;
+      __u32 btf_log_level;
+    };
 
     struct { /* anonymous struct used by BPF_PROG_QUERY command */
       union {

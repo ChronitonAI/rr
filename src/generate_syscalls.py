@@ -68,6 +68,10 @@ def write_syscall_record_cases(f):
         if isinstance(arg_descriptor, str):
             f.write("    syscall_state.reg_parameter<%s>(%d);\n"
                     % (arg_descriptor, arg))
+        elif isinstance(arg_descriptor, tuple):
+            (arg_type, mode) = arg_descriptor
+            f.write("    syscall_state.reg_parameter<%s>(%d, %s);\n"
+                    % (arg_type, arg, mode))
     for name, obj in syscalls.all():
         # Irregular syscalls will be handled by hand-written code elsewhere.
         if isinstance(obj, syscalls.RegularSyscall):
